@@ -33,6 +33,10 @@ llvm::Type* IREmitter::map_type(TypeId id) {
 				case BaseType::I16: return llvm::Type::getInt16Ty(*llctx_);
 				case BaseType::I32: return llvm::Type::getInt32Ty(*llctx_);
 				case BaseType::I64: return llvm::Type::getInt64Ty(*llctx_);
+				case BaseType::U8:  return llvm::Type::getInt8Ty(*llctx_);
+				case BaseType::U16: return llvm::Type::getInt16Ty(*llctx_);
+				case BaseType::U32: return llvm::Type::getInt32Ty(*llctx_);
+				case BaseType::U64: return llvm::Type::getInt64Ty(*llctx_);
 				case BaseType::F32: return llvm::Type::getFloatTy(*llctx_);
 				case BaseType::F64: return llvm::Type::getDoubleTy(*llctx_);
 				case BaseType::Void:return llvm::Type::getVoidTy(*llctx_);
@@ -315,7 +319,7 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 							if (!cval) cval = llvm::UndefValue::get(lty);
 							vmap[dst] = cval; vtypes[dst] = ty;
 						}
-						else if ((op == "add" || op == "sub" || op == "mul" || op == "sdiv") && il.size() == 5) {
+						else if ((op == "add" || op == "sub" || op == "mul" || op == "sdiv" || op == "udiv" || op == "srem" || op == "urem") && il.size() == 5) {
 							std::string dst = trimPct(symName(il[1]));
 							TypeId ty = tctx_.parse_type(il[2]);
 							std::string a = trimPct(symName(il[3]));
@@ -328,7 +332,10 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 							if (op == "add") res = builder.CreateAdd(va, vb, dst);
 							else if (op == "sub") res = builder.CreateSub(va, vb, dst);
 							else if (op == "mul") res = builder.CreateMul(va, vb, dst);
-							else res = builder.CreateSDiv(va, vb, dst);
+							else if (op == "sdiv") res = builder.CreateSDiv(va, vb, dst);
+							else if (op == "udiv") res = builder.CreateUDiv(va, vb, dst);
+							else if (op == "srem") res = builder.CreateSRem(va, vb, dst);
+							else /* urem */ res = builder.CreateURem(va, vb, dst);
 							vmap[dst] = res; vtypes[dst] = ty;
 						}
 						else if ((op == "eq" || op == "ne" || op == "lt" || op == "gt" || op == "le" || op == "ge") && il.size() == 5) {
@@ -349,6 +356,30 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 							else                 pred = llvm::CmpInst::ICMP_SGE;
 							auto* res = builder.CreateICmp(pred, va, vb, dst);
 							vmap[dst] = res; vtypes[dst] = tctx_.get_base(BaseType::I1);
+						}
+						else if (op == "icmp" && il.size() == 7) {
+							std::string dst = trimPct(symName(il[1])); if(dst.empty()) continue;
+							TypeId opty = tctx_.parse_type(il[2]); (void)opty;
+							// il[3] should be :pred keyword, il[4] predicate symbol
+							if(!std::holds_alternative<keyword>(il[3]->data)) continue;
+							std::string predSym = symName(il[4]);
+							std::string a = trimPct(symName(il[5])); std::string b = trimPct(symName(il[6]));
+							if(a.empty()||b.empty()) continue;
+							auto* va = vmap.count(a)? vmap[a]: nullptr; auto* vb=vmap.count(b)? vmap[b]: nullptr; if(!va||!vb) continue;
+							llvm::CmpInst::Predicate pred = llvm::CmpInst::ICMP_EQ;
+							if      (predSym=="eq") pred = llvm::CmpInst::ICMP_EQ;
+							else if (predSym=="ne") pred = llvm::CmpInst::ICMP_NE;
+							else if (predSym=="slt") pred = llvm::CmpInst::ICMP_SLT;
+							else if (predSym=="sgt") pred = llvm::CmpInst::ICMP_SGT;
+							else if (predSym=="sle") pred = llvm::CmpInst::ICMP_SLE;
+							else if (predSym=="sge") pred = llvm::CmpInst::ICMP_SGE;
+							else if (predSym=="ult") pred = llvm::CmpInst::ICMP_ULT;
+							else if (predSym=="ugt") pred = llvm::CmpInst::ICMP_UGT;
+							else if (predSym=="ule") pred = llvm::CmpInst::ICMP_ULE;
+							else if (predSym=="uge") pred = llvm::CmpInst::ICMP_UGE;
+							else continue; // unknown predicate
+							auto* res = builder.CreateICmp(pred, va, vb, dst);
+							vmap[dst]=res; vtypes[dst]=tctx_.get_base(BaseType::I1);
 						}
 						else if ((op == "and" || op == "or" || op == "xor" || op == "shl" || op == "lshr" || op == "ashr") && il.size() == 5) {
 							std::string dst = trimPct(symName(il[1]));

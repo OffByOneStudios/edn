@@ -39,6 +39,13 @@ void run_ir_emitter_test(){
         auto ast = parse("(module :id \"m_cmp\" (fn :name \"cmpf\" :ret i1 :params [ (param i32 %a) (param i32 %b) ] :body [ (lt %l i32 %a %b) (gt %g i32 %a %b) (eq %e i32 %a %b) (and %t i1 %l %g) (or %u i1 %t %e) (ret i1 %u) ]) )");
         TypeCheckResult r; auto *m = em.emit(ast,r); assert(r.success && m); auto fn = m->getFunction("cmpf"); assert(fn); bool sawCmp=false; for(auto &bb:*fn) for(auto &ins:bb) if(ins.getOpcode()==llvm::Instruction::ICmp) sawCmp=true; assert(sawCmp);
     }
+    // icmp predicate test (unsigned)
+    {
+        std::cout << "IR test: starting icmp predicate module\n";
+        IREmitter em(ctx);
+        auto ast = parse("(module :id \"m_icmp\" (fn :name \"uci\" :ret i1 :params [ (param u32 %a) (param u32 %b) ] :body [ (icmp %r u32 :pred ult %a %b) (ret i1 %r) ]) )");
+        TypeCheckResult r; auto *m = em.emit(ast,r); assert(r.success && m); auto fn = m->getFunction("uci"); assert(fn); size_t cmpCount=0; for(auto &bb:*fn) for(auto &ins:bb) if(ins.getOpcode()==llvm::Instruction::ICmp) ++cmpCount; assert(cmpCount==1);
+    }
     // mem function module
     {
     std::cout << "IR test: starting mem module\n";

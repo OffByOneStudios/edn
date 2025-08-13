@@ -13,7 +13,8 @@ namespace edn {
 
 using TypeId = uint32_t;
 
-enum class BaseType { I1,I8,I16,I32,I64,F32,F64,Void };
+// Phase 2: add unsigned integer base types (same bit widths; semantics differ in ops)
+enum class BaseType { I1,I8,I16,I32,I64,U8,U16,U32,U64,F32,F64,Void };
 
 struct Type {
     enum class Kind { Base, Pointer, Struct, Function, Array } kind;
@@ -29,9 +30,10 @@ struct Type {
 
 class TypeContext {
 public:
-    TypeContext(){ // seed base types
+    TypeContext(){ // seed base types (order matters only for stable ids across run)
         get_base(BaseType::I1); get_base(BaseType::I8); get_base(BaseType::I16);
         get_base(BaseType::I32); get_base(BaseType::I64);
+        get_base(BaseType::U8); get_base(BaseType::U16); get_base(BaseType::U32); get_base(BaseType::U64);
         get_base(BaseType::F32); get_base(BaseType::F64); get_base(BaseType::Void);
     }
 
@@ -67,6 +69,10 @@ public:
             if(name=="i16") return get_base(BaseType::I16);
             if(name=="i32") return get_base(BaseType::I32);
             if(name=="i64") return get_base(BaseType::I64);
+            if(name=="u8") return get_base(BaseType::U8);
+            if(name=="u16") return get_base(BaseType::U16);
+            if(name=="u32") return get_base(BaseType::U32);
+            if(name=="u64") return get_base(BaseType::U64);
             if(name=="f32") return get_base(BaseType::F32);
             if(name=="f64") return get_base(BaseType::F64);
             if(name=="void") return get_base(BaseType::Void);
@@ -144,7 +150,20 @@ private:
 
     TypeId add_type(Type t){ TypeId id = static_cast<TypeId>(types_.size()); types_.push_back(std::move(t)); return id; }
     std::string base_name(BaseType b) const {
-        switch(b){ case BaseType::I1: return "i1"; case BaseType::I8: return "i8"; case BaseType::I16: return "i16"; case BaseType::I32: return "i32"; case BaseType::I64: return "i64"; case BaseType::F32: return "f32"; case BaseType::F64: return "f64"; case BaseType::Void: return "void"; }
+        switch(b){
+            case BaseType::I1: return "i1";
+            case BaseType::I8: return "i8";
+            case BaseType::I16: return "i16";
+            case BaseType::I32: return "i32";
+            case BaseType::I64: return "i64";
+            case BaseType::U8: return "u8";
+            case BaseType::U16: return "u16";
+            case BaseType::U32: return "u32";
+            case BaseType::U64: return "u64";
+            case BaseType::F32: return "f32";
+            case BaseType::F64: return "f64";
+            case BaseType::Void: return "void";
+        }
         return "?";
     }
 

@@ -62,6 +62,13 @@ void run_type_checker_tests(){
     auto rcmpok = tc.check_module(cmpok); assert(rcmpok.success);
     auto cmpbad = parse("(module (fn :name \"cmpb\" :ret i1 :params [ (param f32 %a) (param f32 %b) ] :body [ (lt %l f32 %a %b) (ret i1 %l) ]))");
     auto rcmpbad = tc.check_module(cmpbad); assert(!rcmpbad.success);
+    // unsigned arithmetic & icmp
+    auto uarith = parse("(module (fn :name \"uarith\" :ret u32 :params [ (param u32 %a) (param u32 %b) ] :body [ (udiv %d u32 %a %b) (urem %r u32 %a %b) (add %s u32 %d %r) (ret u32 %s) ]))");
+    auto ruarith = tc.check_module(uarith); assert(ruarith.success);
+    auto icmpu = parse("(module (fn :name \"icmpu\" :ret i1 :params [ (param u32 %a) (param u32 %b) ] :body [ (icmp %r u32 :pred ult %a %b) (ret i1 %r) ]))");
+    auto ricmpu = tc.check_module(icmpu); assert(ricmpu.success);
+    auto badicmp = parse("(module (fn :name \"badicmp\" :ret i1 :params [ (param f32 %a) (param f32 %b) ] :body [ (icmp %r f32 :pred ult %a %b) (ret i1 %r) ]))");
+    auto rbadicmp = tc.check_module(badicmp); assert(!rbadicmp.success);
     // globals
     auto globok = parse("(module (global :name G :type i32 :init 5) (fn :name \"useg\" :ret i32 :params [] :body [ (gload %v i32 G) (ret i32 %v) ]))");
     auto rglobok = tc.check_module(globok); assert(rglobok.success);
