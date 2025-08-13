@@ -3,6 +3,7 @@ build/
 [Cc]MakeCache.txt
 CMakeFiles/
 cmake-build-*/
+CMakeUserPresets.json
 
 # Generated config & version headers in build tree
 include/edn/version.hpp
