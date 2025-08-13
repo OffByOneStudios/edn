@@ -1,7 +1,11 @@
-#include <cassert>
+﻿#include <cassert>
 #include <iostream>
 #include "edn/edn.hpp"
 #include "edn/transform.hpp"
+// Forward declaration from types_test.cpp
+void run_type_tests();
+void run_type_checker_tests();
+void run_ir_emitter_test();
 
 int main(){
     using namespace edn;
@@ -40,6 +44,9 @@ int main(){
     assert(expanded->data.index()!=0); // not nil
 
 
+    run_type_tests();
+    run_type_checker_tests();
+    run_ir_emitter_test();
     std::cout << "All tests passed\n";
     return 0;
 }

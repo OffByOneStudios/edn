@@ -49,23 +49,27 @@ namespace detail {
     inline node_ptr make_int(int64_t v){ return make_node(node_data{v}); }
     inline void attach_pos(node& n,int sl,int sc,int el,int ec){ n.metadata["line"]=make_int(sl); n.metadata["col"]=make_int(sc); n.metadata["end-line"]=make_int(el); n.metadata["end-col"]=make_int(ec); }
 
-    node_ptr parse_value(reader&);
+    inline node_ptr parse_value(reader&);
 
-    node_ptr parse_list_like(reader& r,char end,int sl,int sc,bool tagged_set=false){
+    inline node_ptr parse_list_like(reader& r,char end,int sl,int sc,bool tagged_set=false){
         std::vector<node_ptr> elems; r.skip_ws(); while(!r.eof() && r.peek()!=end){ elems.push_back(parse_value(r)); r.skip_ws(); }
         if(r.get()!=end) throw parse_error("unterminated collection");
         node_ptr out;
         if(tagged_set){ set s; s.elems=std::move(elems); out=make_node(s);} else if(end==')'){ list l; l.elems=std::move(elems); out=make_node(l);} else if(end==']'){ vector_t v; v.elems=std::move(elems); out=make_node(v);} else if(end=='}'){ if(elems.size()%2) throw parse_error("map requires even number of forms"); map m; for(size_t i=0;i<elems.size();i+=2) m.entries.emplace_back(elems[i],elems[i+1]); out=make_node(m);} else { list l; out=make_node(l);} attach_pos(*out,sl,sc,r.last_line,r.last_col); return out; }
 
-    node_ptr parse_string(reader& r){ int sl=r.line,sc=r.col; if(r.get()!='"') throw parse_error("expected \""); std::string out; while(!r.eof()){ char c=r.get(); if(c=='"') break; if(c=='\\'){ if(r.eof()) throw parse_error("bad escape"); char e=r.get(); switch(e){ case 'n': out+='\n'; break; case 'r': out+='\r'; break; case 't': out+='\t'; break; case '"': out+='"'; break; case '\\': out+='\\'; break; default: out+=e; break;} } else out+=c; } auto n=make_node(out); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
 
-    node_ptr parse_number(reader& r){ int sl=r.line,sc=r.col; std::string num; if(r.peek()=='+'||r.peek()=='-') num+=r.get(); bool is_float=false; while(is_digit(r.peek())) num+=r.get(); if(r.peek()=='.'){ is_float=true; num+=r.get(); while(is_digit(r.peek())) num+=r.get(); } if(r.peek()=='e'||r.peek()=='E'){ is_float=true; num+=r.get(); if(r.peek()=='+'||r.peek()=='-') num+=r.get(); while(is_digit(r.peek())) num+=r.get(); } node_ptr n; try { if(is_float) n=make_node(std::stod(num)); else { long long v=std::stoll(num); n=make_node((int64_t)v);} } catch(...) { throw parse_error("invalid number"); } attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
 
-    node_ptr parse_symbol_or_keyword(reader& r){ int sl=r.line,sc=r.col; bool kw=false; if(r.peek()==':'){ kw=true; r.get(); } std::string s; while(is_symbol_char(r.peek())) s+=r.get(); node_ptr n; if(s=="nil" && !kw) n=make_node(std::monostate{}); else if(s=="true" && !kw) n=make_node(true); else if(s=="false" && !kw) n=make_node(false); else if(kw) n=make_node(keyword{s}); else n=make_node(symbol{s}); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
 
-    node_ptr parse_tagged(reader& r){ int sl=r.line,sc=r.col; if(r.peek()=='{'){ r.get(); return parse_list_like(r,'}',sl,sc,true);} std::string tag; while(is_symbol_char(r.peek())) tag+=r.get(); r.skip_ws(); auto inner=parse_value(r); auto n=make_node(tagged_value{symbol{tag},inner}); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
 
-    node_ptr parse_value(reader& r){ r.skip_ws(); char c=r.peek(); switch(c){ case '"': return parse_string(r); case '(': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,')',sl,sc);} case '[': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,']',sl,sc);} case '{': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,'}',sl,sc);} case '#': { r.get(); return parse_tagged(r);} default: break; } if(is_digit(c)||c=='+'||c=='-') return parse_number(r); if(c==':'||is_symbol_start(c)) return parse_symbol_or_keyword(r); throw parse_error("unexpected character"); }
+    inline node_ptr parse_string(reader& r){ int sl=r.line,sc=r.col; if(r.get()!='"') throw parse_error("expected \""); std::string out; while(!r.eof()){ char c=r.get(); if(c=='"') break; if(c=='\\'){ if(r.eof()) throw parse_error("bad escape"); char e=r.get(); switch(e){ case 'n': out+='\n'; break; case 'r': out+='\r'; break; case 't': out+='\t'; break; case '"': out+='"'; break; case '\\': out+='\\'; break; default: out+=e; break;} } else out+=c; } auto n=make_node(out); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
+
+    inline node_ptr parse_number(reader& r){ int sl=r.line,sc=r.col; std::string num; if(r.peek()=='+'||r.peek()=='-') num+=r.get(); bool is_float=false; while(is_digit(r.peek())) num+=r.get(); if(r.peek()=='.'){ is_float=true; num+=r.get(); while(is_digit(r.peek())) num+=r.get(); } if(r.peek()=='e'||r.peek()=='E'){ is_float=true; num+=r.get(); if(r.peek()=='+'||r.peek()=='-') num+=r.get(); while(is_digit(r.peek())) num+=r.get(); } node_ptr n; try { if(is_float) n=make_node(std::stod(num)); else { long long v=std::stoll(num); n=make_node((int64_t)v);} } catch(...) { throw parse_error("invalid number"); } attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
+
+    inline node_ptr parse_symbol_or_keyword(reader& r){ int sl=r.line,sc=r.col; bool kw=false; if(r.peek()==':'){ kw=true; r.get(); } std::string s; while(is_symbol_char(r.peek())) s+=r.get(); node_ptr n; if(s=="nil" && !kw) n=make_node(std::monostate{}); else if(s=="true" && !kw) n=make_node(true); else if(s=="false" && !kw) n=make_node(false); else if(kw) n=make_node(keyword{s}); else n=make_node(symbol{s}); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
+
+    inline node_ptr parse_tagged(reader& r){ int sl=r.line,sc=r.col; if(r.peek()=='{'){ r.get(); return parse_list_like(r,'}',sl,sc,true);} std::string tag; while(is_symbol_char(r.peek())) tag+=r.get(); r.skip_ws(); auto inner=parse_value(r); auto n=make_node(tagged_value{symbol{tag},inner}); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
+
+    inline node_ptr parse_value(reader& r){ r.skip_ws(); char c=r.peek(); switch(c){ case '"': return parse_string(r); case '(': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,')',sl,sc);} case '[': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,']',sl,sc);} case '{': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,'}',sl,sc);} case '#': { r.get(); return parse_tagged(r);} default: break; } if(is_digit(c)||c=='+'||c=='-') return parse_number(r); if(c==':'||is_symbol_start(c)) return parse_symbol_or_keyword(r); throw parse_error("unexpected character"); }
 }
 
 inline node_ptr parse(std::string_view input){ detail::reader r(input); r.skip_ws(); auto v=detail::parse_value(r); r.skip_ws(); if(!r.eof()) throw parse_error("unexpected trailing characters"); return v; }

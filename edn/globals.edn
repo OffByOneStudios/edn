@@ -1,0 +1,5 @@
+(module :id "globals"
+  (global :name G :type i32 :init 5)
+  (fn :name "incG" :ret i32 :params [] :body [ (gload %v i32 G) (add %n i32 %v %v) (gstore i32 G %n) (ret i32 %n) ])
+  (fn :name "main" :ret i32 :params [] :body [ (call %x i32 incG) (ret i32 %x) ])
+)

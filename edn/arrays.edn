@@ -1,0 +1,7 @@
+(module :id "arrays"
+  (fn :name "sum2" :ret i32 :params []
+      :body [ (alloca %p (array :elem i32 :size 4)) (const %i0 i32 0) (index %e0 i32 %p %i0) (const %v0 i32 11) (store i32 %e0 %v0)
+              (const %i1 i32 1) (index %e1 i32 %p %i1) (const %v1 i32 31) (store i32 %e1 %v1)
+              (load %lv0 i32 %e0) (load %lv1 i32 %e1) (add %s i32 %lv0 %lv1) (ret i32 %s) ])
+  (fn :name "main" :ret i32 :params [] :body [ (call %r i32 sum2) (ret i32 %r) ])
+)

@@ -1,0 +1,6 @@
+(module :id "arith"
+  (fn :name "addmul" :ret i32 :params [ (param i32 %a) (param i32 %b) ]
+      :body [ (add %s i32 %a %b) (mul %p i32 %s %a) (ret i32 %p) ])
+  (fn :name "main" :ret i32 :params []
+      :body [ (const %c1 i32 6) (const %c2 i32 7) (call %r i32 addmul %c1 %c2) (ret i32 %r) ])
+)

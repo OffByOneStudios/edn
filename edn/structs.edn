@@ -1,0 +1,9 @@
+(module :id "structs"
+  (struct :name Pair :fields [ (field :name a :type i32) (field :name b :type i32) ])
+  (fn :name "sum" :ret i32 :params [ (param (ptr (struct-ref Pair)) %p) ]
+      :body [ (member %va Pair %p a) (member %vb Pair %p b) (add %s i32 %va %vb) (ret i32 %s) ])
+  (fn :name "main" :ret i32 :params []
+      :body [ (alloca %q (struct-ref Pair)) (member-addr %qa Pair %q a) (member-addr %qb Pair %q b)
+              (const %c1 i32 10) (const %c2 i32 32) (store i32 %qa %c1) (store i32 %qb %c2)
+              (call %r i32 sum %q) (ret i32 %r) ])
+)

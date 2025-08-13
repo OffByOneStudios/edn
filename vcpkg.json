@@ -1,0 +1,12 @@
+{
+  "name": "edn",
+  "version-string": "0.0.1",
+  "description": "EDN experimental language toolkit (parser, type system, LLVM backend).",
+  "homepage": "https://github.com/OffByOneStudios/edn",
+  "license": "MIT",
+  "dependencies": [
+    "fmt",
+    "cxxopts",
+    "llvm"
+  ]
+}

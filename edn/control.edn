@@ -1,0 +1,9 @@
+(module :id "control"
+  (fn :name "branch" :ret i32 :params [ (param i32 %x) ]
+      :body [ (const %one i32 1) (const %zero i32 0) (lt %c i32 %x %one) (if %c [ (ret i32 %zero) ]) (ret i32 %one) ])
+  (fn :name "looping" :ret i32 :params []
+      :body [ (alloca %p i32) (const %c i1 1) (const %init i32 1) (store i32 %p %init)
+              (while %c [ (load %t i32 %p) (add %n i32 %t %t) (store i32 %p %n) (break) ])
+              (load %v i32 %p) (ret i32 %v) ])
+  (fn :name "main" :ret i32 :params [] :body [ (const %x i32 0) (call %b i32 branch %x) (call %l i32 looping) (add %s i32 %b %l) (ret i32 %s) ])
+)
