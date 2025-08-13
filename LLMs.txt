@@ -1,0 +1,140 @@
+edn Library Quick Reference for LLM Integration
+=================================================
+Goal: Provide a concise mental model so an LLM (or a user via an LLM) can confidently parse, traverse, transform, and emit derived IR using the edn header‑only library.
+
+Core Concepts
+-------------
+1. Node-Centric AST:
+   - Type: `edn::node` (held by `std::shared_ptr<node>` alias `node_ptr`).
+   - Payload variant (`node_data`): monostate(nil), bool, int64_t, double, std::string, keyword, symbol, list, vector_t, set, map, tagged_value.
+   - Containers store child `node_ptr`s (deep tree, shared ownership allowed when cloning/expanding).
+2. Metadata:
+   - Each node has `std::map<std::string,node_ptr> metadata`.
+   - Parser auto-populates: line, col, end-line, end-col (all int64 nodes).
+   - Free to attach additional semantic annotations (e.g., kind, types, IR info).
+3. Parsing:
+   - Single entry: `node_ptr parse(std::string_view src)`; throws `parse_error` on failure.
+   - Reader tracks positions; comments start with `;` to end of line.
+4. Printing:
+   - `to_string(node_ptr)` gives a non-canonical EDN rendering (useful for debugging, not round‑trip canonicalization guarantees).
+5. Transformation Layer (`transform.hpp`):
+   - `Transformer` supports macro expansion + visitor traversal.
+   - Macros: pattern `(head ...)` -> optional replacement `node_ptr`; can recursively expand (expansion re-enters macro pass until fixed point).
+   - Visitors: operate after full expansion; you can mutate node metadata but typically avoid altering structural shape (unless building a second IR separately).
+6. Example IR Emission:
+   - See `examples/llvm_ir_emitter.cpp` for a pattern: represent a module as an EDN `(module ... (fn ...))` form, then traverse to produce textual IR.
+
+Minimal Usage Sketch
+--------------------
+```
+#include <edn/edn.hpp>
+#include <edn/transform.hpp>
+using namespace edn;
+
+auto ast = parse("(inc 41)");
+Transformer tr;
+tr.add_macro("inc", [](const list& L){
+  if (L.elems.size()==2) {
+    list out; // (+ :lhs x :rhs 1)
+    out.elems.push_back(std::make_shared<node>(node{ symbol{"+"}, {} }));
+    out.elems.push_back(std::make_shared<node>(node{ keyword{"lhs"}, {} }));
+    out.elems.push_back(L.elems[1]);
+    out.elems.push_back(std::make_shared<node>(node{ keyword{"rhs"}, {} }));
+    out.elems.push_back(std::make_shared<node>(node{ int64_t{1}, {} }));
+    return std::optional<node_ptr>( std::make_shared<node>(node{ out, {} }) );
+  }
+  return std::optional<node_ptr>{};
+});
+int plus_forms=0;
+tr.add_visitor("+", [&](node& n, list& l, const symbol&){
+  n.metadata["kind"] = std::make_shared<node>(node{ keyword{"binary"}, {} });
+  ++plus_forms;
+});
+auto expanded = tr.expand_and_traverse(ast);
+```
+
+Metadata Helpers
+----------------
+Provided in `edn.hpp`:
+- `line(const node&)`, `col(const node&)`, `end_line`, `end_col` (return int or -1 if absent).
+- `is_symbol`, `is_keyword`, `is_list`, plus `as_list`, `as_symbol` for safe extraction.
+Add your own convenience wrappers if you frequently read other metadata keys.
+
+Design & Extension Guidelines
+-----------------------------
+1. Favor small, pure helper functions when inspecting `node` shape; avoid scattering variant logic.
+2. Macros must remain deterministic & side-effect free beyond structural rewrites; they are run to fixed point.
+3. Attach semantic analysis results (types, scopes, etc.) in metadata rather than constructing parallel ad-hoc side tables unless performance later demands it.
+4. For large transforms, consider building a second IR object graph rather than mutating EDN nodes.
+5. Keep new metadata keys lowercase with dashes for readability (e.g., `"ir-op"`, `"type"`).
+
+Error Handling
+--------------
+- Parsing: throws `parse_error` (derive from std::runtime_error) with a generic message; you can post-process using position metadata on the failing form (if partial progress is captured separately — by default, failure aborts without partial AST).
+- Transformer macros should avoid throwing; prefer returning `std::nullopt` when not applicable.
+
+Performance Considerations (Current State)
+-----------------------------------------
+- Data structures are simple and not optimized (vector-backed set/map; no hashing).
+- Shared pointers ease manipulation but incur allocation overhead.
+- Future optimization could introduce arena allocation or small-buffer node pools; avoid premature micro-optimizations in current code.
+
+Common Pitfalls for LLM Code Generation
+---------------------------------------
+1. Forgetting commas / separators when emitting downstream IR (e.g., LLVM binops need a comma between operands).
+2. Returning raw `node` instead of `node_ptr` in macros/visitors (always allocate shared_ptr for new nodes).
+3. Mutating container vectors while iterating during macro expansion (clone first or build new list variant).
+4. Losing metadata when cloning: ensure deep clone copies `metadata` map; existing `Transformer::clone_node` handles this.
+5. Assuming ordering in maps: current map stores entries vector-wise; preserve insertion order manually if needed.
+
+Pattern for Adding a New Instruction Form
+----------------------------------------
+1. Decide EDN shape, e.g., `(foo %dst i32 %a %b)`.
+2. Add emission logic in your visitor (similar to `emit_instruction`).
+3. (Optional) Provide a macro that rewrites a higher-level sugar form into core instructions.
+4. Attach semantic metadata on the instruction node (e.g., `n.metadata["ir-op"] = <keyword node>`).
+
+Testing Strategy
+----------------
+- Parse + round-trip shape assertions via `to_string` (lenient).
+- Use visitors to accumulate simple stats ensuring macros expanded correctly.
+- For IR emission, assert key substrings are present (avoid full-string brittle matches).
+
+Versioning & Distribution
+-------------------------
+- CMake install exports `edn::edn` target.
+- vcpkg port scaffold included (header-only install + usage file).
+- Update `vcpkg/ports/edn/portfile.cmake` ref & tag when releasing.
+
+Roadmap Snapshot
+----------------
+See CHANGELOG.md for upcoming features (namespaces, better sets/maps, streaming parser, performance).
+
+Checklist for LLM-Generated Patches
+-----------------------------------
+[ ] Includes tests or updates existing tests
+[ ] Preserves existing public API unless intentional breaking change
+[ ] Adds or updates README / comments for new user-facing behavior
+[ ] Avoids introducing new global state
+[ ] Keeps header-only property (no new compiled source target)
+
+Security / Safety Notes
+-----------------------
+- No untrusted code execution; only parses a textual subset (no eval).
+- Tagged values are parsed but not dispatched—safe by default.
+
+License
+-------
+MIT (see LICENSE).
+
+Quick Copy Snippet
+------------------
+Parse & visit:
+```
+auto root = edn::parse("[1 2 3]");
+edn::Transformer t;
+t.on_atom([](edn::node& n){ /* annotate or count */ });
+t.traverse(root);
+```
+
+End of LLMs.txt

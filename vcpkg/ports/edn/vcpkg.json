@@ -1,0 +1,14 @@
+{
+  "name": "edn",
+  "version-string": "0.0.1",
+  "description": "Header-only EDN parser library in modern C++",
+  "homepage": "https://github.com/cgrinker/edn",
+  "license": "MIT",
+  "supports": "!uwp",
+  "features": {
+    "core": {
+      "description": "Base header-only EDN parser (default)"
+    }
+  },
+  "default-features": ["core"]
+}

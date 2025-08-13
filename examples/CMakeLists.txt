@@ -1,0 +1,3 @@
+add_executable(edn_llvm_ir_example llvm_ir_emitter.cpp)
+set_target_properties(edn_llvm_ir_example PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES)
+target_link_libraries(edn_llvm_ir_example PRIVATE edn)

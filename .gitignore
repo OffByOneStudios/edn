@@ -1,0 +1,54 @@
+# CMake build directories
+build/
+[Cc]MakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Generated config & version headers in build tree
+include/edn/version.hpp
+
+# Visual Studio / MSVC
+*.sln
+*.vcxproj*
+*.vcproj*
+*.user
+*.userprefs
+*.opensdf
+*.sdf
+*.suo
+*.vcxproj.filters
+ipch/
+.vs/
+
+# VS Code
+.vscode/
+
+# clangd / ccls / lsp caches
+compile_commands.json
+.clangd/
+.ccls-cache/
+
+# OS / misc
+.DS_Store
+Thumbs.db
+
+# Archives / dumps
+*.tar
+*.gz
+*.zip
+*.7z
+
+# vcpkg build tree (if placed inside project)
+vcpkg_installed/
+
+# Coverage / testing
+*.gcno
+*.gcda
+*.lcov
+
+# Logs
+*.log
+
+# Temporary
+*.tmp
+*.bak
