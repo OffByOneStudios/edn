@@ -9,15 +9,17 @@
 
 namespace edn {
 
-struct TypeError { std::string message; int line=-1; int col=-1; };
+struct TypeNote { std::string message; int line=-1; int col=-1; };
+struct TypeError { std::string code; std::string message; std::string hint; int line=-1; int col=-1; std::vector<TypeNote> notes; };
+struct TypeWarning { std::string code; std::string message; std::string hint; int line=-1; int col=-1; std::vector<TypeNote> notes; };
 
-struct TypeCheckResult { bool success; std::vector<TypeError> errors; };
+struct TypeCheckResult { bool success; std::vector<TypeError> errors; std::vector<TypeWarning> warnings; };
 
 struct FieldInfo { std::string name; TypeId type; size_t index; };
 struct StructInfo { std::string name; std::vector<FieldInfo> fields; std::unordered_map<std::string,FieldInfo*> field_map; };
 struct ParamInfoTC { std::string name; TypeId type; };
 struct FunctionInfoTC { std::string name; TypeId ret; std::vector<ParamInfoTC> params; };
-struct GlobalInfoTC { std::string name; TypeId type; };
+struct GlobalInfoTC { std::string name; TypeId type; bool is_const=false; node_ptr init; };
 
 class TypeChecker {
 public:
@@ -26,6 +28,8 @@ public:
 private:
     TypeContext& ctx_;
     void error(TypeCheckResult& r, const node& n, std::string msg);
+    void warn(TypeCheckResult& r, const node& n, std::string msg);
+    void error_code(TypeCheckResult& r, const node& n, std::string code, std::string msg, std::string hint="");
     // symbol tables (cleared per module)
     std::unordered_map<std::string, StructInfo> structs_;
     std::unordered_map<std::string, FunctionInfoTC> functions_;

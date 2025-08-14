@@ -177,3 +177,30 @@ private:
 };
 
 } // namespace edn
+
+// ---- Phase 2 helper utilities for type/category queries (kept header-only for inlining) ----
+namespace edn {
+inline bool is_integer_base(BaseType b){
+    switch(b){
+        case BaseType::I1: case BaseType::I8: case BaseType::I16: case BaseType::I32: case BaseType::I64:
+        case BaseType::U8: case BaseType::U16: case BaseType::U32: case BaseType::U64: return true;
+        default: return false;
+    }
+}
+inline bool is_signed_base(BaseType b){
+    switch(b){
+        case BaseType::I1: case BaseType::I8: case BaseType::I16: case BaseType::I32: case BaseType::I64: return true; // treat i1 as signed for extension purposes (LLVM allows either)
+        default: return false;
+    }
+}
+inline unsigned base_type_bit_width(BaseType b){
+    switch(b){
+        case BaseType::I1: return 1; case BaseType::I8: case BaseType::U8: return 8; case BaseType::I16: case BaseType::U16: return 16;
+        case BaseType::I32: case BaseType::U32: return 32; case BaseType::I64: case BaseType::U64: return 64;
+        case BaseType::F32: return 32; case BaseType::F64: return 64; case BaseType::Void: return 0;
+    }
+    return 0;
+}
+inline bool is_float_base(BaseType b){ return b==BaseType::F32 || b==BaseType::F64; }
+}
+

@@ -22,7 +22,7 @@ void run_type_checker_tests(){
     auto bad_member = parse("(module (struct :name Point :fields [ (:name x :type i32) ]) (fn :name \"gety\" :ret i32 :params [(param (ptr (struct-ref Point)) %p)] :body [ (member %my Point %p y) (ret i32 %my) ]))");
     auto rbadm = tc.check_module(bad_member); assert(!rbadm.success);
     // load/store/index + metadata
-    auto mem = parse("(module (struct :name S :fields [ (:name v :type i32) ]) (fn :name \"memops\" :ret i32 :params [ (param (ptr (struct-ref S)) %s) ] :body [ (member %m S %s v) (const %c i32 0) (store i32 %m %c) (load %lv i32 %m) (ret i32 %lv) ]))");
+    auto mem = parse("(module (struct :name S :fields [ (:name v :type i32) ]) (fn :name \"memops\" :ret i32 :params [ (param (ptr (struct-ref S)) %s) ] :body [ (member-addr %ma S %s v) (const %c i32 0) (store i32 %ma %c) (load %lv i32 %ma) (ret i32 %lv) ]))");
     auto rm = tc.check_module(mem); assert(rm.success);
     auto arr = parse("(module (fn :name \"arr\" :ret i32 :params [] :body [ (const %zero i32 0) (const %zero2 i32 0) (const %a (array :elem i32 :size 4) 0) (index %e i32 %a %zero) (ret i32 %zero) ]))");
     auto ra = tc.check_module(arr); assert(!ra.success); // expect failure: %a not pointer to array
@@ -60,6 +60,9 @@ void run_type_checker_tests(){
     // comparisons
     auto cmpok = parse("(module (fn :name \"cmp\" :ret i1 :params [ (param i32 %a) (param i32 %b) ] :body [ (lt %l i32 %a %b) (ret i1 %l) ]))");
     auto rcmpok = tc.check_module(cmpok); assert(rcmpok.success);
+    // Legacy cmp warning path (cannot assert on env presence here, just ensure still succeeds)
+    auto cmpwarn = parse("(module (fn :name \"cmpw\" :ret i1 :params [ (param i32 %a) (param i32 %b) ] :body [ (gt %g i32 %a %b) (ret i1 %g) ]))");
+    auto rcmpwarn = tc.check_module(cmpwarn); assert(rcmpwarn.success);
     auto cmpbad = parse("(module (fn :name \"cmpb\" :ret i1 :params [ (param f32 %a) (param f32 %b) ] :body [ (lt %l f32 %a %b) (ret i1 %l) ]))");
     auto rcmpbad = tc.check_module(cmpbad); assert(!rcmpbad.success);
     // unsigned arithmetic & icmp

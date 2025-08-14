@@ -23,6 +23,30 @@ int main(int argc, char** argv){
     auto ast = parse(src);
     TypeContext tctx; IREmitter emitter(tctx); TypeCheckResult tcres; (void)emitter.emit(ast, tcres);
     if(!tcres.success){ std::cerr << "Type check failed:\n"; for(auto &e: tcres.errors) std::cerr << e.message << "\n"; return 2; }
+    if(!tcres.warnings.empty()){
+        std::cerr << "Warnings:\n";
+            auto format_loc=[&](const edn::AstNode* n){
+                if(!n) return std::string("");
+                return std::string("(line ")+std::to_string(n->line)+":"+std::to_string(n->col)+")"; };
+            for(auto &e : tcres.errors){
+                std::cerr << "error";
+                if(!e.code.empty()) std::cerr << "["<<e.code<<"]";
+                std::cerr << ": " << e.message;
+                if(e.node) std::cerr << " " << format_loc(e.node);
+                std::cerr << "\n";
+                if(!e.hint.empty()) std::cerr << "  hint: " << e.hint << "\n";
+                for(auto &n : e.notes){ std::cerr << "  note: " << n.message << "\n"; }
+            }
+            for(auto &w : tcres.warnings){
+                std::cerr << "warning";
+                if(!w.code.empty()) std::cerr << "["<<w.code<<"]";
+                std::cerr << ": " << w.message;
+                if(w.node) std::cerr << " " << format_loc(w.node);
+                std::cerr << "\n";
+                if(!w.hint.empty()) std::cerr << "  hint: " << w.hint << "\n";
+                for(auto &n : w.notes){ std::cerr << "  note: " << n.message << "\n"; }
+            }
+    }
     llvm::InitializeNativeTarget(); llvm::InitializeNativeTargetAsmPrinter();
     auto jitExp = llvm::orc::LLJITBuilder().create(); if(!jitExp){ std::cerr << "Failed to create JIT\n"; return 3; }
     auto jit = std::move(*jitExp);

@@ -114,5 +114,16 @@ void run_ir_emitter_test(){
     assert(m->getFunction("callee")!=nullptr); auto callerFn = m->getFunction("caller"); assert(callerFn); size_t callCount=0;
     for(auto &bb:*callerFn) for(auto &ins:bb) if(std::string(ins.getOpcodeName())=="call") ++callCount; assert(callCount==1);
     }
+
+    // Phi test: explicit phi merging then/else values
+    {
+        auto ast = parse("(module (fn :name \"ph\" :ret i32 :params [] :body [ (const %t i1 1) (if %t [ (const %a i32 1) ] [ (const %b i32 2) ]) (phi %m i32 [ (%a if.then.0) (%b if.else.1) ]) (ret i32 %m) ]))");
+        TypeContext tctx; IREmitter em(tctx); TypeCheckResult r; auto *m = em.emit(ast,r); assert(r.success && m); auto fn=m->getFunction("ph"); assert(fn); bool sawPhi=false; for(auto &bb:*fn) for(auto &ins:bb) if(ins.getOpcode()==llvm::Instruction::PHI) sawPhi=true; assert(sawPhi);
+    }
+    // Phi negative test (type mismatch between incoming and declared phi type)
+    {
+        auto ast = parse("(module (fn :name \"phb\" :ret i32 :params [] :body [ (const %a i32 1) (const %b i1 0) (phi %m i32 [ (%a entry) (%b entry) ]) (ret i32 %m) ]))");
+        TypeContext tctx; IREmitter em(tctx); TypeCheckResult r; auto *m=em.emit(ast,r); assert(!r.success); (void)m;
+    }
     std::cout << "IR emitter test passed\n";
 }

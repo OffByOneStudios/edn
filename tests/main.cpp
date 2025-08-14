@@ -6,6 +6,8 @@
 void run_type_tests();
 void run_type_checker_tests();
 void run_ir_emitter_test();
+void run_cast_tests();
+void run_globals_tests();
 
 int main(){
     using namespace edn;
@@ -47,6 +49,8 @@ int main(){
     run_type_tests();
     run_type_checker_tests();
     run_ir_emitter_test();
+    run_cast_tests();
+    run_globals_tests();
     std::cout << "All tests passed\n";
     return 0;
 }
