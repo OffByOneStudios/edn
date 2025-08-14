@@ -46,6 +46,13 @@ void run_ir_emitter_test(){
         auto ast = parse("(module :id \"m_icmp\" (fn :name \"uci\" :ret i1 :params [ (param u32 %a) (param u32 %b) ] :body [ (icmp %r u32 :pred ult %a %b) (ret i1 %r) ]) )");
         TypeCheckResult r; auto *m = em.emit(ast,r); assert(r.success && m); auto fn = m->getFunction("uci"); assert(fn); size_t cmpCount=0; for(auto &bb:*fn) for(auto &ins:bb) if(ins.getOpcode()==llvm::Instruction::ICmp) ++cmpCount; assert(cmpCount==1);
     }
+    // float arithmetic & fcmp test
+    {
+        std::cout << "IR test: starting float module\n";
+        IREmitter em(ctx);
+        auto ast = parse("(module :id \"m_float\" (fn :name \"fop\" :ret i1 :params [ (param f32 %x) (param f32 %y) ] :body [ (fadd %a f32 %x %y) (fmul %m f32 %a %x) (fcmp %c f32 :pred olt %m %y) (ret i1 %c) ]) )");
+        TypeCheckResult r; auto *m = em.emit(ast,r); assert(r.success && m); auto fn = m->getFunction("fop"); assert(fn); bool sawFAdd=false,sawFCmp=false; for(auto &bb:*fn) for(auto &ins:bb){ auto op=ins.getOpcodeName(); if(op==std::string("fadd")) sawFAdd=true; if(ins.getOpcode()==llvm::Instruction::FCmp) sawFCmp=true; } assert(sawFAdd && sawFCmp);
+    }
     // mem function module
     {
     std::cout << "IR test: starting mem module\n";

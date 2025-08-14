@@ -201,3 +201,79 @@ Phase 2 considered complete when:
 
 ---
 *Prepared for Phase 2 kickoff. Ready to begin with Unsigned + icmp unification once approved.*
+
+---
+
+## Progress Snapshot (As of 2025-08-13)
+
+Completed Milestones / Features:
+- M1 Unsigned integers (u8/u16/u32/u64) added; type system & parser updated; emitter maps them; unsigned ops (udiv/urem, unsigned icmp predicates) working.
+- Comparison refactor: canonical `(icmp %dst <type> :pred <predicate> %a %b)` implemented with predicates { eq ne slt sgt sle sge ult ugt ule uge }.
+- Legacy comparison forms `(eq ne lt gt le ge)` still accepted (deprecation phase pending warning mechanism).
+- M2 Floating-point arithmetic: `fadd fsub fmul fdiv` plus `(fcmp %dst <type> :pred <predicate> %a %b)` with predicates { oeq one olt ogt ole oge }.
+- Emitter rewrite: `src/edn.cpp` fully cleaned after prior corruption; unified recursive emission lambda; pre-pass for structs & globals; all tests green.
+- Struct field access & address: `member` and `member-addr` stable.
+- Control flow constructs (if / if-else / while / break) functioning with consistent block naming.
+- Global load/store, array indexing (`index`), pointer arithmetic via GEP implemented.
+- Call instruction basic support (function creation with inferred param types).
+
+Current Test Coverage (Passing):
+- Integer & unsigned arithmetic, division, remainder.
+- Float arithmetic.
+- Signed & unsigned comparisons (legacy + icmp predicates) and float comparisons via fcmp.
+- Bitwise & shift ops.
+- Memory: alloca/load/store, array index, struct member & member-addr.
+- Control flow: if, if-else, while, break, return.
+- Globals and calls.
+
+Pending / Next Milestones:
+1. Cast Instructions (next to implement):
+	- Integer width: `zext`, `sext`, `trunc`.
+	- Reinterpret / same-size: `bitcast`.
+	- Integer/float: `sitofp`, `uitofp`, `fptosi`, `fptoui`.
+	- Pointer/int and pointer/pointer: `ptrtoint`, `inttoptr` (and optionally alias `ptrcast`).
+	Implementation Notes: validate bit widths & category; use corresponding LLVM IRBuilder APIs; update tests.
+2. Deprecation warnings for legacy comparison ops (env flag `EDN_WARN_DEPRECATED=1`).
+3. Phi / SSA introduction (either explicit `(phi ...)` or mem2phi pass for simple patterns).
+4. Diagnostic framework (collect emission errors, richer type mismatch messages).
+5. Aggregate literals & global constant data (struct/array initializers).
+6. Cast test suite & golden IR snapshots.
+7. Optional optimization pipeline scaffolding (mem2reg, instcombine) behind flag.
+
+Cast Instruction Spec (Planned Forms):
+```
+(zext %dst <to-int-type> %src)      ; zero extend narrower int -> wider int
+(sext %dst <to-int-type> %src)      ; sign extend narrower signed int -> wider int
+(trunc %dst <to-int-type> %src)     ; truncate wider int -> narrower int
+(bitcast %dst <to-type> %src)       ; same bit-width int <-> int / int <-> float / pointer <-> pointer
+(sitofp %dst <float-type> %src)     ; signed int -> float
+(uitofp %dst <float-type> %src)     ; unsigned int -> float
+(fptosi %dst <int-type> %src)       ; float -> signed int
+(fptoui %dst <int-type> %src)       ; float -> unsigned int
+(ptrtoint %dst <int-type> %src)     ; pointer -> integer (matching width)
+(inttoptr %dst (ptr <elem>) %src)   ; integer (matching width) -> pointer
+```
+Validation Rules:
+- Width monotonicity for zext/sext/trunc (to != from, and direction correct).
+- bitcast requires identical bit size OR pointer<->pointer.
+- ptrtoint/inttoptr require integer bit width == pointer bit width (target: 64-bit).
+- Float/int conversions require operand categories (int vs float) appropriate.
+
+Testing Plan Addendum (Casts):
+- zext/sext preserve/extend sign correctly (e.g., sext i8 -1 -> i32 0xFFFFFFFF).
+- trunc drops upper bits; verify with round-trip (zext after trunc) mismatch expected if bits lost.
+- sitofp/uitofp then fptosi/fptoui back (value range safe subset) round-trips.
+- ptrtoint/inttoptr alloca pointer round-trip equality (pointer cast to int and back loads same address).
+- bitcast i32<->f32 reinterpret: store then load through casted type (semantic check optional).
+
+Operational Environment Flags (Current & Planned):
+- `EDN_TRACE_IR` (existing): dump LLVM IR after module emission.
+- `EDN_WARN_DEPRECATED` (planned): enable legacy comparison warnings.
+- `EDN_ENABLE_PASSES` (planned): enable optimization pass pipeline.
+
+Hand-off Notes:
+- Core emission logic in `IREmitter::emit` inside `src/edn.cpp`; add new else-if blocks for casts near existing arithmetic for locality.
+- Type width helper not yet implemented; may add inline lambda mapping BaseType to bit width for cast validation.
+- All tests executed via `edn_tests` target; add new `cast` tests into existing IR test file or a new `cast_test.cpp` for clarity.
+
+Ready Next Action: Implement cast instructions & accompanying tests.
