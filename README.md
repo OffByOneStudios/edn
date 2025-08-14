@@ -46,7 +46,72 @@ Types are provided inline using forms like `i32`, `i1`, `(ptr i32)`, `(array :el
 
 This is intentionally minimal: no PHI nodes (merges use temporary stack slots), no floating-point arithmetic yet, and structs are declared with `(struct :name MyS :fields [ (field :name a :type i32) ... ])`.
 
+Phase 2 adds explicit phi node support:
+`(phi %dst <type> [ (%val %predBlockName) ... ])`
+Example:
+```
+(const %t i1 1)
+(if %t [ (const %a i32 1) ] [ (const %b i32 2) ])
+(phi %m i32 [ (%a if.then.0) (%b if.else.1) ])
+(ret i32 %m)
+```
+Block names correspond to the auto-generated structured control flow labels (`if.then.N`, `if.else.N`, etc.).
+
 - Minimal printing (best-effort, non-canonical formatting)
+
+### Diagnostics (Phase 2)
+The type checker now emits structured diagnostics:
+
+Format (driver output):
+```
+error[E0003]: binop type must be integer (line 12:5)
+	hint: choose one of i1/i8/i16/i32/i64/u8/u16/u32/u64
+```
+
+Each `TypeError` / `TypeWarning` contains:
+- code: stable identifier (`E####` / `W####` or category code like EMOD1)
+- message: short human description
+- hint: optional quick-fix guidance
+- notes: optional related messages (future use)
+
+Current code ranges (subject to expansion):
+- E0001–E0007 integer arithmetic
+- E0100–E0106 legacy (deprecated) simple cmp ops
+- E0110–E0118 icmp (typed integer comparisons)
+- E0120–E0128 fcmp (typed float comparisons)
+- E0200–E0214 load / store
+- E0300–E0309 phi construction
+- E0400–E0408 function call
+- E0500–E0508 cast family (arity/src/dst/redefinition + validation)
+- E0600–E0606 bit / logical (and/or/xor/shifts)
+- E0700–E0706 floating arithmetic (fadd/fsub/fmul/fdiv)
+- E0800–E0818 struct member / member-addr
+- E0820–E0827 index (array element access)
+- E0900–E0905 global load
+- E0910–E0915 global store
+- E1000–E1007 control flow if/while/break
+- E1010–E1012 return
+- E1100–E1110 const / assign / alloca + related
+- E1200–E1209 struct-lit
+- E1210–E1218 array-lit
+- E1220–E1228 global const/initializer validation (scalar/array/struct + const store rejection)
+
+General fallback uses `EGEN` (generic) until specialized code coverage is completed for all instructions.
+
+### New Aggregate & Global Features (Phase 2 Milestones M4/M5)
+
+Instructions:
+- `(struct-lit %dst StructName [ field1 %v1 field2 %v2 ... ])` -> allocates stack struct and stores field values (result is pointer to struct)
+- `(array-lit %dst <elem-type> <size> [ %e0 %e1 ... ])` -> allocates stack array and stores elements (result is pointer to array)
+
+Const Globals:
+```
+(global :name G :type i32 :init 7 :const true)
+(global :name ARR :type (array :elem i32 :size 3) :init [1 2 3] :const true)
+(struct :name P :fields [ (field :name x :type i32) (field :name y :type f32) ])
+(global :name S :type (struct-ref P) :init [1 2.0] :const true)
+```
+Diagnostics ensure initializer shapes and literal types match declared global types and disallow storing to a `:const` global (E1226).
 
 ## Not yet implemented / roadmap
 - Big integers / ratios

@@ -71,12 +71,17 @@ Add instructions:
 - `(bitcast %dst <to-type> %src)` (same bit width reinterpret)
 - `(ptrcast %dst (ptr <to>) %src)` (optional alias to bitcast when widths match).
 
-## 4. PHI Nodes
-Introduce instruction:
+## 4. PHI Nodes (Implemented baseline)
+Implemented instruction:
 ```
 (phi %dst <type> [ (%incomingVar %labelName) ... ])
 ```
-Parser & emitter: Build `llvm::PHINode` in the corresponding block; requires two-pass CFG emission for structured constructs. Option: phased: first implement minimal manual phi in `if` with both branches assigning to an alloca then rewrite to `phi` if simple pattern recognized (optimization pass: MemoryToPhi).
+Notes:
+- `labelName` must match currently auto-generated structured block names (e.g. `if.then.N`, `if.else.N`, `while.body.N`, `while.end.N`).
+- Emission defers actual `llvm::PHINode` creation until after function body traversal; collects pending phis with their incoming (%value, label) pairs.
+- Type checker validates: destination uniqueness, vector form, at least two incoming, each incoming value previously defined and type-compatible.
+- No mem2phi optimization yet; only explicit form supported.
+Next (future) enhancement: pattern-based rewrite of simple stack slot merges into phi.
 
 ## 5. Aggregate Literals & Initialization
 Syntax proposals:
@@ -204,13 +209,14 @@ Phase 2 considered complete when:
 
 ---
 
-## Progress Snapshot (As of 2025-08-13)
+## Progress Snapshot (As of 2025-08-14)
 
 Completed Milestones / Features:
 - M1 Unsigned integers (u8/u16/u32/u64) added; type system & parser updated; emitter maps them; unsigned ops (udiv/urem, unsigned icmp predicates) working.
 - Comparison refactor: canonical `(icmp %dst <type> :pred <predicate> %a %b)` implemented with predicates { eq ne slt sgt sle sge ult ugt ule uge }.
-- Legacy comparison forms `(eq ne lt gt le ge)` still accepted (deprecation phase pending warning mechanism).
+- Legacy comparison forms `(eq ne lt gt le ge)` still accepted; deprecation warnings now emitted when `EDN_WARN_DEPRECATED=1` is set (implemented).
 - M2 Floating-point arithmetic: `fadd fsub fmul fdiv` plus `(fcmp %dst <type> :pred <predicate> %a %b)` with predicates { oeq one olt ogt ole oge }.
+- Cast instruction suite implemented: `zext sext trunc bitcast sitofp uitofp fptosi fptoui ptrtoint inttoptr` with full type/width validation & tests (constant-fold avoidance in tests via alloca/load pattern).
 - Emitter rewrite: `src/edn.cpp` fully cleaned after prior corruption; unified recursive emission lambda; pre-pass for structs & globals; all tests green.
 - Struct field access & address: `member` and `member-addr` stable.
 - Control flow constructs (if / if-else / while / break) functioning with consistent block naming.
@@ -218,27 +224,26 @@ Completed Milestones / Features:
 - Call instruction basic support (function creation with inferred param types).
 
 Current Test Coverage (Passing):
-- Integer & unsigned arithmetic, division, remainder.
-- Float arithmetic.
-- Signed & unsigned comparisons (legacy + icmp predicates) and float comparisons via fcmp.
-- Bitwise & shift ops.
-- Memory: alloca/load/store, array index, struct member & member-addr.
-- Control flow: if, if-else, while, break, return.
-- Globals and calls.
+- Integer & unsigned arithmetic, division, remainder
+- Float arithmetic
+- Signed & unsigned comparisons (legacy + icmp predicates) and float comparisons via fcmp
+- Bitwise & shift ops
+- Memory: alloca/load/store, array index, struct member & member-addr
+- Control flow: if, if-else, while, break, return
+- Struct & array aggregate literals (construction into stack memory)
+- Const globals (scalars, arrays, structs) with initializer validation & mutation rejection
+- Globals and calls
+
+Recently Completed Since Last Snapshot:
+- M4 Aggregate literals: implemented `struct-lit` and `array-lit` with diagnostics E1200–E1209; emission allocates and stores field/element values; tests integrated indirectly via usage in later milestones (dedicated negative tests still a future improvement)
+- M5 Const globals & data: implemented `:const` flag, initializer validation (E1220–E1228), constant emission for scalar/array/struct, prevention of stores to const (E1226), tests added (positive + negative), docs & changelog updated, fixed `TypeChecker::reset()` to clear globals preventing state leakage
 
 Pending / Next Milestones:
-1. Cast Instructions (next to implement):
-	- Integer width: `zext`, `sext`, `trunc`.
-	- Reinterpret / same-size: `bitcast`.
-	- Integer/float: `sitofp`, `uitofp`, `fptosi`, `fptoui`.
-	- Pointer/int and pointer/pointer: `ptrtoint`, `inttoptr` (and optionally alias `ptrcast`).
-	Implementation Notes: validate bit widths & category; use corresponding LLVM IRBuilder APIs; update tests.
-2. Deprecation warnings for legacy comparison ops (env flag `EDN_WARN_DEPRECATED=1`).
-3. Phi / SSA introduction (either explicit `(phi ...)` or mem2phi pass for simple patterns).
-4. Diagnostic framework (collect emission errors, richer type mismatch messages).
-5. Aggregate literals & global constant data (struct/array initializers).
-6. Cast test suite & golden IR snapshots.
-7. Optional optimization pipeline scaffolding (mem2reg, instcombine) behind flag.
+1. Diagnostics polish (expected vs actual wording, name suggestions, secondary notes, extended fcmp predicates)
+2. Golden IR snapshots & pattern-based tests (introduce tests/golden with matcher utility)
+3. CLI enhancements & optimization pipeline scaffolding (mem2reg, instcombine) behind `EDN_ENABLE_PASSES`
+4. Optional optimization pipeline & extended fcmp predicate set
+5. Additional aggregate/global tests: struct field mismatch, array element type mismatch, nested aggregate const initializers (future)
 
 Cast Instruction Spec (Planned Forms):
 ```
@@ -276,4 +281,53 @@ Hand-off Notes:
 - Type width helper not yet implemented; may add inline lambda mapping BaseType to bit width for cast validation.
 - All tests executed via `edn_tests` target; add new `cast` tests into existing IR test file or a new `cast_test.cpp` for clarity.
 
-Ready Next Action: Implement cast instructions & accompanying tests.
+Ready Next Action: Begin M4 aggregate literals implementation (parser/type checker/emitter scaffolding) then diagnostics polish.
+
+---
+
+### M4 Implementation Work Log (Aggregate Literals) - Completed
+Planned Syntax (value form returning pointer for now):
+```
+(struct-lit %dst StructName [ field1 %v1 field2 %v2 ... ])
+(array-lit %dst <elem-type> [ %e0 %e1 %e2 ... ])
+```
+Initial Scope:
+- In-function literals allocate stack storage (alloca) and store field/element values sequentially; `%dst` becomes pointer to aggregate.
+- Type checker validates:
+	* Struct exists & field list matches declared fields (exact order for first iteration).
+	* Array literal element count >= 1 and each element variable has matching type.
+- Emission lowering strategy (phase 1 of M4):
+	* struct-lit: create alloca of struct type, for each field compute GEP, store value, result pointer in `%dst`.
+	* array-lit: allocate `(array :elem T :size N)` then store each element by index.
+- Future (Globals V2): reuse pattern at global scope with constant folding into `ConstantStruct` / `ConstantArray`.
+
+Planned / Assigned Error Code Range Reservations:
+- E1200–E1209 struct-lit
+- E1210–E1219 array-lit
+
+Status:
+- struct-lit & array-lit opcodes shipped with diagnostics E1200–E1209
+- Emission: stack allocation + field/element stores; `%dst` holds pointer to aggregate
+- README & CHANGELOG updated (Phase 2 sections)
+Remaining Nice-to-Haves:
+1. Add explicit aggregate literal negative tests (field mismatch, order, type)
+2. Consider supporting unordered / partial field specification (would require keyword/value or builder form)
+3. Potential direct value (non-pointer) struct result alternative (defer)
+
+### M5 Implementation Work Log (Globals v2 Const Data) - Completed
+Scope (initial slice delivered):
+- Parser/type checker: added :const flag and :init node capture for globals (scalars + raw vectors).
+- Emitter: supports scalar and simple array constant initialization when :const true (and any global, currently) and falls back to zero for unsupported forms.
+
+Delivered:
+1. Type checker validation for scalar/array/struct global initializers with codes E1220–E1225, E1226 (store), E1227 (missing init), E1228 (unsupported kind)
+2. Constant emission: `ConstantInt`, `ConstantFP`, `ConstantArray`, `ConstantStruct` (flat base fields/elements)
+3. Prevention of mutation: `gstore` to const emits E1226
+4. Tests (`globals_test.cpp`): positive (scalar, array, struct) and negative (const store, array length mismatch)
+5. Documentation: README + CHANGELOG updated; milestone marked complete in this plan
+6. Bug fix: `TypeChecker::reset()` now clears `globals_` (previous state carryover resolved)
+
+Remaining / Future (Post-M5):
+1. Nested aggregate constant initializers (structs containing arrays, arrays of structs)
+2. Additional negative tests (struct field count/type mismatch, unsupported nested types) 
+3. Enhanced diagnostic secondary notes / context ranges
