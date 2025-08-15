@@ -1,4 +1,5 @@
-add_executable(edn_tests main.cpp types_test.cpp type_checker_test.cpp ir_emitter_test.cpp cast_test.cpp globals_test.cpp)
+file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+add_executable(edn_tests ${TEST_SOURCES})
 
 target_link_libraries(edn_tests PRIVATE edn)
 

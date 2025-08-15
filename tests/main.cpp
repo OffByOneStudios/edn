@@ -8,6 +8,19 @@ void run_type_checker_tests();
 void run_ir_emitter_test();
 void run_cast_tests();
 void run_globals_tests();
+void run_diagnostics_tests();
+void run_phase2_feature_tests();
+void run_phase3_pointer_arith_tests();
+void run_phase3_addr_deref_tests();
+void run_phase3_fnptr_tests();
+int run_phase3_typedef_tests();
+int run_phase3_enum_tests();
+void phase3_for_continue_tests();
+void run_phase3_switch_tests();
+int run_phase3_union_tests();
+int run_phase3_variadic_tests();
+int run_phase3_variadic_runtime_test();
+int run_phase3_cast_sugar_test();
 
 int main(){
     using namespace edn;
@@ -51,6 +64,19 @@ int main(){
     run_ir_emitter_test();
     run_cast_tests();
     run_globals_tests();
+    run_diagnostics_tests();
+    run_phase2_feature_tests();
+    run_phase3_pointer_arith_tests();
+    run_phase3_addr_deref_tests();
+    run_phase3_fnptr_tests();
+    run_phase3_typedef_tests();
+    run_phase3_enum_tests();
+        phase3_for_continue_tests();
+    run_phase3_switch_tests();
+    run_phase3_union_tests();
+    run_phase3_variadic_tests();
+    run_phase3_variadic_runtime_test();
+    run_phase3_cast_sugar_test();
     std::cout << "All tests passed\n";
     return 0;
 }

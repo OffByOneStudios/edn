@@ -1,0 +1,1 @@
+(module (fn :name "sum" :ret i32 :params [ (param i32 %a) (param i32 %b) ] :vararg true :body [ (ret i32 %a) ] (fn :name "main" :ret i32 :params [] :body [ (const %c i32 1) (call %r i32 sum %c) (ret i32 %r) ]) )

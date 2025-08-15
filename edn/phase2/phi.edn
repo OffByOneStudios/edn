@@ -1,0 +1,6 @@
+(module :id "phi"
+  (fn :name "abs" :ret i32 :params [ (param i32 %x) ]
+      :body [ (const %zero i32 0) (lt %neg i32 %x %zero)
+              (if %neg [ (sub %n i32 %zero %x) (ret i32 %n) ])
+              (ret i32 %x) ])
+)

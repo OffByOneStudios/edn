@@ -1,0 +1,6 @@
+(module :id "floats"
+  (fn :name "mix" :ret f32 :params [ (param f32 %a) (param f32 %b) (param f32 %t) ]
+      :body [ (fsub %one f32 %b %a) (fmul %scaled f32 %one %t) (fadd %out f32 %a %scaled) (ret f32 %out) ])
+  (fn :name "main" :ret f32 :params []
+      :body [ (const %a f32 1.0) (const %b f32 3.0) (const %t f32 0.25) (call %r f32 mix %a %b %t) (ret f32 %r) ])
+)

@@ -1,0 +1,5 @@
+(module :id "unsigned"
+  (fn :name "wrap" :ret u32 :params [ (param u32 %x) ]
+      :body [ (const %m u32 4294967295) (add %s u32 %x %m) (ret u32 %s) ])
+  (fn :name "main" :ret u32 :params [] :body [ (const %z u32 5) (call %r u32 wrap %z) (ret u32 %r) ])
+)

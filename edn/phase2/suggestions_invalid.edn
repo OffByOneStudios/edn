@@ -1,0 +1,4 @@
+(module :id "suggestions-invalid"
+  (global :name GLOB1 :type i32 :init 1)
+  (fn :name "bad" :ret i32 :params [] :body [ (gload %v i32 GLOB ) (ret i32 %v) ])
+)
