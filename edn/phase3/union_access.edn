@@ -1,0 +1,10 @@
+(module
+  (union :name U :fields [ (ufield :name i :type i32) (ufield :name f :type f32) ])
+  (fn :name "union_demo" :ret i32 :params [] :body [
+    ; allocate union storage (lowered as struct-sized alloca internally)
+    (alloca %up (struct-ref U))
+    ; read integer field (uninitialized => UB, but fine for demo path)
+    (union-member %iv U %up i)
+    (ret i32 %iv)
+  ])
+)

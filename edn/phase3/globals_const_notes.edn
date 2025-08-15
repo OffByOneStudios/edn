@@ -1,0 +1,11 @@
+(module
+  (struct :name P :fields [ (:name x :type i32) (:name y :type f32) ])
+  (global :name GOOD :type i32 :const true :init 5)
+  ; mismatch scalar (float literal into i32)
+  (global :name BAD1 :type i32 :const true :init 3.14)
+  ; array mismatch (length + type) to exercise E1222/E1223
+  (global :name ARR :type (array :elem i32 :size 2) :const true :init [1 2 3])
+  ; struct mismatch (wrong field literal type)
+  (global :name S :type (struct-ref P) :const true :init [1 2.2 3])
+  (fn :name "use" :ret i32 :params [] :body [ (gload %v i32 GOOD) (ret i32 %v) ])
+)

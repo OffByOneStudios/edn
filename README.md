@@ -1,14 +1,17 @@
 # edn
 
-Header-only EDN parser library with metadata + transformation layer.
+Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3 advanced features).
 
 ## Features (current)
 - Header-only: single include `#include <edn/edn.hpp>`
-- EDN data types: nil, booleans, integers, floats, strings, keywords, symbols, lists, vectors, maps, sets, tagged values
-- Per-node metadata map (string -> node) automatically populated with `line/col/end-line/end-col`
-- Transformer system (macro expansion + visitor traversal) for building higher-level IR
-- Example LLVM-like IR emitter (see `examples/llvm_ir_emitter.cpp`)
-### IR Emitter Subset (Phase 1)
+- Rich EDN data model: nil, booleans, integers, floats, strings, keywords, symbols, lists, vectors, maps, sets, tagged values
+- Per-node metadata (line/col span) auto-populated; accessible for diagnostics
+- Macro / transformer system for syntactic extension & metadata enrichment
+- LLVM IR emission for a custom SSA instruction subset
+- Multi-phase language growth (Phases 1–3) with stable error codes & structured notes
+- JSON diagnostics export (`EDN_DIAG_JSON=1`)
+
+### IR Instruction Set (Phases 1–3)
 
 The embedded experimental IR supports these instruction forms (EDN list syntax):
 
@@ -44,7 +47,27 @@ Functions & Calls
 
 Types are provided inline using forms like `i32`, `i1`, `(ptr i32)`, `(array :elem i32 :size 4)`, `(struct-ref MyS)`.
 
-This is intentionally minimal: no PHI nodes (merges use temporary stack slots), no floating-point arithmetic yet, and structs are declared with `(struct :name MyS :fields [ (field :name a :type i32) ... ])`.
+Additional Phase 2 / 3 instructions & forms:
+- PHI nodes: `(phi %dst <type> [ (%val %predBlock) ... ])`
+- Float arithmetic: `fadd`, `fsub`, `fmul`, `fdiv`
+- Floating comparisons: `(fcmp %dst <f-type> :pred <pred> %a %b)`
+- Pointer arithmetic: `(ptr-add)`, `(ptr-sub)`, element difference `(ptr-diff)`
+- Address-of & dereference sugar: `(addr %p (ptr <T>) %v)`, `(deref %v <T> %p)`
+- Function pointers & indirect calls: `(fnptr ...)`, `(call-indirect %dst <ret> %fptr %args...)`
+- Typedef aliases: `(typedef :name Alias :type <type>)`
+- Enums: `(enum :name E :underlying i32 :values [ (eval :name A :value 0) ... ])`
+- Unions: `(union :name U :fields [ (ufield :name a :type i32) ... ])` + `(union-member %v U %ptr field)`
+- Variadic functions: `:vararg true` on `fn` + runtime vararg intrinsic support
+- For loops & continue: `(for :init [...] :cond %c :step [...] :body [...])`, `(continue)`
+- Switch: `(switch %expr :cases [ (case <const> [ ... ]) ... ] :default [ ... ])`
+- Cast sugar: `(as %dst <to-type> %src)` desugared to concrete cast ops (zext, trunc, uitofp, etc.)
+- Structured global initializers: `(global :name G :type (struct-ref S) :init [ ... ] :const true)` with validation
+
+Phase 3 feature sample programs: see `edn/phase3/` for one `.edn` file per new construct plus a globals mismatch diagnostics example. Use the `phase3_driver` tool to JIT-run them, e.g.:
+```pwsh
+cmake --build build --config Debug
+./build/Debug/phase3_driver edn/phase3/cast_sugar.edn cast_demo
+```
 
 Phase 2 adds explicit phi node support:
 `(phi %dst <type> [ (%val %predBlockName) ... ])`
@@ -59,8 +82,8 @@ Block names correspond to the auto-generated structured control flow labels (`if
 
 - Minimal printing (best-effort, non-canonical formatting)
 
-### Diagnostics (Phase 2)
-The type checker now emits structured diagnostics:
+### Diagnostics
+Structured diagnostics with stable error codes, per-error hints, and optional note list (`expected` vs `found`). JSON mode enabled by setting `EDN_DIAG_JSON=1` before running tests / emitter.
 
 Format (driver output):
 ```
@@ -74,27 +97,40 @@ Each `TypeError` / `TypeWarning` contains:
 - hint: optional quick-fix guidance
 - notes: optional related messages (future use)
 
-Current code ranges (subject to expansion):
+Current (Phase 1–3) code ranges:
 - E0001–E0007 integer arithmetic
-- E0100–E0106 legacy (deprecated) simple cmp ops
-- E0110–E0118 icmp (typed integer comparisons)
-- E0120–E0128 fcmp (typed float comparisons)
+- E0100–E0106 legacy deprecated cmp wrappers (eq/ne/lt/...)
+- E0110–E0118 icmp predicates
+- E0120–E0128 fcmp predicates
 - E0200–E0214 load / store
-- E0300–E0309 phi construction
-- E0400–E0408 function call
-- E0500–E0508 cast family (arity/src/dst/redefinition + validation)
-- E0600–E0606 bit / logical (and/or/xor/shifts)
-- E0700–E0706 floating arithmetic (fadd/fsub/fmul/fdiv)
+- E0300–E0309 phi (with structured incoming mismatch notes on E0309)
+- E0400–E0408 direct function call
+- E0500–E0508 explicit cast op family
+- E0600–E0606 bit / logical ops
+- E0700–E0706 float arithmetic
 - E0800–E0818 struct member / member-addr
 - E0820–E0827 index (array element access)
 - E0900–E0905 global load
 - E0910–E0915 global store
-- E1000–E1007 control flow if/while/break
+- E1000–E1007 if / while / break
 - E1010–E1012 return
-- E1100–E1110 const / assign / alloca + related
-- E1200–E1209 struct-lit
-- E1210–E1218 array-lit
-- E1220–E1228 global const/initializer validation (scalar/array/struct + const store rejection)
+- E1100–E1110 const / assign / alloca
+- E1200–E1209 struct literal
+- E1210–E1218 array literal
+- E1220–E1228 global const & initializer validation (E1220/E1223/E1225 emit expected/found notes)
+- E1300–E1309 pointer arithmetic
+- E1310–E1319 address-of / deref
+- E1320–E1329 function pointer + indirect call
+- E1330–E1334 typedef
+- E1340–E1349 enum
+- E1350–E1359 union
+- E1360–E1369 variadic functions
+- E1370–E1379 for loop
+- E1380 misuse of continue (reserved range)
+- E1390–E1399 switch
+- E13A0–E13A5 cast sugar dispatcher `(as ...)`
+
+Notes use the `TypeNote` vector; mismatch helpers add two notes: one `expected <T>`, one `found <T>`.
 
 General fallback uses `EGEN` (generic) until specialized code coverage is completed for all instructions.
 
@@ -113,12 +149,20 @@ Const Globals:
 ```
 Diagnostics ensure initializer shapes and literal types match declared global types and disallow storing to a `:const` global (E1226).
 
-## Not yet implemented / roadmap
+## Phase 3 Out-of-Scope / Deferred
+The following originally proposed Phase 3 items are now explicitly deferred:
+- Source span mapping for non-S-expression surface (would require alternate parser)
+- Optimization pass pipeline (`EDN_ENABLE_PASSES`) – design placeholder only
+- Union write/store convenience op (current API only supports reads via `union-member`)
+- Active union variant tracking / safety tagging
+- Additional suggestion coverage for typedef / enum / union fields (basic may be present; advanced fuzzy ranking deferred)
+- Constant-folding control toggles (current cast materialization workaround accepted for tests)
+
+General future roadmap (unrelated to Phase 3 closure):
 - Big integers / ratios
 - Character literals
 - Namespaces for keywords & symbols
 - Tagged literal dispatch / user extension registry
-- Proper hash-based set & map preserving insertion order (currently vector-backed)
 - Streaming / incremental parser
 - Performance tuning & benchmarking harness
 
@@ -165,5 +209,21 @@ MIT (see LICENSE)
 ## Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md). Please add tests for new features.
 
+## JSON Diagnostics Example
+Set the environment variable before running your tool/tests:
+```pwsh
+$env:EDN_DIAG_JSON=1; .\build\tests\Debug\edn_tests.exe
+```
+Sample output snippet:
+```json
+{"success":false,"errors":[{"code":"E1220","message":"global scalar initializer type mismatch","hint":"match literal to declared type","line":3,"col":1,"notes":[{"message":"expected i32","line":3,"col":1},{"message":"found f64","line":3,"col":1}]}],"warnings":[]}
+```
+
 ## Changelog
-See [CHANGELOG.md](CHANGELOG.md) for upcoming and past changes.
+See [CHANGELOG.md](CHANGELOG.md) for detailed changes.
+
+## Phase 3 Driver & Examples
+`phase3_driver` mirrors the original `phase1_driver` but supports the extended instruction set and structured JSON diagnostics. Examples live under `edn/phase3`. A failing diagnostics showcase (`globals_const_notes.edn`) intentionally triggers errors with expected/found notes; run it for JSON output:
+```pwsh
+$env:EDN_DIAG_JSON=1; ./build/Debug/phase3_driver edn/phase3/globals_const_notes.edn use
+```

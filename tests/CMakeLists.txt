@@ -5,4 +5,7 @@ target_link_libraries(edn_tests PRIVATE edn)
 
 target_compile_features(edn_tests PRIVATE cxx_std_20)
 
+# Provide project source dir to tests so they can open example .edn files reliably
+target_compile_definitions(edn_tests PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 add_test(NAME edn.basic COMMAND edn_tests)

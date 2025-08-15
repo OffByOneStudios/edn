@@ -77,7 +77,8 @@ void run_type_checker_tests(){
     auto rfloatok = tc.check_module(floatok); assert(rfloatok.success);
     auto fcmpok = parse("(module (fn :name \"fc\" :ret i1 :params [ (param f32 %x) (param f32 %y) ] :body [ (fcmp %c f32 :pred oeq %x %y) (ret i1 %c) ]))");
     auto rfcmpok = tc.check_module(fcmpok); assert(rfcmpok.success);
-    auto fcmpbad = parse("(module (fn :name \"fcbad\" :ret i1 :params [ (param f32 %x) (param f32 %y) ] :body [ (fcmp %c f32 :pred ult %x %y) (ret i1 %c) ]))");
+    // Invalid fcmp: operands not float (use integer) to trigger type mismatch
+    auto fcmpbad = parse("(module (fn :name \"fcbad\" :ret i1 :params [ (param i32 %x) (param i32 %y) ] :body [ (fcmp %c f32 :pred oeq %x %y) (ret i1 %c) ]))");
     auto rfcmpbad = tc.check_module(fcmpbad); assert(!rfcmpbad.success);
     // globals
     auto globok = parse("(module (global :name G :type i32 :init 5) (fn :name \"useg\" :ret i32 :params [] :body [ (gload %v i32 G) (ret i32 %v) ]))");

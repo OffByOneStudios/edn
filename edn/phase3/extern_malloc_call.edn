@@ -1,0 +1,10 @@
+; Demonstrate calling external malloc now that resolver is installed.
+(module
+  (fn :name "malloc" :ret (ptr i8) :params [ (param i64 %size) ] :external true)
+  (fn :name "main" :ret i32 :params [] :body [
+        (const %sz i64 32)
+        (call %p (ptr i8) malloc %sz)
+        (const %zero i32 0)
+        (ret i32 %zero)
+  ])
+)

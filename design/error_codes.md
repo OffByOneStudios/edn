@@ -30,12 +30,14 @@ Status: Initial extraction on 2025-08-14. Keep this file in sync when adding / r
 | E130x    | Pointer arithmetic (`ptr-add/sub/diff`) |
 | E131x    | Address-of / deref (`addr` / `deref`)   |
 | E132x    | Function pointers / indirect call       |
-| E133x    | Typedef aliases                          |
-| E134x    | Enum declarations & constants             |
-| E135x    | Union declarations & access               |
-| E137x    | For loop construct                        |
-| E138x    | Continue statement                        |
-| E139x    | Switch construct                          |
+| E133x    | Typedef aliases                         |
+| E134x    | Enum declarations & constants           |
+| E135x    | Union declarations & access             |
+| E136x    | Variadics & vararg intrinsics           |
+| E137x    | For loop construct                      |
+| E138x    | Continue statement                      |
+| E139x    | Switch construct                        |
+| E13Ax    | Cast sugar `(as ...)`                   |
 
 ---
 
@@ -356,18 +358,6 @@ Form: `(as %dst <to-type> %src)` chooses an underlying concrete cast opcode (zex
 | E13A4  | as unsupported conversion| No valid canonical cast between the two types   | adjust source/target types or insert explicit form |
 | E13A5  | redefinition of variable | Destination already defined                     | rename destination |
 
-### E13Ax – Cast Sugar `(as ...)`
-Form: `(as %dst <to-type> %src)` chooses an underlying concrete cast opcode (zext, sext, trunc, bitcast, sitofp, uitofp, fptosi, fptoui, ptrtoint, inttoptr) based on source/target types.
-
-| Code   | Title                    | Condition / When Emitted                        | Hint |
-|--------|--------------------------|-------------------------------------------------|------|
-| E13A0  | as arity                 | Wrong number of elements                        | use `(as %dst <to-type> %src)` |
-| E13A1  | as dst must be %var      | Destination missing `%`                         | prefix destination with % |
-| E13A2  | as src must be %var      | Source missing `%`                              | prefix source with % |
-| E13A3  | as unknown src var       | Source variable undefined                       | define source earlier |
-| E13A4  | as unsupported conversion| No valid canonical cast between the two types   | adjust source/target types or insert explicit form |
-| E13A5  | redefinition of variable | Destination already defined                     | rename destination |
-
 ### E137x – For Loop
 Form: `(for :init [ ... ] :cond %c :step [ ... ] :body [ ... ])` Keywords may appear in any order; all are required.
 
@@ -439,4 +429,13 @@ Form: `(switch %expr :cases [ (case <int> [ ... ])* ] :default [ ... ])`
 
 ---
 
-_Last updated: 2025-08-14_
+## Structured Notes
+Some errors emit additional note entries providing expected vs found types to aid tooling (JSON mode includes these in a `notes` array):
+- E0309 (phi incoming value type mismatch) – emits two notes: `expected <phi-type>` and `found <incoming-type>`.
+- E1220 / E1223 / E1225 (global const initializer mismatch cases) – emit expected/found notes detailing the declared global type vs the initializer element or nested element type.
+
+Notes appear only when a mismatch occurs; they do not change the primary error code semantics.
+
+Out-of-Scope (Phase 3) – Optimization pass pipeline & extended suggestion coverage are deferred and may introduce new ranges later.
+
+_Last updated: 2025-08-15_

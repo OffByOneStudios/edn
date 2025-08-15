@@ -31,7 +31,7 @@ struct StructInfo { std::string name; std::vector<FieldInfo> fields; std::unorde
 struct UnionFieldInfo { std::string name; TypeId type; };
 struct UnionInfo { std::string name; std::vector<UnionFieldInfo> fields; std::unordered_map<std::string,UnionFieldInfo*> field_map; };
 struct ParamInfoTC { std::string name; TypeId type; };
-struct FunctionInfoTC { std::string name; TypeId ret; std::vector<ParamInfoTC> params; bool variadic=false; };
+struct FunctionInfoTC { std::string name; TypeId ret; std::vector<ParamInfoTC> params; bool variadic=false; bool external=false; };
 struct GlobalInfoTC { std::string name; TypeId type; bool is_const=false; node_ptr init; };
 
 class TypeChecker {

@@ -4,6 +4,7 @@
 #include "edn/transform.hpp"
 // Forward declaration from types_test.cpp
 void run_type_tests();
+void run_extended_negative_tests();
 void run_type_checker_tests();
 void run_ir_emitter_test();
 void run_cast_tests();
@@ -21,6 +22,9 @@ int run_phase3_union_tests();
 int run_phase3_variadic_tests();
 int run_phase3_variadic_runtime_test();
 int run_phase3_cast_sugar_test();
+void run_phase3_diagnostics_notes_tests();
+int run_phase3_diagnostics_json_tests();
+void run_phase3_examples_smoke();
 
 int main(){
     using namespace edn;
@@ -71,12 +75,15 @@ int main(){
     run_phase3_fnptr_tests();
     run_phase3_typedef_tests();
     run_phase3_enum_tests();
-        phase3_for_continue_tests();
+    phase3_for_continue_tests();
     run_phase3_switch_tests();
     run_phase3_union_tests();
     run_phase3_variadic_tests();
     run_phase3_variadic_runtime_test();
     run_phase3_cast_sugar_test();
-    std::cout << "All tests passed\n";
+    run_phase3_diagnostics_notes_tests();
+    run_phase3_diagnostics_json_tests();
+    run_phase3_examples_smoke();
+    std::cout << "All tests passed" << std::endl;
     return 0;
 }

@@ -1,0 +1,9 @@
+(module
+  (fn :name "cast_demo" :ret i32 :params [] :body [
+    (const %a u8 10)
+    (as %w i32 %a)
+    (as %n i8 %w)
+    (as %f f32 %w)
+    (ret i32 %w)
+  ])
+)

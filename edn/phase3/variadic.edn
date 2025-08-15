@@ -1,0 +1,14 @@
+(module
+  (fn :name "sum3" :ret i32 :params [ (param i32 %a) (param i32 %b) (param i32 %c) ] :body [ (add %ab i32 %a %b) (add %abc i32 %ab %c) (ret i32 %abc) ])
+  (fn :name "var_demo" :ret i32 :params [ (param i32 %base) ] :vararg true :body [
+    (va-start %ap)
+    ; Pretend to pull two more i32 args (placeholders)
+    (va-arg %x i32 %ap)
+    (va-arg %y i32 %ap)
+    (va-end %ap)
+    ; use base + placeholder zeros (since va-arg currently yields undef, sum not meaningful but exercises forms)
+    (const %z i32 0)
+    (add %r i32 %base %z)
+    (ret i32 %r)
+  ])
+)

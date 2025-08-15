@@ -1,0 +1,8 @@
+(module
+  (fn :name "loop_demo" :ret i32 :params [] :body [
+    (const %c i1 1)
+    (for :init [ (const %i i32 0) ] :cond %c :step [ (const %i2 i32 0) ] :body [ (continue) (break) ])
+    (const %z i32 5)
+    (ret i32 %z)
+  ])
+)

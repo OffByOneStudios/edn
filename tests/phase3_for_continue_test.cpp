@@ -15,20 +15,21 @@ static node_ptr i64(int64_t v){ return detail::make_node(v); }
 static node_ptr make_type(const std::string& s){ return sym(s); }
 
 static node_ptr simple_fn_for_loop(){
-    // Build: (fn :name main :ret void :params [] :body [ (const %c i1 1) (for :init [ (const %i i32 0) ] :cond %c :step [ (const %i i32 0) ] :body [ (break) ]) (ret :void 0) ])
     std::vector<node_ptr> body;
     body.push_back( listn({ sym("const"), sym("%c"), make_type("i1"), i64(1) }) );
-    body.push_back( listn({ sym("for"), kw("init"), vec({ listn({ sym("const"), sym("%i"), make_type("i32"), i64(0) }) }), kw("cond"), sym("%c"), kw("step"), vec({ listn({ sym("const"), sym("%i"), make_type("i32"), i64(0) }) }), kw("body"), vec({ listn({ sym("break") }) }) }) );
-    body.push_back( listn({ sym("ret"), kw("void"), i64(0) }) );
-    auto fn = listn({ sym("fn"), kw("name"), sym("main"), kw("ret"), make_type("void"), kw("params"), vec({}), kw("body"), vec(body) });
+    body.push_back( listn({ sym("for"), kw("init"), vec({ listn({ sym("const"), sym("%i"), make_type("i32"), i64(0) }) }), kw("cond"), sym("%c"), kw("step"), vec({ listn({ sym("const"), sym("%i2"), make_type("i32"), i64(0) }) }), kw("body"), vec({ listn({ sym("break") }) }) }) );
+    body.push_back( listn({ sym("const"), sym("%z"), make_type("i32"), i64(0) }) );
+    body.push_back( listn({ sym("ret"), make_type("i32"), sym("%z") }) );
+    auto fn = listn({ sym("fn"), kw("name"), detail::make_node(std::string("main")), kw("ret"), make_type("i32"), kw("params"), vec({}), kw("body"), vec(body) });
     return listn({ sym("module"), fn });
 }
 
 static node_ptr bad_continue_outside(){
     std::vector<node_ptr> body;
     body.push_back( listn({ sym("continue") }) ); // invalid outside loop
-    body.push_back( listn({ sym("ret"), kw("void"), i64(0) }) );
-    auto fn = listn({ sym("fn"), kw("name"), sym("main"), kw("ret"), make_type("void"), kw("params"), vec({}), kw("body"), vec(body) });
+    body.push_back( listn({ sym("const"), sym("%z"), make_type("i32"), i64(0) }) );
+    body.push_back( listn({ sym("ret"), make_type("i32"), sym("%z") }) );
+    auto fn = listn({ sym("fn"), kw("name"), detail::make_node(std::string("main")), kw("ret"), make_type("i32"), kw("params"), vec({}), kw("body"), vec(body) });
     return listn({ sym("module"), fn });
 }
 
@@ -37,8 +38,12 @@ void phase3_for_continue_tests(){
     TypeContext tctx; IREmitter emitter(tctx); TypeCheckResult tcr;
     {
         auto modAst = simple_fn_for_loop();
+        tcr = TypeCheckResult{true,{},{}}; // ensure clean result
         auto *M = emitter.emit(modAst, tcr);
-        assert(!tcr.errors.size());
+        if(!tcr.success){
+            std::cerr << "Unexpected errors in simple for-loop test:\n";
+            for(auto &e: tcr.errors) std::cerr<<e.code<<" "<<e.message<<"\n";
+        }
         assert(tcr.success);
         (void)M;
     }

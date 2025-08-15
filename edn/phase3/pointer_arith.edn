@@ -1,0 +1,11 @@
+(module
+  (fn :name "ptr_demo" :ret i32 :params [ (param (ptr i32) %p) (param i32 %n) ] :body [
+    ; pointer add: %p2 = %p + %n
+    (ptr-add %p2 (ptr i32) %p %n)
+    ; pointer sub: %p3 = %p2 - %n
+    (ptr-sub %p3 (ptr i32) %p2 %n)
+    ; diff: %d = (%p2 - %p3) elements (will be zero here)
+    (ptr-diff %d i32 %p2 %p3)
+    (ret i32 %d)
+  ])
+)

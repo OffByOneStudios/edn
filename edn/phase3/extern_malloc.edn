@@ -1,0 +1,13 @@
+; External function declaration example
+; Declares C malloc and a wrapper main that (conceptually) would call it.
+; IR emitter will produce an external declaration only.
+
+(module
+  (fn :name "malloc" :ret (ptr i8) :params [ (param i64 %size) ] :external true)
+  (fn :name "main" :ret i32 :params [] :body [
+        (const %zero i32 0)
+        ; Normally we'd call (call %p (ptr i8) malloc %size) after defining %size.
+        ; Keep minimal until runtime call plumbing + symbol resolver added.
+        (ret i32 %zero)
+  ])
+)

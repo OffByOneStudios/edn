@@ -1,0 +1,11 @@
+(module
+  (typedef :name SizeT :type i32)
+  (enum :name Color :underlying i32 :values [ (eval :name RED :value 0) (eval :name GREEN :value 1) (eval :name BLUE :value 2) ])
+  (fn :name "enum_demo" :ret i32 :params [] :body [
+    (const %r SizeT 3)
+    ; use enum constants (resolve to i32 literals)
+    (const %c i32 1)
+    (add %sum i32 %r %c)
+    (ret i32 %sum)
+  ])
+)

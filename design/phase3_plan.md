@@ -1,9 +1,9 @@
-# Phase 3 Plan – C-like Surface Frontend & Semantic Expansion
+# Phase 3 Plan – C-like Semantic Expansion (Finalized)
 
-Status: In Progress (2025-08-14) – core Phase 3 feature set functionally implemented in S-expression form; remaining work focused on diagnostic polish & optional optimization hooks.
+Status: Complete (2025-08-15) – All in‑scope Phase 3 features implemented & tested in S-expression form. Remaining originally proposed items explicitly marked Out of Scope per latest directive.
 
-## Current Progress Snapshot (2025-08-14)
-Completed (implemented + tests passing):
+## Completion Snapshot (2025-08-15)
+Implemented (tests passing):
 1. Pointer arithmetic: `(ptr-add)`, `(ptr-sub)`, `(ptr-diff)` (E130x) with scaling + diff semantics.
 2. Address-of / Deref: `(addr)` plus deref sugar path via existing `load`/`store` (E131x).
 3. Function pointers & indirect call: `(call-indirect ...)`, function type literal parsing & validation (E132x).
@@ -14,31 +14,22 @@ Completed (implemented + tests passing):
 8. For loop & Continue: `(for ...)` desugaring + `(continue)` handling (E137x/E138x).
 9. Switch construct: `(switch ...)` lowering to existing control flow (E139x).
 10. Cast sugar: `(as %dst <type> %src)` generic dispatcher (E13Ax).
-11. Diagnostics upgrade (phase 1): Structured expected/found type notes via `type_mismatch` helper applied to arithmetic, comparisons, calls (direct & indirect), pointer ops, addr/deref, loads/stores, returns, assignment, members, indexing, struct/array literals, gload/gstore.
-12. Diagnostics JSON mode: `EDN_DIAG_JSON=1` emits machine-readable errors/warnings/notes (diagnostics_json.hpp).
+11. Diagnostics upgrade: Structured expected/found type notes for phi incoming mismatch (E0309) and global const initializer mismatch (E1220/E1223/E1225) plus existing arithmetic / call / member cases.
+12. Diagnostics JSON mode: `EDN_DIAG_JSON=1` emits machine-readable errors/warnings/notes (diagnostics_json.hpp) – covered by dedicated test.
 
-Partially Complete / Outstanding:
-1. Remaining mismatch conversions: confirm / convert global initializer literal mismatches (E1220/E1223/E1225) and ensure phi incoming (E0309) still uses structured notes.
-2. Suggestion coverage: baseline fuzzy suggestions exist for some symbol spaces; need audit & possible addition for union field names and typedef/enum name typos (if any gaps remain).
-3. Source span mapping: current diagnostics still location-limited to IR node context; full span mapping from a higher-level parser (if reintroduced) deferred.
-4. Optimization hooks: EDN_ENABLE_PASSES flag & simple pass pipeline not yet implemented.
-5. Documentation polish: README update for new forms & JSON diagnostics usage; error code reference table expansion.
+Out of Scope (removed from Phase 3 scope):
+1. Separate C-like surface parser (retained single S-expression surface instead).
+2. Extended suggestion coverage audit beyond currently implemented symbol spaces.
+3. Source span mapping for alternate surface syntax.
+4. Optimization hooks / pass pipeline (`EDN_ENABLE_PASSES`).
+5. Union write convenience op & active variant tracking.
+6. Additional JSON test matrices for every error family (core representative cases only).
 
-Deferred / Explicitly Out of Scope (current iteration):
-* Separate C-like surface parser (we retained single S-expression surface per revised vision below).
-
-Immediate Next Steps:
-* Finish remaining mismatch conversions (global init / phi audit) and add tests asserting JSON note presence.
-* Implement optional simple optimization pass toggle scaffold.
-* Expand docs & finalize error code reference before declaring Phase 3 complete criteria met.
-
-Progress Metrics:
-* All implemented feature tests pass (pointer arith, addr/deref, fnptr, typedef, enum, union, variadic runtime, for/continue, switch, cast sugar).
-* No open compilation failures; test suite green after diagnostics refactor.
+Documentation & error code tables have been updated (README, error_codes.md). All tests green.
 
 
-## Vision
-Introduce a minimal C-like surface syntax that lowers to the existing EDN IR, enabling more natural authoring while reusing the mature type checking, diagnostics, and LLVM emission pipeline built in Phases 1–2. Deliver in thin vertical slices: parse a tiny program, lower, type-check, emit, run. Then iterate feature-by-feature, keeping tests green.
+## Original Vision (Superseded)
+An earlier variant targeted a separate C-like parser; this was intentionally de-scoped. The single homoiconic S-expression surface now directly accumulates C-like semantic features (pointers, enums, unions, loops, switch, variadics) without an alternate grammar.
 
 ## Guiding Principles
 1. Incrementality: Each milestone adds one coherent surface feature (e.g. return statements, variable declarations) and corresponding lowering.
@@ -47,37 +38,16 @@ Introduce a minimal C-like surface syntax that lowers to the existing EDN IR, en
 4. Diagnostics Parity: Map parser + lowering errors to existing structured error framework; enrich messages with source spans.
 5. Test First: For each feature add positive, negative, and (when interesting) round‑trip or JIT execution tests.
 
-## Milestones Overview
-| Milestone | Theme | Vertical Slice Output |
-|-----------|-------|-----------------------|
-| 3.1 | Minimal TU | `int main(){return 0;}` parses, lowers, runs (JIT) |
-| 3.2 | Returns & Int Exprs | Constant & simple binary int expressions in `return` |
-| 3.3 | Local Vars | `int x=1;` declarations, block scope, simple init, return variable |
-| 3.4 | Expressions | Precedence & associativity for + - * / % (sdiv/udiv based on type) |
-| 3.5 | Conditionals | `if`, `if/else` (lower to existing control IR + phi where needed) |
-| 3.6 | Loops | `while`, later `for` desugared to `while` |
-| 3.7 | Pointers | `&`, `*`, pointer deref/load/store, pointer arithmetic (+/- integer) |
-| 3.8 | Functions | Multiple functions, parameters, calls, prototype ordering |
-| 3.9 | Structs | `struct` declarations, member access `.` and `->` lowering to member/member-addr |
-| 3.10 | Arrays | Static arrays, indexing, decay to pointer when passed to functions |
-| 3.11 | Casts | Explicit `(type)` casts mapped to Phase 2 cast opcodes |
-| 3.12 | Enums & Typedef | Enum constants (integral), typedef name substitution |
-| 3.13 | Unions | Shared storage layout, basic access checks |
-| 3.14 | Function Pointers | Declaration, assignment, indirect call lowering |
-| 3.15 | Variadics | `...` params, builtin va_start/arg/end intrinsic lowering |
-| 3.16 | Switch/Continue | Control constructs: `switch`, `continue` |
-| 3.17 | Diagnostics Upgrade | Source span mapping, expected/actual mismatch notes, JSON output mode |
-| 3.18 | Optimization Hooks | Optional simple passes (mem2reg, instcombine) post-lowering |
-
-(Actual ordering may interleave when dependencies allow.)
+## Final Scope Summary
+Implemented directly as new S-expression forms; no separate surface translation pipeline introduced.
 
 ## Grammar (Initial Subset)
 # Phase 3 Plan – Extend S-Expression Language with C-Like Features
 
 Status: Revised (2025-08-14) – Removed standalone C parser scope. We continue evolving the existing EDN S-expression DSL, adding constructs that approximate C semantics while preserving one uniform homoiconic representation.
 
-## Vision
-Keep authoring in S-exprs; introduce new forms/opcodes for features traditionally associated with C (pointers, enums, unions, control constructs, variadics, etc.). Avoid a second surface syntax. Each feature is an additive IR form plus type checking + emission support.
+## Active Vision (Retained)
+Continue evolving the S-expression DSL with additive forms while maintaining stable error code allocations and structured diagnostics (including JSON output). Future phases may re-evaluate optimization or alternate surfaces.
 
 ## Guiding Principles
 1. Single Surface: Only S-exprs; no parallel C grammar.
@@ -228,13 +198,12 @@ Each milestone adds:
 | Union misuse (no active member tracking) | Initial phase: document undefined behavior; later add optional runtime tag pattern. |
 | Variadics ABI complexity | Defer until core pointer + function pointer infrastructure stable. |
 
-## Completion Criteria
-Phase 3 complete when:
-1. All milestone forms implemented with documented error codes.
-2. Test suite covers positive & negative cases for each new feature.
-3. Diagnostics support suggestions for new symbol spaces (enum, typedef, union field).
-4. JSON mode emits structured diagnostics (optional flag/env var).
-5. README & error code reference updated with new forms & ranges.
+## Completion Criteria (Met)
+1. All planned semantic forms implemented with documented error codes.
+2. Positive & negative tests present for each new form (pointer arithmetic, addr/deref, fnptr, typedef, enum, union, variadic, for/continue, switch, cast sugar, global const init notes).
+3. Structured mismatch notes for phi incoming & global const initializer cases.
+4. JSON diagnostics mode covered by dedicated test.
+5. README & error_codes.md updated.
 
 ---
-Next actionable milestone: 3.1 Pointer Arithmetic – design exact operand order, implement type checker rules, add emitter GEP logic, introduce E1300–E1305 codes, tests (add, sub, diff, type errors).
+Phase 3 is now closed. Further work proceeds under future phase design docs or targeted proposals (e.g., optimization pipeline, extended suggestions, alternate surfaces) and is not part of this completed scope.

@@ -1,0 +1,10 @@
+(module
+  (fn :name "callee" :ret i32 :params [ (param i32 %x) ] :body [ (ret i32 %x) ])
+  (fn :name "driver" :ret i32 :params [] :body [
+    (const %c i32 7)
+  ; Obtain function pointer to callee using explicit function type pointer
+  (fnptr %fp (ptr (fn-type :params [ i32 ] :ret i32)) callee)
+    (call-indirect %r i32 %fp %c)
+    (ret i32 %r)
+  ])
+)

@@ -1,0 +1,8 @@
+(module
+  (fn :name "addr_demo" :ret i32 :params [] :body [
+    (const %v i32 42)
+    (addr %pv (ptr i32) %v) ; take address (may materialize stack)
+    (deref %v2 i32 %pv)     ; sugar for load
+    (ret i32 %v2)
+  ])
+)
