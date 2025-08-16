@@ -17,6 +17,8 @@ find_package(fmt CONFIG REQUIRED)
 
 add_library(edn STATIC
     src/edn.cpp
+    src/type_check.cpp
+    src/diagnostics_json.cpp
 )
 add_library(edn::edn ALIAS edn)
 

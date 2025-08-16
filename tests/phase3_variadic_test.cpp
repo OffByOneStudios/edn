@@ -2,7 +2,7 @@
 #include <iostream>
 #include "edn/edn.hpp"
 #include "edn/type_check.hpp"
-#include "edn/type_check.inl"
+#include "edn/type_check.hpp"
 
 using namespace edn;
 static void ok(const char* s){ auto ast=parse(s); TypeContext ctx; TypeChecker tc(ctx); auto res=tc.check_module(ast); if(!res.success){ std::cerr<<"Unexpected variadic test failure:\n"; for(auto &e: res.errors) std::cerr<<e.code<<" "<<e.message<<"\n"; } assert(res.success); }

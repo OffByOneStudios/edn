@@ -3,7 +3,7 @@
 #include <iostream>
 #include "edn/edn.hpp"
 #include "edn/type_check.hpp"
-#include "edn/type_check.inl"
+#include "edn/type_check.hpp"
 
 using namespace edn;
 

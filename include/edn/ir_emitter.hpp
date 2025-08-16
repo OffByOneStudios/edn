@@ -2,7 +2,6 @@
 #include "edn/edn.hpp"
 #include "edn/types.hpp"
 #include "edn/type_check.hpp"
-#include "edn/type_check.inl"
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -39,6 +38,10 @@ private:
     // For unions we represent each union as a single-field struct containing a byte array big enough to hold the largest field.
     // We still need to remember each field's logical type so that (union-member ...) can bitcast and load correctly.
     std::unordered_map<std::string, std::unordered_map<std::string,TypeId>> union_field_types_; // union name -> field name -> TypeId
+    // For sums, we represent as struct { i32 tag, [N x i8] payload } and keep per-variant field type vectors and tag indices.
+    std::unordered_map<std::string, std::vector<std::vector<TypeId>>> sum_variant_field_types_; // sum name -> variants -> field types
+    std::unordered_map<std::string, std::unordered_map<std::string,int>> sum_variant_tag_; // sum name -> variant name -> tag index
+    std::unordered_map<std::string, uint64_t> sum_payload_size_; // sum name -> max payload bytes
 
     llvm::Type* map_type(TypeId id);
     

@@ -2,6 +2,7 @@
 #pragma once
 #include "type_check.hpp"
 #include <algorithm>
+#include <functional>
 
 namespace edn {
 
@@ -17,7 +18,7 @@ inline void TypeChecker::error_code(TypeCheckResult& r, const node& n, std::stri
     ErrorReporter rep{&r.errors,&r.warnings};
     rep.emit_error(rep.make_error(std::move(code), std::move(msg), std::move(hint), line(n), col(n)));
 }
-inline void TypeChecker::reset(){ structs_.clear(); unions_.clear(); functions_.clear(); globals_.clear(); var_types_.clear(); }
+inline void TypeChecker::reset(){ structs_.clear(); unions_.clear(); sums_.clear(); functions_.clear(); globals_.clear(); var_types_.clear(); }
 inline void TypeChecker::collect_typedefs(TypeCheckResult& r, const std::vector<node_ptr>& elems){
     for(size_t i=1;i<elems.size(); ++i){
         auto &n = elems[i];
@@ -76,6 +77,44 @@ inline void TypeChecker::collect_unions(TypeCheckResult& r, const std::vector<no
         if(info.fields.empty()){ error_code(r,*n,"E1352","union field malformed","define at least one valid field"); r.success=false; continue; }
         for(auto &uf: info.fields) info.field_map[uf.name]=&uf;
         unions_[name]=info;
+    }
+}
+inline void TypeChecker::collect_sums(TypeCheckResult& r, const std::vector<node_ptr>& elems){
+    // (sum :name T :variants [ (variant :name A :fields [ <types>* ]) ... ])
+    for(size_t i=1;i<elems.size(); ++i){
+        auto &n=elems[i]; if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data)) continue; if(std::get<symbol>(l[0]->data).name!="sum") continue;
+        std::string name; node_ptr variantsNode; bool haveName=false, haveVariants=false;
+        for(size_t j=1;j<l.size(); ++j){ if(!l[j]||!std::holds_alternative<keyword>(l[j]->data)) break; std::string kw=std::get<keyword>(l[j]->data).name; if(++j>=l.size()) break; auto val=l[j];
+            if(kw=="name"){ if(std::holds_alternative<symbol>(val->data)) { name=std::get<symbol>(val->data).name; haveName=true; } else if(std::holds_alternative<std::string>(val->data)) { name=std::get<std::string>(val->data); haveName=true; } }
+            else if(kw=="variants"){ variantsNode=val; haveVariants=true; }
+        }
+        if(!haveName){ error_code(r,*n,"E1400","sum missing :name","provide (sum :name T ...) "); r.success=false; continue; }
+        if(sums_.count(name) || structs_.count(name) || unions_.count(name) || enums_.count(name) || typedefs_.count(name)){
+            error_code(r,*n,"E1401","sum redefinition","choose unique sum type name"); r.success=false; continue; }
+        if(!haveVariants || !variantsNode || !std::holds_alternative<vector_t>(variantsNode->data)){
+            error_code(r,*n,"E1402","sum missing :variants","add :variants [ (variant :name A :fields [ ... ])* ]"); r.success=false; continue; }
+        SumInfo info; info.name=name;
+        std::unordered_set<std::string> vnames;
+        for(auto &vn : std::get<vector_t>(variantsNode->data).elems){
+            if(!vn||!std::holds_alternative<list>(vn->data)) { error_code(r,*n,"E1403","variant malformed","use (variant :name A :fields [ <types>* ])"); r.success=false; continue; }
+            auto &vl = std::get<list>(vn->data).elems; if(vl.empty()||!std::holds_alternative<symbol>(vl[0]->data) || std::get<symbol>(vl[0]->data).name!="variant"){
+                error_code(r,*vn,"E1403","variant malformed","starts with variant symbol"); r.success=false; continue; }
+            std::string vname; node_ptr fieldsNode; bool haveVName=false, haveFields=false;
+            for(size_t k=1;k<vl.size(); ++k){ if(!vl[k]||!std::holds_alternative<keyword>(vl[k]->data)) break; std::string kw=std::get<keyword>(vl[k]->data).name; if(++k>=vl.size()) break; auto val=vl[k];
+                if(kw=="name"){ if(std::holds_alternative<symbol>(val->data)) { vname=std::get<symbol>(val->data).name; haveVName=true; } else if(std::holds_alternative<std::string>(val->data)){ vname=std::get<std::string>(val->data); haveVName=true; } }
+                else if(kw=="fields"){ fieldsNode=val; haveFields=true; }
+            }
+            if(!haveVName){ error_code(r,*vn,"E1404","variant missing :name","provide (variant :name A ...) "); r.success=false; continue; }
+            if(vnames.count(vname)){ error_code(r,*vn,"E1405","duplicate variant","rename variant"); r.success=false; continue; }
+            std::vector<TypeId> ftys; if(haveFields){ if(!fieldsNode || !std::holds_alternative<vector_t>(fieldsNode->data)){
+                    error_code(r,*vn,"E1406","variant :fields must be vector","use [ <types>* ]"); r.success=false; }
+                else { for(auto &tf : std::get<vector_t>(fieldsNode->data).elems){ try{ ftys.push_back(ctx_.parse_type(tf)); } catch(const parse_error&){ error_code(r,*tf,"E1407","variant field type invalid","fix type form"); r.success=false; } } }
+            }
+            vnames.insert(vname); info.variants.push_back(SumVariantInfo{vname, std::move(ftys)});
+        }
+        for(auto &v : info.variants) info.variant_map[v.name]=&v;
+        if(info.variants.empty()){ error_code(r,*n,"E1408","sum has no variants","add at least one variant"); r.success=false; continue; }
+        sums_[name]=std::move(info);
     }
 }
 // --- M6 Suggestion utilities ---
@@ -186,8 +225,155 @@ inline bool TypeChecker::parse_function_header(TypeCheckResult& r, const node_pt
 inline void TypeChecker::collect_structs(TypeCheckResult& r, const std::vector<node_ptr>& elems){ for(size_t i=1;i<elems.size(); ++i) parse_struct(r, elems[i]); }
 inline void TypeChecker::collect_functions_headers(TypeCheckResult& r, const std::vector<node_ptr>& elems){ for(size_t i=1;i<elems.size(); ++i){ FunctionInfoTC fi; if(parse_function_header(r, elems[i], fi)){ if(functions_.count(fi.name)){ error(r,*elems[i],"duplicate function name"); r.success=false; } else functions_[fi.name]=fi; } } }
 inline void TypeChecker::check_functions(TypeCheckResult& r, const std::vector<node_ptr>& elems){ for(size_t i=1;i<elems.size(); ++i){ auto &n=elems[i]; if(!n||!std::holds_alternative<list>(n->data)) continue; auto &fl=std::get<list>(n->data).elems; if(fl.empty()||!std::holds_alternative<symbol>(fl[0]->data) || std::get<symbol>(fl[0]->data).name!="fn") continue; std::string fname; bool isExternal=false; for(size_t j=1;j<fl.size(); ++j){ if(fl[j] && std::holds_alternative<keyword>(fl[j]->data)){ std::string kw=std::get<keyword>(fl[j]->data).name; if(++j>=fl.size()) break; if(kw=="name" && std::holds_alternative<std::string>(fl[j]->data)) fname=std::get<std::string>(fl[j]->data); else if(kw=="external" && std::holds_alternative<bool>(fl[j]->data)) isExternal=std::get<bool>(fl[j]->data); } } if(fname.empty()) continue; auto it=functions_.find(fname); if(it!=functions_.end()){ if(it->second.external || isExternal) continue; check_function_body(r,n,it->second); } } }
-inline void TypeChecker::check_function_body(TypeCheckResult& r, const node_ptr& fn, const FunctionInfoTC& info){ var_types_.clear(); for(auto &p: info.params) var_types_[p.name]=p.type; auto &fl=std::get<list>(fn->data).elems; node_ptr body; for(size_t i=1;i<fl.size(); ++i){ if(fl[i] && std::holds_alternative<keyword>(fl[i]->data) && std::get<keyword>(fl[i]->data).name=="body"){ if(++i<fl.size()) body=fl[i]; break; } } if(!body || !std::holds_alternative<vector_t>(body->data)){ error(r,*fn,":body missing or not vector"); r.success=false; return; } check_instruction_list(r, std::get<vector_t>(body->data).elems, info, 0); }
+inline void TypeChecker::check_function_body(TypeCheckResult& r, const node_ptr& fn, const FunctionInfoTC& info){ var_types_.clear(); for(auto &p: info.params) var_types_[p.name]=p.type; auto &fl=std::get<list>(fn->data).elems; node_ptr body; for(size_t i=1;i<fl.size(); ++i){ if(fl[i] && std::holds_alternative<keyword>(fl[i]->data) && std::get<keyword>(fl[i]->data).name=="body"){ if(++i<fl.size()) body=fl[i]; break; } } if(!body || !std::holds_alternative<vector_t>(body->data)){ error(r,*fn,":body missing or not vector"); r.success=false; return; } auto &insts = std::get<vector_t>(body->data).elems; check_instruction_list(r, insts, info, 0); analyze_fn_lints(r, insts, info); }
+
+inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn){
+    // Gate lints behind EDN_LINT=1 (default on if unset to encourage early hygiene)
+    if(const char* lintEnv = std::getenv("EDN_LINT")){ if(lintEnv[0]=='0') return; }
+    ErrorReporter rep{&r.errors,&r.warnings};
+    // W1400: unreachable instructions after a top-level ret in function body
+    bool sawRet=false; for(auto &n : insts){ if(!n || !std::holds_alternative<list>(n->data)) continue; auto &il = std::get<list>(n->data).elems; if(il.empty()||!std::holds_alternative<symbol>(il[0]->data)) continue; std::string op = std::get<symbol>(il[0]->data).name; if(op=="ret"){ sawRet=true; continue; } if(sawRet){
+            rep.emit_warning(rep.make_warning("W1400","unreachable instruction after return","reorder or remove dead code", line(*n), col(*n)));
+        }
+    }
+    // Helper: recursively scan nested vectors for reachability and usage
+    std::function<void(const std::vector<node_ptr>&, bool&)> scan;
+    // Track uses of %vars and declared locals/SSA defs to catch unused
+    std::unordered_set<std::string> defined;
+    std::unordered_set<std::string> used;
+    // Seed with parameters
+    for(const auto& p : fn.params) if(!p.name.empty()) defined.insert(p.name);
+    // Seed with any already defined in var_types_ at this point (top-level defs from body processed earlier)
+    for(const auto& kv : var_types_) defined.insert(kv.first);
+    scan = [&](const std::vector<node_ptr>& body, bool& reachable){
+        for(size_t i=0;i<body.size();++i){ auto &n = body[i]; if(!n || !std::holds_alternative<list>(n->data)) continue; auto &il = std::get<list>(n->data).elems; if(il.empty()||!std::holds_alternative<symbol>(il[0]->data)) continue; std::string op = std::get<symbol>(il[0]->data).name;
+            auto symAt=[&](size_t idx)->std::string{ if(idx<il.size() && std::holds_alternative<symbol>(il[idx]->data)) return std::get<symbol>(il[idx]->data).name; return std::string{}; };
+            auto noteUse=[&](const std::string& s){ if(!s.empty()&&s[0]=='%') used.insert(s.substr(1)); };
+            auto noteDef=[&](const std::string& s){ if(!s.empty()&&s[0]=='%') defined.insert(s.substr(1)); };
+            if(!reachable){ rep.emit_warning(rep.make_warning("W1402","unreachable code","code cannot execute after terminator", line(*n), col(*n))); }
+            // Collect defs/uses for a few ops
+            if(op=="const"||op=="alloca"||op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="icmp"||op=="fcmp"||op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv"||op=="load"||op=="phi"||op=="member"||op=="member-addr"||op=="sum-new"||op=="sum-is"||op=="sum-get"||op=="array-lit"||op=="struct-lit"||op=="call"||op=="call-indirect"||op=="addr"||op=="deref"||op=="index"||op=="gload"||op=="va-start"||op=="va-arg"){
+                if(il.size()>=2) noteDef(symAt(1));
+                for(size_t k=2;k<il.size();++k){ if(std::holds_alternative<symbol>(il[k]->data)) noteUse(std::get<symbol>(il[k]->data).name); }
+            } else if(op=="assign"){ if(il.size()>=3){ noteUse(symAt(2)); noteUse(symAt(1)); } }
+            // Control-flow and reachability
+            if(op=="ret"){ reachable=false; continue; }
+            if(op=="break"||op=="continue"){ reachable=false; continue; }
+            if(op=="block"){ // scan :body
+                for(size_t j=1;j<il.size();++j){ if(!il[j]||!std::holds_alternative<keyword>(il[j]->data)) break; std::string kw=std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val=il[j]; if(kw=="locals"){ if(val && std::holds_alternative<vector_t>(val->data)){ for(auto &d: std::get<vector_t>(val->data).elems){ if(!d||!std::holds_alternative<list>(d->data)) continue; auto &dl=std::get<list>(d->data).elems; if(dl.size()==3 && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="local"){ if(std::holds_alternative<symbol>(dl[2]->data)){ std::string vn=std::get<symbol>(dl[2]->data).name; if(!vn.empty()&&vn[0]=='%') vn.erase(0,1); defined.insert(vn); } } } } } else if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)){ bool subReach=true; scan(std::get<vector_t>(val->data).elems, subReach); if(!subReach) reachable=false; } } }
+                continue;
+            }
+            if(op=="if"){ bool thenReach=true, elseReach=true; if(il.size()>=2) noteUse(symAt(1)); if(il.size()>=3 && il[2] && std::holds_alternative<vector_t>(il[2]->data)) scan(std::get<vector_t>(il[2]->data).elems, thenReach); if(il.size()>=4 && il[3] && std::holds_alternative<vector_t>(il[3]->data)) scan(std::get<vector_t>(il[3]->data).elems, elseReach); reachable = thenReach || elseReach; continue; }
+            if(op=="while"){ if(il.size()>=2) noteUse(symAt(1)); // while may loop 0 times -> reachable continues
+                if(il.size()>=3 && il[2] && std::holds_alternative<vector_t>(il[2]->data)){ bool bodyReach=true; scan(std::get<vector_t>(il[2]->data).elems, bodyReach); }
+                continue; }
+            if(op=="for"){ std::vector<node_ptr> initVec, stepVec, bodyVec; std::string condVar; for(size_t j=1;j<il.size();++j){ if(!il[j]||!std::holds_alternative<keyword>(il[j]->data)) break; std::string kw=std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val=il[j]; if(kw=="init"){ if(val && std::holds_alternative<vector_t>(val->data)) initVec=std::get<vector_t>(val->data).elems; } else if(kw=="cond"){ condVar=symAt(j); } else if(kw=="step"){ if(val && std::holds_alternative<vector_t>(val->data)) stepVec=std::get<vector_t>(val->data).elems; } else if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)) bodyVec=std::get<vector_t>(val->data).elems; } }
+                if(!condVar.empty()) noteUse(condVar);
+                if(!initVec.empty()){ bool rch=true; scan(initVec, rch); }
+                if(!bodyVec.empty()){ bool rch=true; scan(bodyVec, rch); }
+                if(!stepVec.empty()){ bool rch=true; scan(stepVec, rch); }
+                continue; }
+            if(op=="switch"){ if(il.size()>=2) noteUse(symAt(1)); // cases and default
+                bool anyReach=false; node_ptr casesNode=nullptr, defaultNode=nullptr; for(size_t j=2;j<il.size();++j){ if(!il[j]||!std::holds_alternative<keyword>(il[j]->data)) break; std::string kw=std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val=il[j]; if(kw=="cases") casesNode=val; else if(kw=="default") defaultNode=val; }
+                if(casesNode && std::holds_alternative<vector_t>(casesNode->data)){ for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)) continue; auto &cl=std::get<list>(cv->data).elems; if(cl.size()>=3 && std::holds_alternative<vector_t>(cl[2]->data)){ bool rch=true; scan(std::get<vector_t>(cl[2]->data).elems, rch); anyReach |= rch; } } }
+                if(defaultNode && std::holds_alternative<vector_t>(defaultNode->data)){ bool rch=true; scan(std::get<vector_t>(defaultNode->data).elems, rch); anyReach |= rch; }
+                reachable = anyReach; continue; }
+            if(op=="match"){ // treat like switch for reachability; also descend into case/default bodies to track uses
+                bool anyReach=false; size_t argBase=1; if(il.size()>=2 && std::holds_alternative<symbol>(il[1]->data)){ std::string maybeDst=std::get<symbol>(il[1]->data).name; if(!maybeDst.empty() && maybeDst[0]=='%') argBase=3; }
+                if(il.size()>argBase+1){ noteUse(symAt(argBase+1)); }
+                node_ptr casesNode=nullptr, defaultNode=nullptr; for(size_t j=argBase+2;j<il.size();++j){ if(!il[j]||!std::holds_alternative<keyword>(il[j]->data)) break; std::string kw=std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val=il[j]; if(kw=="cases") casesNode=val; else if(kw=="default") defaultNode=val; }
+                if(casesNode && std::holds_alternative<vector_t>(casesNode->data)){
+                    for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)) continue; auto &cl=std::get<list>(cv->data).elems; if(cl.size()<3) continue; // simple [ body ] or keyworded
+                        if(std::holds_alternative<vector_t>(cl[2]->data)){ bool rch=true; scan(std::get<vector_t>(cl[2]->data).elems, rch); anyReach |= rch; }
+                        else if(std::holds_alternative<keyword>(cl[2]->data)){ node_ptr bodyNode=nullptr; for(size_t ci=2; ci<cl.size(); ++ci){ if(!cl[ci]||!std::holds_alternative<keyword>(cl[ci]->data)) break; std::string kw=std::get<keyword>(cl[ci]->data).name; if(++ci>=cl.size()) break; auto valn=cl[ci]; if(kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)) bodyNode=valn; }
+                            if(bodyNode){ bool rch=true; scan(std::get<vector_t>(bodyNode->data).elems, rch); anyReach |= rch; }
+                        }
+                    }
+                }
+                if(defaultNode){ if(std::holds_alternative<vector_t>(defaultNode->data)){ bool rch=true; scan(std::get<vector_t>(defaultNode->data).elems, rch); anyReach |= rch; }
+                    else if(std::holds_alternative<list>(defaultNode->data)){ auto &dl = std::get<list>(defaultNode->data).elems; for(size_t di=0; di<dl.size(); ++di){ if(dl[di]&&std::holds_alternative<keyword>(dl[di]->data) && std::get<keyword>(dl[di]->data).name=="body"){ if(di+1<dl.size() && dl[di+1] && std::holds_alternative<vector_t>(dl[di+1]->data)){ bool rch=true; scan(std::get<vector_t>(dl[di+1]->data).elems, rch); anyReach |= rch; } } }
+                    }
+                }
+                reachable = anyReach; continue; }
+            // other ops do not change reachability
+        }
+    };
+    bool reachable=true; scan(insts, reachable);
+    // W1401: missing top-level ret for non-void function (approximate)
+    if(fn.ret!=ctx_.get_base(BaseType::Void)){
+        bool hasTopRet=false; for(auto &n : insts){ if(!n || !std::holds_alternative<list>(n->data)) continue; auto &il = std::get<list>(n->data).elems; if(!il.empty() && std::holds_alternative<symbol>(il[0]->data) && std::get<symbol>(il[0]->data).name=="ret"){ hasTopRet=true; break; } }
+        if(!hasTopRet){ rep.emit_warning(rep.make_warning("W1401","function may be missing return on some paths","ensure all paths return a value", -1, -1)); }
+    }
+    // W1404: unused parameter
+    for(const auto& p : fn.params){ if(!p.name.empty() && !used.count(p.name)){ rep.emit_warning(rep.make_warning("W1404","unused parameter '%"+p.name+"'","remove or prefix with _ if intentional", -1, -1)); } }
+    // W1403: unused variable (defined but never used)
+    for(const auto& d : defined){ if(!used.count(d)){
+            // Skip parameters (already handled) and allow names prefixed _ as intentionally unused
+            if(!d.empty() && d[0]=='_') continue;
+            bool isParam=false; for(const auto& p : fn.params){ if(p.name==d){ isParam=true; break; } }
+            if(isParam) continue;
+            rep.emit_warning(rep.make_warning("W1403","unused variable '%"+d+"'","remove or prefix with _ if intentional", -1, -1));
+        }
+    }
+}
 inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn, int loop_depth){ auto get_var=[&](const std::string& n)->TypeId{ auto it=var_types_.find(n); return it==var_types_.end() ? (TypeId)-1 : it->second; }; auto attach=[&](const node_ptr& n, TypeId t){ n->metadata["type-id"]=detail::make_node((int64_t)t); }; auto is_int=[&](TypeId t){ const Type& T=ctx_.at(t); if(T.kind!=Type::Kind::Base) return false; switch(T.base){ case BaseType::I1: case BaseType::I8: case BaseType::I16: case BaseType::I32: case BaseType::I64: case BaseType::U8: case BaseType::U16: case BaseType::U32: case BaseType::U64: return true; default: return false;} }; for(auto &n: insts){ if(!n||!std::holds_alternative<list>(n->data)){ error(r,*n,"instruction must be list"); r.success=false; continue; } auto &il=std::get<list>(n->data).elems; if(il.empty()||!std::holds_alternative<symbol>(il[0]->data)){ error(r,*n,"instruction missing opcode"); r.success=false; continue; } std::string op=std::get<symbol>(il[0]->data).name; auto sym=[&](size_t i)->std::string{ if(i<il.size() && std::holds_alternative<symbol>(il[i]->data)) return std::get<symbol>(il[i]->data).name; return std::string{}; };
+    // --- M4.1 Sum constructors and tag test ---
+    if(op=="sum-new"){ // (sum-new %dst SumType Variant [ %v0 %v1 ... ])
+        if(il.size()<4){ error_code(r,*n,"E1409","sum-new arity","expected (sum-new %dst SumType Variant [ %vals* ])"); r.success=false; continue; }
+        std::string dst=sym(1), sName=sym(2), vName=sym(3);
+        if(dst.empty()||sName.empty()||vName.empty()){ error_code(r,*n,"E1409","sum-new arity","supply %dst SumName Variant [ ... ]"); r.success=false; continue; }
+        auto sit=sums_.find(sName); if(sit==sums_.end()){ error_code(r,*n,"E1400","unknown sum type","declare sum before use"); r.success=false; continue; }
+        auto vit=sit->second.variant_map.find(vName); if(vit==sit->second.variant_map.end()){ error_code(r,*n,"E1405","unknown variant","check variant name"); r.success=false; continue; }
+        std::vector<node_ptr> vec;
+        if(il.size()>=5){ if(!il[4]||!std::holds_alternative<vector_t>(il[4]->data)){ error_code(r,*n,"E1406","sum-new fields must be vector","wrap payload values in [ ]"); r.success=false; continue; } vec = std::get<vector_t>(il[4]->data).elems; }
+        auto &fields = vit->second->fields; if(vec.size()!=fields.size()){ error_code(r,*n,"E1409","sum-new arity","payload count must match variant fields"); r.success=false; }
+        for(size_t i=0;i<vec.size() && i<fields.size(); ++i){
+            if(!vec[i]||!std::holds_alternative<symbol>(vec[i]->data)){
+                error_code(r,*n,"E1409","sum-new arity","payload must be %var symbols"); r.success=false; continue; }
+            std::string vs = std::get<symbol>(vec[i]->data).name;
+            if(vs.empty()||vs[0] != '%'){
+                error_code(r,*n,"E1409","sum-new arity","payload must be %var symbols"); r.success=false; continue; }
+            auto vt=get_var(vs.substr(1));
+            if(vt==(TypeId)-1){
+                error_code(r,*n,"E1409","sum-new payload undefined","define payload variable before use"); r.success=false; continue;
+            }
+            if(vt!=fields[i]){ type_mismatch(r,*n,"E1409","sum-new field",fields[i],vt); r.success=false; }
+        }
+        if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1409","sum-new arity","destination already defined"); r.success=false; } TypeId sumTy = ctx_.get_struct(sName); TypeId pty=ctx_.get_pointer(sumTy); var_types_[dst.substr(1)]=pty; attach(n,pty);} else { error_code(r,*n,"E1409","sum-new arity","dst must be %var"); r.success=false; }
+        continue;
+    }
+    if(op=="sum-is"){ // (sum-is %dst SumType %value Variant) -> %dst i1
+        if(il.size()!=5){ error_code(r,*n,"E1409","sum-is arity","expected (sum-is %dst SumType %val Variant)"); r.success=false; continue; }
+        std::string dst=sym(1), sName=sym(2), val=sym(3), vName=sym(4);
+        if(dst.empty()||sName.empty()||val.empty()||vName.empty()){ error_code(r,*n,"E1409","sum-is arity","supply %dst SumName %val Variant"); r.success=false; continue; }
+        auto sit=sums_.find(sName); if(sit==sums_.end()){ error_code(r,*n,"E1400","unknown sum type","declare sum before use"); r.success=false; continue; }
+        if(sit->second.variant_map.find(vName)==sit->second.variant_map.end()){ error_code(r,*n,"E1405","unknown variant","check variant name"); r.success=false; }
+        if(val[0]=='%'){ auto vt=get_var(val.substr(1)); if(vt==(TypeId)-1){ error_code(r,*n,"E1409","sum-is arity","value undefined"); r.success=false; } else { const Type& VT=ctx_.at(vt); bool ok=false; if(VT.kind==Type::Kind::Pointer){ const Type& PT=ctx_.at(VT.pointee); if(PT.kind==Type::Kind::Struct && PT.struct_name==sName) ok=true; } if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_struct(sName)); type_mismatch(r,*n,"E1409","sum-is value", expected, vt); r.success=false; } } }
+        else { error_code(r,*n,"E1409","sum-is arity","value must be %var"); r.success=false; }
+        if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1409","sum-is arity","destination already defined"); r.success=false; } TypeId b=ctx_.get_base(BaseType::I1); var_types_[dst.substr(1)]=b; attach(n,b);} else { error_code(r,*n,"E1409","sum-is arity","dst must be %var"); r.success=false; }
+        continue;
+    }
+    if(op=="sum-get"){ // (sum-get %dst SumType %value Variant <index>) -> %dst field type
+        if(il.size()!=6){ error_code(r,*n,"E1409","sum-get arity","expected (sum-get %dst SumType %val Variant <index>)"); r.success=false; continue; }
+        std::string dst=sym(1), sName=sym(2), val=sym(3), vName=sym(4);
+        if(dst.empty()||sName.empty()||val.empty()||vName.empty()){ error_code(r,*n,"E1409","sum-get arity","supply %dst SumName %val Variant <index>"); r.success=false; continue; }
+        auto sit=sums_.find(sName); if(sit==sums_.end()){ error_code(r,*n,"E1400","unknown sum type","declare sum before use"); r.success=false; continue; }
+        auto vit=sit->second.variant_map.find(vName); if(vit==sit->second.variant_map.end()){ error_code(r,*n,"E1405","unknown variant","check variant name"); r.success=false; continue; }
+        // index must be integer literal
+        size_t idx=SIZE_MAX; if(std::holds_alternative<int64_t>(il[5]->data)){ auto v=(int64_t)std::get<int64_t>(il[5]->data); if(v>=0) idx=(size_t)v; }
+        if(idx==SIZE_MAX){ error_code(r,*n,"E1409","sum-get index must be int literal","use 0-based field index"); r.success=false; continue; }
+        // value must be pointer to this sum struct
+        if(val[0]=='%'){ auto vt=get_var(val.substr(1)); if(vt==(TypeId)-1){ error_code(r,*n,"E1409","sum-get value undefined","define value earlier"); r.success=false; }
+            else { const Type& VT=ctx_.at(vt); bool ok=false; if(VT.kind==Type::Kind::Pointer){ const Type& PT=ctx_.at(VT.pointee); if(PT.kind==Type::Kind::Struct && PT.struct_name==sName) ok=true; }
+                if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_struct(sName)); type_mismatch(r,*n,"E1409","sum-get value", expected, vt); r.success=false; }
+            }
+        } else { error_code(r,*n,"E1409","sum-get value must be %var","prefix with %"); r.success=false; continue; }
+        // bounds check and set result type
+        auto &fields = vit->second->fields; if(idx>=fields.size()){ error_code(r,*n,"E1409","sum-get index out of range","variant has fewer fields"); r.success=false; continue; }
+        if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1409","sum-get dst already defined","use fresh SSA name"); r.success=false; } var_types_[dst.substr(1)]=fields[idx]; attach(n,fields[idx]); }
+        else { error_code(r,*n,"E1409","sum-get dst must be %var","prefix destination with %"); r.success=false; }
+        continue;
+    }
     if(op=="block"){ std::unordered_map<std::string,TypeId> saved=var_types_; for(size_t i=1;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i]; if(kw=="locals"){ if(val && std::holds_alternative<vector_t>(val->data)){ for(auto &d: std::get<vector_t>(val->data).elems){ if(!d||!std::holds_alternative<list>(d->data)) continue; auto &dl=std::get<list>(d->data).elems; if(dl.size()==3 && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="local"){ TypeId lty=parse_type_node(dl[1],r); if(std::holds_alternative<symbol>(dl[2]->data)){ std::string vn=std::get<symbol>(dl[2]->data).name; if(!vn.empty()&&vn[0]=='%') vn.erase(0,1); if(var_types_.count(vn)){ error(r,*d,"duplicate local"); r.success=false; } else var_types_[vn]=lty; } } } } } else if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)) check_instruction_list(r, std::get<vector_t>(val->data).elems, fn); } } var_types_=saved; continue; }
     if(op=="if"){ if(il.size()<3){ error_code(r,*n,"E1000","if arity","expected (if %cond [ then ] [ else ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1001","if cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1002","if cond must be i1","use boolean (i1) value"); r.success=false; } } if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn); if(il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data)) check_instruction_list(r, std::get<vector_t>(il[3]->data).elems, fn); continue; }
     if(op=="while"){ if(il.size()<3){ error_code(r,*n,"E1003","while arity","expected (while %cond [ body ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1004","while cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1005","while cond must be i1","use boolean (i1) value"); r.success=false; } } if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn, loop_depth+1); continue; }
@@ -233,6 +419,169 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         if(haveDefault && (!defaultNode || !std::holds_alternative<vector_t>(defaultNode->data))){ error_code(r,*n,"E1397","switch missing :default","provide :default [ ... ] vector"); r.success=false; }
         if(haveDefault && defaultNode && std::holds_alternative<vector_t>(defaultNode->data)){
             check_instruction_list(r, std::get<vector_t>(defaultNode->data).elems, fn, loop_depth);
+        }
+        continue;
+    }
+    if(op=="match"){ // (match SumType %val ...) or result form: (match %dst <type> SumType %val ...)
+    /* debug removed */
+        if(il.size()<3){ error_code(r,*n,"E1410","match missing sum or value","use (match SumType %val :cases [...] :default [...])"); r.success=false; continue; }
+        bool resultMode=false; std::string dstName; TypeId resultTy=0; size_t argBase=1;
+        if(std::holds_alternative<symbol>(il[1]->data)){
+            std::string maybeDst = std::get<symbol>(il[1]->data).name;
+            if(!maybeDst.empty() && maybeDst[0]=='%'){
+                // result form
+                resultMode=true; dstName=maybeDst;
+                if(il.size()<5){ error_code(r,*n,"E1410","match missing sum or value","result form expects (match %dst <type> Sum %val ...)" ); r.success=false; continue; }
+                resultTy=parse_type_node(il[2],r);
+                if(!std::holds_alternative<symbol>(il[3]->data) || !std::holds_alternative<symbol>(il[4]->data)){
+                    error_code(r,*n,"E1410","match missing sum or value","result form expects Sum symbol and %val"); r.success=false; continue;
+                }
+                argBase=3;
+            }
+        }
+    /* debug removed */
+        if(!std::holds_alternative<symbol>(il[argBase]->data) || !std::holds_alternative<symbol>(il[argBase+1]->data)){
+            error_code(r,*n,"E1410","match missing sum or value","use (match SumType %val ...) or (match %dst <type> Sum %val ...)"); r.success=false; continue; }
+        std::string sName = sym(argBase); std::string val = sym(argBase+1);
+        auto sit=sums_.find(sName); if(sit==sums_.end()){ error_code(r,*n,"E1400","unknown sum type","declare sum before use"); r.success=false; continue; }
+        if(val.empty()||val[0] != '%'){ error_code(r,*n,"E1410","match missing sum or value","value must be %var"); r.success=false; continue; }
+        auto vt=get_var(val.substr(1)); if(vt==(TypeId)-1){ error_code(r,*n,"E1410","match missing sum or value","value undefined"); r.success=false; }
+        else { const Type& VT=ctx_.at(vt); bool ok=false; if(VT.kind==Type::Kind::Pointer){ const Type& PT=ctx_.at(VT.pointee); if(PT.kind==Type::Kind::Struct && PT.struct_name==sName) ok=true; } if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_struct(sName)); type_mismatch(r,*n,"E1410","match value", expected, vt); r.success=false; } }
+        bool haveCases=false, haveDefault=false; node_ptr casesNode=nullptr, defaultNode=nullptr;
+        for(size_t i=argBase+2;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto valn=il[i]; if(kw=="cases"){ casesNode=valn; haveCases=true; } else if(kw=="default"){ defaultNode=valn; haveDefault=true; } }
+        if(!haveCases){ error_code(r,*n,"E1411","match missing :cases","add :cases [ (case Variant [ ... ])* ]"); r.success=false; }
+        if(haveCases && (!casesNode || !std::holds_alternative<vector_t>(casesNode->data))){ error_code(r,*n,"E1412","match cases must be vector","wrap cases in [ ]"); r.success=false; haveCases=false; }
+        std::unordered_set<std::string> usedVariants; if(haveCases){ for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)){ error_code(r,*n,"E1413","match case malformed","use (case Variant [ ... ])"); r.success=false; continue; } auto &cl=std::get<list>(cv->data).elems; if(cl.size()<3 || !std::holds_alternative<symbol>(cl[0]->data) || std::get<symbol>(cl[0]->data).name!="case" || !std::holds_alternative<symbol>(cl[1]->data)){ error_code(r,*cv,"E1413","match case malformed","expected (case Variant [ ... ])"); r.success=false; continue; } std::string vName = std::get<symbol>(cl[1]->data).name; if(sit->second.variant_map.find(vName)==sit->second.variant_map.end()){ error_code(r,*cv,"E1405","unknown variant","check variant name"); r.success=false; continue; } if(usedVariants.count(vName)){ error_code(r,*cv,"E1414","match duplicate variant","remove duplicate variant arm"); r.success=false; continue; }
+                usedVariants.insert(vName);
+                // Parse either simple body vector or keyword sections (:binds optional, :body required if keywords used)
+                std::vector<node_ptr> bodyElems; std::vector<std::pair<std::string,size_t>> binds; // (%name, index)
+                std::string caseValueName; bool haveCaseValue=false;
+                bool okCase=true;
+                if(std::holds_alternative<vector_t>(cl[2]->data)){
+                    bodyElems = std::get<vector_t>(cl[2]->data).elems;
+                    if(resultMode){
+                        // Allow :value %var inside the body vector; extract and filter it out from instructions
+                        std::vector<node_ptr> filtered;
+                        for(size_t bi=0; bi<bodyElems.size(); ++bi){
+                            auto &be = bodyElems[bi];
+                            if(be && std::holds_alternative<keyword>(be->data) && std::get<keyword>(be->data).name=="value"){
+                                if(bi+1<bodyElems.size() && bodyElems[bi+1] && std::holds_alternative<symbol>(bodyElems[bi+1]->data)){
+                                    caseValueName = std::get<symbol>(bodyElems[bi+1]->data).name; haveCaseValue=true; ++bi; // skip value symbol
+                                    continue;
+                                } else {
+                                    error_code(r,*cv,"E1421","match case missing :value in result mode","provide :value %var"); r.success=false; okCase=false; continue;
+                                }
+                            }
+                            filtered.push_back(be);
+                        }
+                        bodyElems.swap(filtered);
+                    }
+                } else if(std::holds_alternative<keyword>(cl[2]->data)){
+                    node_ptr bindsNode=nullptr, bodyNode=nullptr; bool haveBody=false; for(size_t ci=2; ci<cl.size(); ++ci){ if(!cl[ci]||!std::holds_alternative<keyword>(cl[ci]->data)) break; std::string kw=std::get<keyword>(cl[ci]->data).name; if(++ci>=cl.size()) break; auto valn=cl[ci]; if(kw=="binds") bindsNode=valn; else if(kw=="body"){ bodyNode=valn; haveBody=true; } else if(kw=="value"){ if(!std::holds_alternative<symbol>(valn->data)){ error_code(r,*cv,"E1421","match case missing :value in result mode","provide :value %var"); r.success=false; } else { caseValueName=std::get<symbol>(valn->data).name; haveCaseValue=true; } } }
+                    if(!haveBody || !bodyNode || !std::holds_alternative<vector_t>(bodyNode->data)){ error_code(r,*cv,"E1413","match case malformed","expected :body [ ... ]"); r.success=false; okCase=false; }
+                    if(okCase){ bodyElems = std::get<vector_t>(bodyNode->data).elems; 
+                        if(resultMode){
+                            // Allow :value %var inside the :body vector; extract and filter it out
+                            std::vector<node_ptr> filtered;
+                            for(size_t bi=0; bi<bodyElems.size(); ++bi){
+                                auto &be = bodyElems[bi];
+                                if(be && std::holds_alternative<keyword>(be->data) && std::get<keyword>(be->data).name=="value"){
+                                    if(bi+1<bodyElems.size() && bodyElems[bi+1] && std::holds_alternative<symbol>(bodyElems[bi+1]->data)){
+                                        caseValueName = std::get<symbol>(bodyElems[bi+1]->data).name; haveCaseValue=true; ++bi; // skip value symbol
+                                        continue;
+                                    } else {
+                                        error_code(r,*cv,"E1421","match case missing :value in result mode","provide :value %var"); r.success=false; okCase=false; continue;
+                                    }
+                                }
+                                filtered.push_back(be);
+                            }
+                            bodyElems.swap(filtered);
+                        }
+                    }
+                    if(bindsNode){ if(!std::holds_alternative<vector_t>(bindsNode->data)){ error_code(r,*cv,"E1417","match :binds must be vector","wrap binds in [ ]"); r.success=false; }
+                        else {
+                            auto vit = sit->second.variant_map.find(vName);
+                            auto &fields = vit->second->fields;
+                            for(auto &bn : std::get<vector_t>(bindsNode->data).elems){ if(!bn||!std::holds_alternative<list>(bn->data)){ error_code(r,*cv,"E1418","bind entry malformed","use (bind %name <index>)"); r.success=false; continue; } auto &bl = std::get<list>(bn->data).elems; if(bl.size()!=3 || !std::holds_alternative<symbol>(bl[0]->data) || std::get<symbol>(bl[0]->data).name!="bind"){ error_code(r,*bn,"E1418","bind entry malformed","expected (bind %name <index>)"); r.success=false; continue; } if(!std::holds_alternative<symbol>(bl[1]->data)){ error_code(r,*bn,"E1420","bind name must be %var","prefix with %"); r.success=false; continue; } std::string bname=std::get<symbol>(bl[1]->data).name; if(bname.empty()||bname[0] != '%'){ error_code(r,*bn,"E1420","bind name must be %var","prefix with %"); r.success=false; continue; } size_t idx=SIZE_MAX; if(std::holds_alternative<int64_t>(bl[2]->data)){ auto iv=(int64_t)std::get<int64_t>(bl[2]->data); if(iv>=0) idx=(size_t)iv; }
+                                if(idx==SIZE_MAX){ error_code(r,*bn,"E1418","bind index must be int literal","use 0-based index"); r.success=false; continue; }
+                                if(idx>=fields.size()){ error_code(r,*bn,"E1419","bind index out of range","variant has fewer fields"); r.success=false; continue; }
+                                binds.emplace_back(bname.substr(1), idx);
+                            }
+                        }
+                    }
+                } else { error_code(r,*cv,"E1413","match case malformed","expected [ body ] or :binds/:body"); r.success=false; okCase=false; }
+                // Descend into case body with binds in scope
+                if(okCase){ auto saved=var_types_; if(!binds.empty()){ // declare binds as their field types
+                        auto vit2 = sit->second.variant_map.find(vName);
+                        auto &fields2 = vit2->second->fields;
+                        for(auto &bp : binds){ var_types_[bp.first] = fields2[bp.second]; }
+                    }
+                    check_instruction_list(r, bodyElems, fn, loop_depth);
+                    if(resultMode){ if(!haveCaseValue){ error_code(r,*cv,"E1421","match case missing :value in result mode","add :value %var matching result type"); r.success=false; }
+                        else {
+                            if(caseValueName.empty()||caseValueName[0] != '%'){ error_code(r,*cv,"E1421","match case missing :value in result mode","use %var after :value"); r.success=false; }
+                            else {
+                                auto itv = var_types_.find(caseValueName.substr(1)); if(itv==var_types_.end()){ error_code(r,*cv,"E1421","match case :value undefined","define value variable in case body"); r.success=false; }
+                                else if(itv->second!=resultTy){ type_mismatch(r,*cv,"E1423","match result", resultTy, itv->second); r.success=false; }
+                            }
+                        }
+                    }
+                    var_types_=saved;
+                }
+            }
+        }
+        // Exhaustiveness: allow omitting :default if all variants are covered
+        const size_t totalVariants = sit->second.variants.size();
+        const bool exhaustive = (usedVariants.size() == totalVariants);
+        if(!haveDefault && !exhaustive){ error_code(r,*n,"E1415","match missing :default","add :default [ ... ] block or cover all variants"); r.success=false; }
+        // Default body may be vector (legacy) or a list of keywords including :body and optional :value
+        std::vector<node_ptr> defaultBody; std::string defaultValueName; bool defaultHasValue=false;
+        if(haveDefault){
+            if(defaultNode && std::holds_alternative<vector_t>(defaultNode->data)) {
+                defaultBody = std::get<vector_t>(defaultNode->data).elems;
+            }
+            else if(defaultNode && std::holds_alternative<list>(defaultNode->data)){
+                auto &dl = std::get<list>(defaultNode->data).elems;
+                size_t diStart = 0;
+                if(!dl.empty() && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="default") diStart = 1;
+                for(size_t di=diStart; di<dl.size(); ++di){
+                    if(!dl[di]||!std::holds_alternative<keyword>(dl[di]->data)) break;
+                    std::string kw=std::get<keyword>(dl[di]->data).name; if(++di>=dl.size()) break; auto valn=dl[di];
+                    if(kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)) defaultBody = std::get<vector_t>(valn->data).elems;
+                    else if(kw=="value" && valn && std::holds_alternative<symbol>(valn->data)){ defaultValueName=std::get<symbol>(valn->data).name; defaultHasValue=true; }
+                }
+                if(defaultBody.empty()){ error_code(r,*n,"E1416","match default must be vector","provide :default [ ... ] or (default :body [ ... ])"); r.success=false; }
+            } else {
+                error_code(r,*n,"E1416","match default must be vector","provide :default [ ... ]"); r.success=false;
+            }
+        }
+        if(haveDefault){
+            /* debug removed */
+            auto saved=var_types_;
+            // If resultMode and defaultBody is a vector, allow :value %var inside it and filter out
+            if(resultMode && !defaultBody.empty()){
+                std::vector<node_ptr> filtered;
+                for(size_t di=0; di<defaultBody.size(); ++di){
+                    auto &de = defaultBody[di];
+                    if(de && std::holds_alternative<keyword>(de->data) && std::get<keyword>(de->data).name=="value"){
+                        if(di+1<defaultBody.size() && defaultBody[di+1] && std::holds_alternative<symbol>(defaultBody[di+1]->data)){
+                            defaultValueName = std::get<symbol>(defaultBody[di+1]->data).name; defaultHasValue=true; ++di; continue;
+                        } else { error_code(r,*n,"E1422","match default missing :value in result mode","add :value %var with result type"); r.success=false; continue; }
+                    }
+                    filtered.push_back(de);
+                }
+                defaultBody.swap(filtered);
+            }
+            check_instruction_list(r, defaultBody, fn, loop_depth);
+            if(resultMode){ if(!defaultHasValue){ error_code(r,*n,"E1422","match default missing :value in result mode","add :value %var with result type"); r.success=false; } else { if(defaultValueName.empty()||defaultValueName[0] != '%'){ error_code(r,*n,"E1422","match default missing :value in result mode","use %var"); r.success=false; } else { auto itv = var_types_.find(defaultValueName.substr(1)); if(itv==var_types_.end()){ error_code(r,*n,"E1422","match default :value undefined","define value in default body"); r.success=false; } else if(itv->second!=resultTy){ type_mismatch(r,*n,"E1423","match result", resultTy, itv->second); r.success=false; } } } }
+            var_types_=saved;
+        }
+    /* debug removed */
+        if(haveDefault && exhaustive){ warn(r,*n, "match :default is unreachable; all variants are handled"); }
+        if(resultMode){ if(dstName.empty()||dstName[0] != '%'){ error_code(r,*n,"E1410","match result dst must be %var","prefix destination with %"); r.success=false; }
+            else { if(var_types_.count(dstName.substr(1))){ error_code(r,*n,"E1410","match result dst already defined","use fresh SSA name for %dst"); r.success=false; }
+                var_types_[dstName.substr(1)]=resultTy; attach(n,resultTy);
+            }
         }
         continue;
     }
@@ -504,6 +853,6 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
     error(r,*n,"unknown instruction"); r.success=false; }
 }
 // (removed stray extra brace that previously closed namespace early)
-inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); return res; }
+inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_sums(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); return res; }
 
 } // namespace edn

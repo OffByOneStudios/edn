@@ -1,10 +1,11 @@
 ﻿#include <cassert>
 #include <iostream>
+#include <cassert>
+#include <iostream>
 #include "edn/edn.hpp"
 #include "edn/transform.hpp"
 // Forward declaration from types_test.cpp
 void run_type_tests();
-void run_extended_negative_tests();
 void run_type_checker_tests();
 void run_ir_emitter_test();
 void run_cast_tests();
@@ -25,6 +26,15 @@ int run_phase3_cast_sugar_test();
 void run_phase3_diagnostics_notes_tests();
 int run_phase3_diagnostics_json_tests();
 void run_phase3_examples_smoke();
+void run_phase4_sum_types_tests();
+void run_phase4_sum_ir_golden_tests();
+void run_phase4_sum_resultmode_repro();
+void run_phase4_lints_tests();
+void run_phase4_generics_macro_test();
+void run_phase4_generics_two_params_test();
+void run_phase4_generics_dedup_test();
+void run_phase4_generics_negative_tests();
+void run_phase4_traits_macro_test();
 
 int main(){
     using namespace edn;
@@ -63,6 +73,7 @@ int main(){
     assert(expanded->data.index()!=0); // not nil
 
 
+    // Run full test suite
     run_type_tests();
     run_type_checker_tests();
     run_ir_emitter_test();
@@ -73,17 +84,30 @@ int main(){
     run_phase3_pointer_arith_tests();
     run_phase3_addr_deref_tests();
     run_phase3_fnptr_tests();
-    run_phase3_typedef_tests();
-    run_phase3_enum_tests();
+    (void)run_phase3_typedef_tests();
+    (void)run_phase3_enum_tests();
     phase3_for_continue_tests();
     run_phase3_switch_tests();
-    run_phase3_union_tests();
-    run_phase3_variadic_tests();
-    run_phase3_variadic_runtime_test();
-    run_phase3_cast_sugar_test();
+    (void)run_phase3_union_tests();
+    (void)run_phase3_variadic_tests();
+    (void)run_phase3_variadic_runtime_test();
+    (void)run_phase3_cast_sugar_test();
     run_phase3_diagnostics_notes_tests();
-    run_phase3_diagnostics_json_tests();
+    (void)run_phase3_diagnostics_json_tests();
     run_phase3_examples_smoke();
+    std::cout << "[dbg] before run_phase4_sum_types_tests" << std::endl;
+    run_phase4_sum_types_tests();
+    std::cout << "[dbg] after run_phase4_sum_types_tests" << std::endl;
+    // Re-enable golden IR tests to verify and localize previously observed segfault
+    run_phase4_sum_ir_golden_tests();
+    run_phase4_lints_tests();
+    run_phase4_generics_macro_test();
+    run_phase4_generics_two_params_test();
+    run_phase4_generics_dedup_test();
+    run_phase4_generics_negative_tests();
+    std::cout << "[dbg] before run_phase4_traits_macro_test" << std::endl;
+    run_phase4_traits_macro_test();
+    std::cout << "[dbg] after run_phase4_traits_macro_test" << std::endl;
     std::cout << "All tests passed" << std::endl;
     return 0;
 }

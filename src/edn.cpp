@@ -1,6 +1,8 @@
 // edn.cpp - Clean IR emitter implementation (fully rewritten after corruption)
 #include "edn/edn.hpp"
 #include "edn/ir_emitter.hpp"
+#include "edn/generics.hpp"
+#include "edn/traits.hpp"
 #include "edn/diagnostics_json.hpp"
 
 #include <llvm/IR/LLVMContext.h>
@@ -9,6 +11,8 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/PassManager.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <cstdlib>
 
 namespace edn {
@@ -44,15 +48,34 @@ llvm::Type* IREmitter::map_type(TypeId id){ const Type& T=tctx_.at(id); switch(T
 llvm::StructType* IREmitter::get_or_create_struct(const std::string& name,const std::vector<TypeId>& field_types){ if(auto it=struct_types_.find(name); it!=struct_types_.end()) return it->second; auto* ST=llvm::StructType::getTypeByName(*llctx_,"struct."+name); if(!ST) ST=llvm::StructType::create(*llctx_,"struct."+name); std::vector<llvm::Type*> elems; elems.reserve(field_types.size()); for(auto ft:field_types) elems.push_back(map_type(ft)); if(ST->isOpaque()) ST->setBody(elems,false); struct_types_[name]=ST; return ST; }
 
 llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_result){
-	TypeChecker checker(tctx_); tc_result = checker.check_module(module_ast);
+	// First, expand reader-macros that rewrite into core forms
+	// Order: traits -> generics (traits produce plain structs/globals; generics may reference them)
+	node_ptr rewritten = expand_traits(module_ast);
+	rewritten = expand_generics(rewritten);
+	TypeChecker checker(tctx_); tc_result = checker.check_module(rewritten);
 	// Optional JSON diagnostics output (set EDN_DIAG_JSON=1)
 	extern void maybe_print_json(const TypeCheckResult&); // forward (header-only impl)
 	maybe_print_json(tc_result);
 	if(!tc_result.success) return nullptr;
 	module_ = std::make_unique<llvm::Module>("edn.module", *llctx_);
-	if(!module_ast || !std::holds_alternative<list>(module_ast->data)) return nullptr; auto &top = std::get<list>(module_ast->data).elems; if(top.empty()) return nullptr;
+	if(!rewritten || !std::holds_alternative<list>(rewritten->data)) return nullptr; auto &top = std::get<list>(rewritten->data).elems; if(top.empty()) return nullptr;
 
 	auto collect_structs = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data)|| std::get<symbol>(l[0]->data).name!="struct") continue; std::string sname; std::vector<TypeId> ftypes; std::vector<std::string> fnames; for(size_t i=1;i<l.size();++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) continue; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty){ fnames.push_back(fname); ftypes.push_back(fty);} } } } if(!sname.empty()&& !ftypes.empty()){ get_or_create_struct(sname,ftypes); struct_field_types_[sname]=ftypes; auto &m=struct_field_index_[sname]; for(size_t ix=0; ix<fnames.size(); ++ix) m[fnames[ix]]=ix; } } };
+	// Collect sums: represent as { i32 tag, [N x i8] payload }
+	auto collect_sums = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="sum") continue; std::string sname; node_ptr variantsNode; for(size_t i=1;i<l.size(); ++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="variants") variantsNode=val; }
+		if(sname.empty()||!variantsNode||!std::holds_alternative<vector_t>(variantsNode->data)) continue; std::vector<std::vector<TypeId>> variants; std::unordered_map<std::string,int> vtags; uint64_t maxPayload=0; int tag=0; for(auto &vn : std::get<vector_t>(variantsNode->data).elems){ if(!vn||!std::holds_alternative<list>(vn->data)) continue; auto &vl=std::get<list>(vn->data).elems; if(vl.empty()||!std::holds_alternative<symbol>(vl[0]->data) || std::get<symbol>(vl[0]->data).name!="variant") continue; std::string vname; node_ptr fieldsNode; for(size_t k=1;k<vl.size(); ++k){ if(!std::holds_alternative<keyword>(vl[k]->data)) break; std::string kw=std::get<keyword>(vl[k]->data).name; if(++k>=vl.size()) break; auto val=vl[k]; if(kw=="name") vname=symName(val); else if(kw=="fields") fieldsNode=val; }
+			std::vector<TypeId> ftys; if(fieldsNode && std::holds_alternative<vector_t>(fieldsNode->data)){ for(auto &tf : std::get<vector_t>(fieldsNode->data).elems){ try{ ftys.push_back(tctx_.parse_type(tf)); }catch(...){ } } }
+			variants.push_back(ftys); if(!vname.empty()) vtags[vname]=tag; // compute payload size
+			uint64_t sz=0; for(auto &tid: ftys){ llvm::Type* ll=map_type(tid); sz += module_->getDataLayout().getTypeAllocSize(ll); }
+			if(sz>maxPayload) maxPayload=sz; ++tag; }
+		// create struct type if absent
+		auto *tagTy = llvm::Type::getInt32Ty(*llctx_);
+		uint64_t payloadBytes = maxPayload?maxPayload:1; auto *payloadArr = llvm::ArrayType::get(llvm::Type::getInt8Ty(*llctx_), payloadBytes);
+		auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) ST = llvm::StructType::create(*llctx_, {tagTy, payloadArr}, "struct."+sname); else if(ST->isOpaque()) ST->setBody({tagTy, payloadArr}, false);
+		struct_field_types_[sname] = { tctx_.get_base(BaseType::I32), tctx_.get_array(tctx_.get_base(BaseType::I8), payloadBytes) };
+		struct_field_index_[sname]["tag"] = 0; struct_field_index_[sname]["payload"] = 1;
+		sum_variant_field_types_[sname] = variants; sum_variant_tag_[sname] = vtags; sum_payload_size_[sname]=payloadBytes; }
+	};
 	// Represent unions as single-field struct of byte array big enough to hold largest field (simplified); for loads we bitcast
 	auto collect_unions = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="union") continue; std::string uname; std::vector<std::pair<std::string,TypeId>> fields; for(size_t i=1;i<l.size(); ++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") uname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; if(fl.empty()||!std::holds_alternative<symbol>(fl[0]->data) || std::get<symbol>(fl[0]->data).name!="ufield") continue; std::string fname; TypeId fty=0; for(size_t k=1;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) break; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty) fields.emplace_back(fname,fty); } }
 		}
@@ -87,7 +110,7 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		}
 		if(!c) c=llvm::Constant::getNullValue(lty); auto *gv = new llvm::GlobalVariable(*module_, lty, isConst, llvm::GlobalValue::ExternalLinkage, c, gname); (void)gv;
 	} };
-	collect_structs(top); collect_unions(top); emit_globals(top);
+	collect_structs(top); collect_unions(top); collect_sums(top); emit_globals(top);
 
 	for(size_t i=1;i<top.size(); ++i){ auto fn=top[i]; if(!fn||!std::holds_alternative<list>(fn->data)) continue; auto &fl=std::get<list>(fn->data).elems; if(fl.empty()) continue; if(!std::holds_alternative<symbol>(fl[0]->data)|| std::get<symbol>(fl[0]->data).name!="fn") continue; std::string fname; TypeId retTy=tctx_.get_base(BaseType::Void); std::vector<std::pair<std::string,TypeId>> params; node_ptr body; bool isExternal=false; for(size_t j=1;j<fl.size(); ++j){ if(!std::holds_alternative<keyword>(fl[j]->data)) continue; std::string kw=std::get<keyword>(fl[j]->data).name; if(++j>=fl.size()) break; auto val=fl[j]; if(kw=="name") fname=symName(val); else if(kw=="ret") try{ retTy=tctx_.parse_type(val);}catch(...){} else if(kw=="params" && std::holds_alternative<vector_t>(val->data)){ for(auto &p: std::get<vector_t>(val->data).elems){ if(!p||!std::holds_alternative<list>(p->data)) continue; auto &pl=std::get<list>(p->data).elems; if(pl.size()!=3) continue; if(!std::holds_alternative<symbol>(pl[0]->data)|| std::get<symbol>(pl[0]->data).name!="param") continue; try{ TypeId pty=tctx_.parse_type(pl[1]); std::string pname=trimPct(symName(pl[2])); if(!pname.empty()) params.emplace_back(pname,pty);}catch(...){} } } else if(kw=="body" && std::holds_alternative<vector_t>(val->data)) body=val; else if(kw=="external" && std::holds_alternative<bool>(val->data)) isExternal=std::get<bool>(val->data); }
 		if(fname.empty()||!body) continue; std::vector<TypeId> paramIds; for(auto &pr: params) paramIds.push_back(pr.second);
@@ -193,6 +216,47 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					for(size_t i=0,fi=0;i+1<vec.size(); i+=2,++fi){ if(!std::holds_alternative<symbol>(vec[i]->data) || !std::holds_alternative<symbol>(vec[i+1]->data)) continue; std::string fname=symName(vec[i]); std::string val=trimPct(symName(vec[i+1])); if(val.empty()) continue; auto vit=vmap.find(val); if(vit==vmap.end()) continue; auto idxMapIt=idxIt->second.find(fname); if(idxMapIt==idxIt->second.end()) continue; uint32_t fidx=idxMapIt->second; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* fIndex=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),fidx); auto *gep=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,fIndex}, dst+"."+fname+".addr"); builder.CreateStore(vit->second, gep); }
 					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(tctx_.get_struct(sname));
 				}
+				else if(op=="sum-new" && (il.size()==4 || il.size()==5)){
+					// (sum-new %dst SumName Variant [ %v* ]) -> allocate struct, store tag, memcpy payload fields into byte array
+					std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string vname=symName(il[3]); if(dst.empty()||sname.empty()||vname.empty()) continue;
+					auto vtagMapIt=sum_variant_tag_.find(sname); auto vfieldsIt=sum_variant_field_types_.find(sname); if(vtagMapIt==sum_variant_tag_.end()||vfieldsIt==sum_variant_field_types_.end()) continue; auto tIt=vtagMapIt->second.find(vname); if(tIt==vtagMapIt->second.end()) continue; int tag=tIt->second; auto &variants=vfieldsIt->second; if(tag<0 || (size_t)tag>=variants.size()) continue; std::vector<llvm::Value*> vals; if(il.size()==5 && std::holds_alternative<vector_t>(il[4]->data)){ for(auto &nv : std::get<vector_t>(il[4]->data).elems){ std::string vn=trimPct(symName(nv)); if(vn.empty()||!vmap.count(vn)){ vals.clear(); break;} vals.push_back(vmap[vn]); } }
+					auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue; auto *allocaPtr = builder.CreateAlloca(ST, nullptr, dst);
+					// store tag
+					llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* tagIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); auto *tagPtr=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,tagIdx}, dst+".tag.addr"); builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint64_t)tag, true), tagPtr);
+					// payload pointer
+					llvm::Value* payIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),1); auto *payloadPtr=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,payIdx}, dst+".payload.addr");
+					// Bitcast to i8* for byte stores
+					auto *i8Ptr = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)); auto *rawPayloadPtr = builder.CreateBitCast(payloadPtr, i8Ptr, dst+".raw");
+					// Pack fields sequentially
+					uint64_t offset=0; for(size_t i=0;i<vals.size() && i<variants[tag].size(); ++i){ llvm::Type* fty=map_type(variants[tag][i]); uint64_t fsz = module_->getDataLayout().getTypeAllocSize(fty); // compute destination pointer = raw + offset
+						auto *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), offset);
+						auto *dstPtr = builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(*llctx_), rawPayloadPtr, offVal, dst+".fld"+std::to_string(i)+".raw");
+						auto *typedPtr = builder.CreateBitCast(dstPtr, llvm::PointerType::getUnqual(fty), dst+".fld"+std::to_string(i)+".ptr");
+						builder.CreateStore(vals[i], typedPtr);
+						offset += fsz;
+					}
+					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(tctx_.get_struct(sname));
+				}
+				else if(op=="sum-is" && il.size()==5){ // (sum-is %dst SumName %val Variant)
+					std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) continue; if(!vmap.count(val)) continue; auto tIt=sum_variant_tag_.find(sname); if(tIt==sum_variant_tag_.end()) continue; auto vtIt=tIt->second.find(vname); if(vtIt==tIt->second.end()) continue; int tag=vtIt->second; auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* tagIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); auto *tagPtr=builder.CreateInBoundsGEP(ST, vmap[val], {zero,tagIdx}, dst+".tag.addr"); auto *loaded=builder.CreateLoad(llvm::Type::getInt32Ty(*llctx_), tagPtr, dst+".tag"); auto *cmp=builder.CreateICmpEQ(loaded, llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint64_t)tag, true), dst); vmap[dst]=cmp; vtypes[dst]=tctx_.get_base(BaseType::I1);
+				}
+				else if(op=="sum-get" && il.size()==6){ // (sum-get %dst SumName %val Variant <index>)
+					std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) continue; if(!vmap.count(val)) continue;
+					if(!std::holds_alternative<int64_t>(il[5]->data)) continue; int64_t idxLit=(int64_t)std::get<int64_t>(il[5]->data); if(idxLit<0) continue; size_t idx=(size_t)idxLit;
+					auto vfieldsIt = sum_variant_field_types_.find(sname); auto vtagIt = sum_variant_tag_.find(sname); if(vfieldsIt==sum_variant_field_types_.end()||vtagIt==sum_variant_tag_.end()) continue; auto vtIt=vtagIt->second.find(vname); if(vtIt==vtagIt->second.end()) continue; int tag=vtIt->second; auto &variants=vfieldsIt->second; if(tag<0 || (size_t)tag>=variants.size()) continue; auto &fields=variants[tag]; if(idx>=fields.size()) continue; TypeId fieldTyId = fields[idx];
+					auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue;
+					// Compute pointer to payload start
+					llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* payIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),1); auto *payloadPtr=builder.CreateInBoundsGEP(ST, vmap[val], {zero,payIdx}, dst+".payload.addr");
+					// raw i8* to payload
+					auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)); auto *rawPayloadPtr = builder.CreateBitCast(payloadPtr, i8PtrTy, dst+".raw");
+					// Compute offset within payload by summing sizes of earlier fields
+					uint64_t offset=0; for(size_t i=0;i<idx && i<fields.size(); ++i){ llvm::Type* fty=map_type(fields[i]); offset += module_->getDataLayout().getTypeAllocSize(fty); }
+					llvm::Value* offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), offset);
+					llvm::Value* fieldRaw = builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(*llctx_), rawPayloadPtr, offVal, dst+".fld.raw");
+					llvm::Type* fieldLL = map_type(fieldTyId); auto *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL); auto *typedPtr = builder.CreateBitCast(fieldRaw, fieldPtrTy, dst+".fld.ptr");
+					auto *lv = builder.CreateLoad(fieldLL, typedPtr, dst);
+					vmap[dst]=lv; vtypes[dst]=fieldTyId;
+				}
 				else if(op=="array-lit" && il.size()==5){ // (array-lit %dst <elem-type> <size> [ %e0 ... ])
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId elemTy; try{ elemTy=tctx_.parse_type(il[2]); }catch(...){ continue; } if(!std::holds_alternative<int64_t>(il[3]->data)) continue; uint64_t asz=(uint64_t)std::get<int64_t>(il[3]->data); if(asz==0) continue; if(!std::holds_alternative<vector_t>(il[4]->data)) continue; auto &elems=std::get<vector_t>(il[4]->data).elems; if(elems.size()!=asz) continue; TypeId arrTy = tctx_.get_array(elemTy, asz); auto *AT = llvm::cast<llvm::ArrayType>(map_type(arrTy)); auto *allocaPtr = builder.CreateAlloca(AT, nullptr, dst); for(size_t i=0;i<elems.size(); ++i){ if(!std::holds_alternative<symbol>(elems[i]->data)) continue; std::string val=trimPct(symName(elems[i])); if(val.empty()) continue; auto vit=vmap.find(val); if(vit==vmap.end()) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* idx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),(uint32_t)i); auto *gep=builder.CreateInBoundsGEP(AT, allocaPtr, {zero,idx}, dst+".elem"+std::to_string(i)+".addr"); builder.CreateStore(vit->second, gep); }
 					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(arrTy);
@@ -284,6 +348,88 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					if(haveDefault){ builder.SetInsertPoint(defaultBB); emit_ref(defaultBody, emit_ref); if(!defaultBB->getTerminator()) builder.CreateBr(mergeBB); }
 					builder.SetInsertPoint(mergeBB);
 				}
+				else if(op=="match"){ // (match SumName %val ...) or result form: (match %dst <type> SumName %val ...)
+					if(il.size()<3) continue;
+					bool resultMode=false; std::string dstName; TypeId resultTy=0; size_t argBase=1;
+					if(std::holds_alternative<symbol>(il[1]->data)){
+						std::string maybeDst = symName(il[1]);
+						if(!maybeDst.empty() && maybeDst[0]=='%'){
+							resultMode=true; dstName=trimPct(maybeDst);
+							if(il.size()<5) continue; try{ resultTy=tctx_.parse_type(il[2]); }catch(...){ continue; }
+							argBase=3; // Sum at 3, %val at 4
+						}
+					}
+					std::string sname=symName(il[argBase]); std::string val=trimPct(symName(il[argBase+1])); if(sname.empty()||val.empty()||!vmap.count(val)) continue; auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue;
+					// Load tag
+					llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* tagIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); auto *tagPtr=builder.CreateInBoundsGEP(ST, vmap[val], {zero,tagIdx}, "match.tag.addr"); auto *tagVal=builder.CreateLoad(llvm::Type::getInt32Ty(*llctx_), tagPtr, "match.tag");
+					// Parse :cases and :default
+					node_ptr casesNode=nullptr, defaultNode=nullptr; bool haveDefault=false; for(size_t i=argBase+2;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto v=il[i]; if(kw=="cases" && v && std::holds_alternative<vector_t>(v->data)) casesNode=v; else if(kw=="default" && v) { defaultNode=v; haveDefault=true; } }
+					if(!casesNode) continue; auto tagMapIt = sum_variant_tag_.find(sname); if(tagMapIt==sum_variant_tag_.end()) continue; auto &tagMap = tagMapIt->second;
+					// Create blocks
+					auto *mergeBB = llvm::BasicBlock::Create(*llctx_, "match.end."+std::to_string(cfCounter++), F);
+					struct CaseInfo { int tag; std::string vname; std::vector<node_ptr> body; std::vector<std::pair<std::string,size_t>> binds; std::string valueVar; };
+					std::vector<CaseInfo> cases; cases.reserve(std::get<vector_t>(casesNode->data).elems.size());
+					for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)) continue; auto &cl=std::get<list>(cv->data).elems; if(cl.size()<3) continue; if(!std::holds_alternative<symbol>(cl[0]->data) || std::get<symbol>(cl[0]->data).name!="case") continue; std::string vname=symName(cl[1]); if(vname.empty()) continue; auto tIt=tagMap.find(vname); if(tIt==tagMap.end()) continue; // parse either simple vector body or :binds/:body form
+						std::vector<node_ptr> bodyElems; std::vector<std::pair<std::string,size_t>> binds; std::string valueVar;
+						if(std::holds_alternative<vector_t>(cl[2]->data)) bodyElems = std::get<vector_t>(cl[2]->data).elems;
+						else if(std::holds_alternative<keyword>(cl[2]->data)){
+							node_ptr bindsNode=nullptr, bodyNode=nullptr, valueNode=nullptr; for(size_t ci=2; ci<cl.size(); ++ci){ if(!cl[ci]||!std::holds_alternative<keyword>(cl[ci]->data)) break; std::string kw=std::get<keyword>(cl[ci]->data).name; if(++ci>=cl.size()) break; auto valn=cl[ci]; if(kw=="binds") bindsNode=valn; else if(kw=="body") bodyNode=valn; else if(kw=="value") valueNode=valn; }
+							if(bodyNode && std::holds_alternative<vector_t>(bodyNode->data)) bodyElems = std::get<vector_t>(bodyNode->data).elems; else bodyElems.clear();
+							if(bindsNode && std::holds_alternative<vector_t>(bindsNode->data)){
+								for(auto &bn : std::get<vector_t>(bindsNode->data).elems){ if(!bn||!std::holds_alternative<list>(bn->data)) continue; auto &bl=std::get<list>(bn->data).elems; if(bl.size()!=3) continue; if(!std::holds_alternative<symbol>(bl[0]->data) || std::get<symbol>(bl[0]->data).name!="bind") continue; if(!std::holds_alternative<symbol>(bl[1]->data)) continue; std::string bname=trimPct(symName(bl[1])); if(bname.empty()) continue; if(!std::holds_alternative<int64_t>(bl[2]->data)) continue; int64_t idx=(int64_t)std::get<int64_t>(bl[2]->data); if(idx<0) continue; binds.emplace_back(bname,(size_t)idx); }
+							}
+							if(valueNode && std::holds_alternative<symbol>(valueNode->data)) valueVar = trimPct(symName(valueNode));
+						} else continue;
+						cases.push_back(CaseInfo{tIt->second, vname, std::move(bodyElems), std::move(binds), valueVar});
+					}
+					std::vector<llvm::BasicBlock*> cmpBlocks; cmpBlocks.reserve(cases.size()); for(size_t i=0;i<cases.size(); ++i) cmpBlocks.push_back(llvm::BasicBlock::Create(*llctx_, "match.case."+std::to_string(i)+"."+std::to_string(cfCounter++), F));
+					llvm::BasicBlock* defaultBB = haveDefault ? llvm::BasicBlock::Create(*llctx_, "match.default."+std::to_string(cfCounter++), F) : mergeBB;
+					// For result mode, capture incoming values per predecessor
+					struct IncomingVal { llvm::Value* val; llvm::BasicBlock* pred; };
+					std::vector<IncomingVal> incomings;
+					// Start chain
+					auto *curBB=builder.GetInsertBlock(); if(!curBB->getTerminator()) builder.CreateBr(cmpBlocks.empty()?defaultBB:cmpBlocks[0]);
+					for(size_t ci=0; ci<cases.size(); ++ci){ builder.SetInsertPoint(cmpBlocks[ci]); llvm::Value* cval = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint64_t)cases[ci].tag, true); auto *cmp=builder.CreateICmpEQ(tagVal,cval,"match.cmp"); auto *bodyBB=llvm::BasicBlock::Create(*llctx_, "match.body."+std::to_string(ci)+"."+std::to_string(cfCounter++), F); auto *next = (ci+1<cases.size())? cmpBlocks[ci+1] : defaultBB; builder.CreateCondBr(cmp, bodyBB, next); builder.SetInsertPoint(bodyBB);
+						// If binds requested, extract payload fields into variables before body
+						if(!cases[ci].binds.empty()){
+							// Compute payload base pointer
+							llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* payIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),1); auto *payloadPtr=builder.CreateInBoundsGEP(ST, vmap[val], {zero,payIdx}, "match.payload.addr"); auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)); auto *rawPayloadPtr = builder.CreateBitCast(payloadPtr, i8PtrTy, "match.raw");
+							// Need field types to compute offsets
+							auto vfieldsIt = sum_variant_field_types_.find(sname); if(vfieldsIt!=sum_variant_field_types_.end()){
+								auto &variants = vfieldsIt->second; int tag = cases[ci].tag; if(tag>=0 && (size_t)tag<variants.size()){
+									auto &fields = variants[tag];
+									for(auto &bp : cases[ci].binds){ size_t idx = bp.second; if(idx>=fields.size()) continue; // checked by TC
+										uint64_t offset=0; for(size_t fi=0; fi<idx; ++fi){ llvm::Type* fl=map_type(fields[fi]); offset += module_->getDataLayout().getTypeAllocSize(fl); }
+										llvm::Value* offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), offset);
+										llvm::Value* fieldRaw = builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(*llctx_), rawPayloadPtr, offVal, bp.first+".raw");
+										llvm::Type* fieldLL = map_type(fields[idx]); auto *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL); auto *typedPtr = builder.CreateBitCast(fieldRaw, fieldPtrTy, bp.first+".ptr");
+										auto *lv = builder.CreateLoad(fieldLL, typedPtr, bp.first);
+										vmap[bp.first]=lv; vtypes[bp.first]=fields[idx];
+									}
+								}
+							}
+						}
+						emit_ref(cases[ci].body, emit_ref);
+						if(resultMode){ std::string vnm = cases[ci].valueVar; if(!vnm.empty() && vmap.count(vnm)) incomings.push_back({ vmap[vnm], bodyBB }); else if(resultTy){ // fallback undef to keep IR well-formed
+								incomings.push_back({ llvm::UndefValue::get(map_type(resultTy)), bodyBB }); }
+						}
+						if(!bodyBB->getTerminator()) builder.CreateBr(mergeBB);
+					}
+					// Default body can be a vector [ ... ] or a list with :body and :value
+					if(haveDefault){ builder.SetInsertPoint(defaultBB); std::vector<node_ptr> defaultBody; std::string defaultValueVar;
+						if(std::holds_alternative<vector_t>(defaultNode->data)) defaultBody = std::get<vector_t>(defaultNode->data).elems;
+						else if(std::holds_alternative<list>(defaultNode->data)){
+							auto &dl = std::get<list>(defaultNode->data).elems; for(size_t di=0; di<dl.size(); ++di){ if(!dl[di]||!std::holds_alternative<keyword>(dl[di]->data)) break; std::string kw=std::get<keyword>(dl[di]->data).name; if(++di>=dl.size()) break; auto valn=dl[di]; if(kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)) defaultBody = std::get<vector_t>(valn->data).elems; else if(kw=="value" && valn && std::holds_alternative<symbol>(valn->data)) defaultValueVar = trimPct(symName(valn)); }
+						}
+						emit_ref(defaultBody, emit_ref);
+						if(resultMode){ if(!defaultValueVar.empty() && vmap.count(defaultValueVar)) incomings.push_back({ vmap[defaultValueVar], defaultBB }); else if(resultTy){ incomings.push_back({ llvm::UndefValue::get(map_type(resultTy)), defaultBB }); } }
+						if(!defaultBB->getTerminator()) builder.CreateBr(mergeBB);
+					}
+					builder.SetInsertPoint(mergeBB);
+					if(resultMode && resultTy){ llvm::PHINode* phi = builder.CreatePHI(map_type(resultTy), (unsigned)incomings.size(), dstName);
+						for(auto &inc : incomings) phi->addIncoming(inc.val, inc.pred);
+						vmap[dstName]=phi; vtypes[dstName]=resultTy; }
+				}
 				else if(op=="break"){ if(!loopEndStack.empty() && !builder.GetInsertBlock()->getTerminator()) builder.CreateBr(loopEndStack.back()); return; }
 				else if(op=="continue"){ if(!loopContinueStack.empty() && !builder.GetInsertBlock()->getTerminator()){ builder.CreateBr(loopContinueStack.back()); return; } }
 				else if(op=="ret" && il.size()==3){ std::string rv=trimPct(symName(il[2])); if(!rv.empty() && vmap.count(rv)) builder.CreateRet(vmap[rv]); else if(fty->getReturnType()->isVoidTy()) builder.CreateRetVoid(); else builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType())); functionDone=true; return; }
@@ -299,6 +445,22 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 				if(pred) phi->addIncoming(itv->second, pred); }
 		}
 		if(!entry->getTerminator()){ if(fty->getReturnType()->isVoidTy()) builder.CreateRetVoid(); else builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType())); }
+	}
+	// Optional: run a small optimization pipeline if enabled
+	if(const char* enable = std::getenv("EDN_ENABLE_PASSES"); enable && std::string(enable) == "1"){
+		llvm::PassBuilder PB;
+		llvm::LoopAnalysisManager LAM;
+		llvm::FunctionAnalysisManager FAM;
+		llvm::CGSCCAnalysisManager CGAM;
+		llvm::ModuleAnalysisManager MAM;
+		PB.registerModuleAnalyses(MAM);
+		PB.registerCGSCCAnalyses(CGAM);
+		PB.registerFunctionAnalyses(FAM);
+		PB.registerLoopAnalyses(LAM);
+		PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+		// Build a conservative default O1 pipeline
+		llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
+		MPM.run(*module_, MAM);
 	}
 	return module_.get();
 }

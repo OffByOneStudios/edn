@@ -4,7 +4,7 @@
 #include <string>
 #include "edn/edn.hpp"
 #include "edn/type_check.hpp"
-#include "edn/type_check.inl"
+#include "edn/type_check.hpp"
 #include "edn/diagnostics_json.hpp"
 
 using namespace edn;

@@ -1,6 +1,6 @@
 # edn
 
-Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3 advanced features).
+Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3/4 advanced features).
 
 ## Features (current)
 - Header-only: single include `#include <edn/edn.hpp>`
@@ -8,7 +8,7 @@ Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnost
 - Per-node metadata (line/col span) auto-populated; accessible for diagnostics
 - Macro / transformer system for syntactic extension & metadata enrichment
 - LLVM IR emission for a custom SSA instruction subset
-- Multi-phase language growth (Phases 1–3) with stable error codes & structured notes
+- Multi-phase language growth (Phases 1–3, plus experimental Phase 4) with stable error codes & structured notes
 - JSON diagnostics export (`EDN_DIAG_JSON=1`)
 
 ### IR Instruction Set (Phases 1–3)
@@ -173,6 +173,27 @@ cmake --build build --config Release
 ctest --test-dir build --output-on-failure
 ```
 
+### Examples
+Build the examples and run the traits demo:
+```pwsh
+cmake --build build --config Release --target edn_traits_example
+./build/examples/Release/edn_traits_example.exe
+```
+
+More Phase 4 demos:
+```pwsh
+cmake --build build --config Release --target edn_generics_example edn_sum_example
+./build/examples/Release/edn_generics_example.exe
+./build/examples/Release/edn_sum_example.exe
+```
+
+Docs:
+- docs/TRAITS.md
+- docs/GENERICS.md
+- docs/SUMS.md
+
+Note on IR printing: LLVM quotes symbol names that contain special characters. For example, generic instances are mangled like `id@i32`, which will appear in IR as `@"id@i32"`. Tests and string matches should account for the quotes.
+
 ## Using with CMake (after installation or via vcpkg)
 ```cmake
 find_package(edn CONFIG REQUIRED)
@@ -227,3 +248,24 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed changes.
 ```pwsh
 $env:EDN_DIAG_JSON=1; ./build/Debug/phase3_driver edn/phase3/globals_const_notes.edn use
 ```
+
+## Phase 4 (experimental): Traits, Generics, Sum Types
+
+Phase 4 adds experimental surface macros for traits, generics, and sum types with lowering into the core typed IR. These are exercised by tests and a small example.
+
+Highlights for Traits:
+- Define a trait and its methods:
+	`(trait :name Show :methods [ (method :name print :type (ptr (fn-type :params [ (ptr i8) i32 ] :ret i32))) ])`
+- The expander synthesizes two structs:
+	- `ShowVT`: vtable with one field per method (field names are symbols)
+	- `ShowObj`: object wrapper `{ data: (ptr i8), vtable: (ptr ShowVT) }`
+- Construct an object and call a method:
+	- `(make-trait-obj %o Show %dataPtr %vtPtr)` produces a `ShowObj` struct literal
+	- `(trait-call %dst i32 Show %o print %x)` expands to `member-addr`/`load` and `call-indirect`
+
+Important constraints from the type checker:
+- Struct field `:name` values must be symbols (not strings); function `:name` must be a string.
+- `ret`, `load`, `store`, `call-indirect` require explicit types.
+- Don’t take the address of an alloca result twice: pass `%obj` directly to `(make-trait-obj ...)`.
+
+See the new example target `edn_traits_example` in `examples/` and the detailed notes in `docs/TRAITS.md`.

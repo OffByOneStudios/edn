@@ -33,6 +33,9 @@ struct UnionInfo { std::string name; std::vector<UnionFieldInfo> fields; std::un
 struct ParamInfoTC { std::string name; TypeId type; };
 struct FunctionInfoTC { std::string name; TypeId ret; std::vector<ParamInfoTC> params; bool variadic=false; bool external=false; };
 struct GlobalInfoTC { std::string name; TypeId type; bool is_const=false; node_ptr init; };
+// Sum types (tagged unions / ADTs)
+struct SumVariantInfo { std::string name; std::vector<TypeId> fields; };
+struct SumInfo { std::string name; std::vector<SumVariantInfo> variants; std::unordered_map<std::string, SumVariantInfo*> variant_map; };
 
 class TypeChecker {
 public:
@@ -61,6 +64,7 @@ private:
     // symbol tables (cleared per module)
     std::unordered_map<std::string, StructInfo> structs_;
     std::unordered_map<std::string, UnionInfo> unions_;
+    std::unordered_map<std::string, SumInfo> sums_;
     std::unordered_map<std::string, FunctionInfoTC> functions_;
     std::unordered_map<std::string, GlobalInfoTC> globals_;
     // typedef aliases: name -> underlying TypeId
@@ -74,6 +78,7 @@ private:
     void reset();
     void collect_structs(TypeCheckResult& r, const std::vector<node_ptr>& elems);
     void collect_unions(TypeCheckResult& r, const std::vector<node_ptr>& elems);
+    void collect_sums(TypeCheckResult& r, const std::vector<node_ptr>& elems);
     void collect_globals(TypeCheckResult& r, const std::vector<node_ptr>& elems);
     void collect_typedefs(TypeCheckResult& r, const std::vector<node_ptr>& elems);
     void collect_enums(TypeCheckResult& r, const std::vector<node_ptr>& elems);
@@ -82,6 +87,13 @@ private:
     bool parse_struct(TypeCheckResult& r, const node_ptr& n);
     bool parse_function_header(TypeCheckResult& r, const node_ptr& fn_list, FunctionInfoTC& out_fn);
     void check_function_body(TypeCheckResult& r, const node_ptr& fn_node, const FunctionInfoTC& fn_info);
+    // Lints (M4.10):
+    // - W1400: top-level unreachable after return
+    // - W1401: missing top-level return in non-void function
+    // - W1402: unreachable code inside nested blocks after ret/break/continue
+    // - W1403: unused variable (defined but never used)
+    // - W1404: unused parameter
+    void analyze_fn_lints(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn_info);
     TypeId parse_type_node(const node_ptr& n, TypeCheckResult& r);
     bool lookup_function(const std::string& name, FunctionInfoTC*& out){ auto it = functions_.find(name); if(it==functions_.end()) return false; out=&it->second; return true; }
     bool lookup_global(const std::string& name, GlobalInfoTC*& out){ auto it=globals_.find(name); if(it==globals_.end()) return false; out=&it->second; return true; }
