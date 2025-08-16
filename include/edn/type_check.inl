@@ -252,12 +252,15 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
             auto noteDef=[&](const std::string& s){ if(!s.empty()&&s[0]=='%') defined.insert(s.substr(1)); };
             if(!reachable){ rep.emit_warning(rep.make_warning("W1402","unreachable code","code cannot execute after terminator", line(*n), col(*n))); }
             // Collect defs/uses for a few ops
-            if(op=="const"||op=="alloca"||op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="icmp"||op=="fcmp"||op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv"||op=="load"||op=="phi"||op=="member"||op=="member-addr"||op=="sum-new"||op=="sum-is"||op=="sum-get"||op=="array-lit"||op=="struct-lit"||op=="call"||op=="call-indirect"||op=="addr"||op=="deref"||op=="index"||op=="gload"||op=="va-start"||op=="va-arg"){
+            if(op=="const"||op=="alloca"||op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="icmp"||op=="fcmp"||op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv"||op=="load"||op=="phi"||op=="member"||op=="member-addr"||op=="sum-new"||op=="sum-is"||op=="sum-get"||op=="array-lit"||op=="struct-lit"||op=="call"||op=="call-indirect"||op=="addr"||op=="deref"||op=="index"||op=="gload"||op=="va-start"||op=="va-arg"||op=="panic"){
                 if(il.size()>=2) noteDef(symAt(1));
                 for(size_t k=2;k<il.size();++k){ if(std::holds_alternative<symbol>(il[k]->data)) noteUse(std::get<symbol>(il[k]->data).name); }
             } else if(op=="assign"){ if(il.size()>=3){ noteUse(symAt(2)); noteUse(symAt(1)); } }
             // Control-flow and reachability
             if(op=="ret"){ reachable=false; continue; }
+            if(op=="panic"){ // terminator: aborts
+                reachable=false; continue;
+            }
             if(op=="break"||op=="continue"){ reachable=false; continue; }
             if(op=="block"){ // scan :body
                 for(size_t j=1;j<il.size();++j){ if(!il[j]||!std::holds_alternative<keyword>(il[j]->data)) break; std::string kw=std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val=il[j]; if(kw=="locals"){ if(val && std::holds_alternative<vector_t>(val->data)){ for(auto &d: std::get<vector_t>(val->data).elems){ if(!d||!std::holds_alternative<list>(d->data)) continue; auto &dl=std::get<list>(d->data).elems; if(dl.size()==3 && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="local"){ if(std::holds_alternative<symbol>(dl[2]->data)){ std::string vn=std::get<symbol>(dl[2]->data).name; if(!vn.empty()&&vn[0]=='%') vn.erase(0,1); defined.insert(vn); } } } } } else if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)){ bool subReach=true; scan(std::get<vector_t>(val->data).elems, subReach); if(!subReach) reachable=false; } } }
@@ -317,6 +320,91 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
     }
 }
 inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn, int loop_depth){ auto get_var=[&](const std::string& n)->TypeId{ auto it=var_types_.find(n); return it==var_types_.end() ? (TypeId)-1 : it->second; }; auto attach=[&](const node_ptr& n, TypeId t){ n->metadata["type-id"]=detail::make_node((int64_t)t); }; auto is_int=[&](TypeId t){ const Type& T=ctx_.at(t); if(T.kind!=Type::Kind::Base) return false; switch(T.base){ case BaseType::I1: case BaseType::I8: case BaseType::I16: case BaseType::I32: case BaseType::I64: case BaseType::U8: case BaseType::U16: case BaseType::U32: case BaseType::U64: return true; default: return false;} }; for(auto &n: insts){ if(!n||!std::holds_alternative<list>(n->data)){ error(r,*n,"instruction must be list"); r.success=false; continue; } auto &il=std::get<list>(n->data).elems; if(il.empty()||!std::holds_alternative<symbol>(il[0]->data)){ error(r,*n,"instruction missing opcode"); r.success=false; continue; } std::string op=std::get<symbol>(il[0]->data).name; auto sym=[&](size_t i)->std::string{ if(i<il.size() && std::holds_alternative<symbol>(il[i]->data)) return std::get<symbol>(il[i]->data).name; return std::string{}; };
+    // --- M4.4 Closures (minimal non-escaping, single capture env) ---
+    if(op=="closure"){ // (closure %dst (ptr (fn-type ...)) Callee [ %env ])
+        if(il.size()<5){ error_code(r,*n,"E1430","closure arity","expected (closure %dst (ptr (fn-type ...)) <callee> [ %env ])"); r.success=false; continue; }
+        std::string dst = sym(1);
+        if(dst.empty() || dst[0] != '%'){ error_code(r,*n,"E1435","closure dst must be %var","prefix destination with %"); r.success=false; continue; }
+        TypeId toTy = parse_type_node(il[2], r);
+        const Type& TT = ctx_.at(toTy);
+        if(!(TT.kind==Type::Kind::Pointer && ctx_.at(TT.pointee).kind==Type::Kind::Function)){
+            error_code(r,*n,"E1430","closure type must be (ptr (fn-type ...))","annotate with pointer-to-function type"); r.success=false; continue; }
+        const Type& TF = ctx_.at(TT.pointee);
+        // Callee name can be symbol or string; accept symbol here (strings aren't supported in checker forms elsewhere)
+        std::string callee = sym(3);
+        if(callee.empty()){ error_code(r,*n,"E1431","closure missing callee","supply function name symbol"); r.success=false; continue; }
+        FunctionInfoTC* finfo=nullptr; if(!lookup_function(callee, finfo)){
+            error_code(r,*n,"E1431","unknown function for closure","declare function before use"); r.success=false; continue; }
+        // Captures vector
+        if(!std::holds_alternative<vector_t>(il[4]->data)){
+            error_code(r,*n,"E1433","closure captures must be vector","use [ %env ]"); r.success=false; continue; }
+        auto caps = std::get<vector_t>(il[4]->data).elems;
+        if(caps.size()!=1){ error_code(r,*n,"E1433","closure currently supports exactly one capture","provide [ %env ]"); r.success=false; }
+        // Validate function vs thunk signature: function must take env first, then thunk params; return must match
+        if(finfo->params.size() < 1u){ error_code(r,*n,"E1432","closure target must take env as first parameter","add an env/context parameter first"); r.success=false; }
+        if(finfo->ret != TF.ret){ type_mismatch(r,*n,"E1432","closure return", TF.ret, finfo->ret); r.success=false; }
+        if(finfo->variadic != TF.variadic){ error_code(r,*n,"E1432","variadic mismatch between closure type and function","ensure :variadic flags match"); r.success=false; }
+        size_t expectedThunkParams = finfo->params.size() - 1; if(TF.params.size() != expectedThunkParams){ error_code(r,*n,"E1432","closure param mismatch","thunk params must match function params excluding env"); r.success=false; }
+        for(size_t i=0;i<TF.params.size() && i<expectedThunkParams; ++i){ if(TF.params[i] != finfo->params[i+1].type){ type_mismatch(r,*n,"E1432","closure param", finfo->params[i+1].type, TF.params[i]); r.success=false; } }
+        // Validate capture type matches function env param type
+        if(!caps.empty()){
+            auto cap = caps[0]; if(!cap || !std::holds_alternative<symbol>(cap->data)){ error_code(r,*n,"E1434","closure capture must be %var","use symbol of env pointer"); r.success=false; }
+            else {
+                std::string cname = std::get<symbol>(cap->data).name; if(cname.empty()||cname[0] != '%'){ error_code(r,*n,"E1434","closure capture must be %var","prefix with %"); r.success=false; }
+                else { auto ct = get_var(cname.substr(1)); if(ct==(TypeId)-1){ error_code(r,*n,"E1434","closure capture undefined","define %env before use"); r.success=false; }
+                    else if(ct != finfo->params[0].type){ type_mismatch(r,*n,"E1434","closure env", finfo->params[0].type, ct); r.success=false; }
+                }
+            }
+        }
+        // Define result type
+        var_types_[dst.substr(1)] = toTy; attach(n, toTy); continue;
+    }
+    // --- M4.4 Closures (record + call path) ---
+    if(op=="make-closure"){ // (make-closure %dst Callee [ %env ])
+        if(il.size()<4){ error_code(r,*n,"E1436","make-closure arity","expected (make-closure %dst <callee> [ %env ])"); r.success=false; continue; }
+        std::string dst = sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1435","closure dst must be %var","prefix destination with %"); r.success=false; continue; }
+        std::string callee = sym(2); if(callee.empty()){ error_code(r,*n,"E1431","unknown function for closure","supply function name symbol"); r.success=false; continue; }
+        FunctionInfoTC* finfo=nullptr; if(!lookup_function(callee, finfo)){ error_code(r,*n,"E1431","unknown function for closure","declare function before use"); r.success=false; continue; }
+        if(il.size()<4 || !std::holds_alternative<vector_t>(il[3]->data)){ error_code(r,*n,"E1433","closure captures must be vector","use [ %env ]"); r.success=false; continue; }
+        auto caps = std::get<vector_t>(il[3]->data).elems; if(caps.size()!=1){ error_code(r,*n,"E1433","closure currently supports exactly one capture","provide [ %env ]"); r.success=false; }
+        // Validate function takes env first
+        if(finfo->params.size()<1u){ error_code(r,*n,"E1432","closure target must take env as first parameter","add an env/context parameter first"); r.success=false; }
+        // Validate capture var exists and matches env type
+        if(!caps.empty()){
+            auto cap=caps[0]; if(!cap || !std::holds_alternative<symbol>(cap->data)){ error_code(r,*n,"E1434","closure capture must be %var","use symbol of env pointer"); r.success=false; }
+            else {
+                std::string cname=std::get<symbol>(cap->data).name; if(cname.empty()||cname[0] != '%'){ error_code(r,*n,"E1434","closure capture must be %var","prefix with %"); r.success=false; }
+                else { auto ct=get_var(cname.substr(1)); if(ct==(TypeId)-1){ error_code(r,*n,"E1434","closure capture undefined","define %env before use"); r.success=false; }
+                    else if(ct != finfo->params[0].type){ type_mismatch(r,*n,"E1434","closure env", finfo->params[0].type, ct); r.success=false; }
+                }
+            }
+        }
+        // Type of %dst is pointer to struct-ref of internal name
+        std::string sname = "__edn.closure."+callee;
+        TypeId ty = ctx_.get_pointer(ctx_.get_struct(sname));
+        var_types_[dst.substr(1)] = ty; attach(n, ty); continue;
+    }
+    if(op=="call-closure"){ // (call-closure %dst <ret> %clos %args...)
+        if(il.size()<4){ error_code(r,*n,"E1437","call-closure arity","expected (call-closure %dst <ret> %clos %args...)"); r.success=false; continue; }
+        std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1437","call-closure dst must be %var","prefix destination with %"); r.success=false; continue; }
+        TypeId retTy = parse_type_node(il[2], r);
+        std::string clos=sym(3); if(clos.empty()||clos[0] != '%'){ error_code(r,*n,"E1437","call-closure clos must be %var","pass closure value as %var"); r.success=false; continue; }
+        auto cty = get_var(clos.substr(1)); if(cty==(TypeId)-1){ error_code(r,*n,"E1437","call-closure undefined closure var","define closure before use"); r.success=false; continue; }
+        const Type& CT = ctx_.at(cty); if(CT.kind!=Type::Kind::Pointer || ctx_.at(CT.pointee).kind!=Type::Kind::Struct){ error_code(r,*n,"E1437","call-closure expects pointer to closure struct","build with make-closure first"); r.success=false; continue; }
+        const Type& ST = ctx_.at(CT.pointee);
+        std::string sname = ST.struct_name; std::string prefix = "__edn.closure.";
+        if(sname.rfind(prefix,0)!=0){ error_code(r,*n,"E1437","call-closure expects closure struct","name must start with __edn.closure."); r.success=false; continue; }
+        std::string callee = sname.substr(prefix.size()); FunctionInfoTC* finfo=nullptr; if(!lookup_function(callee, finfo)){ error_code(r,*n,"E1431","unknown function for closure","declare function before use"); r.success=false; continue; }
+        // Validate args count/types vs callee (excluding env first param)
+        size_t userArgCount = (il.size()>4)? (il.size()-4) : 0; size_t expected = finfo->params.size()>=1? (finfo->params.size()-1) : 0;
+        if(!finfo->variadic){ if(userArgCount != expected){ error_code(r,*n,"E1437","call-closure arg count mismatch","provide exactly callee params minus env"); r.success=false; } }
+        else { if(userArgCount < expected){ error_code(r,*n,"E1437","call-closure arg count mismatch","provide at least callee params minus env"); r.success=false; } }
+        size_t checkN = std::min(userArgCount, expected);
+        for(size_t i=0;i<checkN; ++i){ std::string an = sym(4+i); if(an.empty()||an[0] != '%'){ error_code(r,*n,"E1437","call-closure arg must be %var","prefix with %"); r.success=false; continue; } auto at = get_var(an.substr(1)); if(at==(TypeId)-1) { error_code(r,*n,"E1437","call-closure arg undefined","define argument before use"); r.success=false; continue; } if(at != finfo->params[i+1].type){ type_mismatch(r,*n,"E1437","call-closure arg", finfo->params[i+1].type, at); r.success=false; } }
+        // Return type must match callee's return
+        if(retTy != finfo->ret){ type_mismatch(r,*n,"E1437","call-closure return", finfo->ret, retTy); r.success=false; }
+        var_types_[dst.substr(1)] = retTy; attach(n, retTy); continue;
+    }
     // --- M4.1 Sum constructors and tag test ---
     if(op=="sum-new"){ // (sum-new %dst SumType Variant [ %v0 %v1 ... ])
         if(il.size()<4){ error_code(r,*n,"E1409","sum-new arity","expected (sum-new %dst SumType Variant [ %vals* ])"); r.success=false; continue; }
@@ -799,6 +887,11 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
     if(op=="alloca"){ if(il.size()!=3){ error_code(r,*n,"E1108","alloca arity","expected (alloca %dst <type>)"); r.success=false; continue; } std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1109","alloca dst must be %var","prefix destination with %"); r.success=false; continue; } TypeId ty=parse_type_node(il[2],r); if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1110","redefinition of variable","rename destination"); r.success=false; } TypeId pty=ctx_.get_pointer(ty); var_types_[dst.substr(1)]=pty; attach(n,pty); continue; }
     if(op=="struct-lit"){ if(il.size()!=4){ error_code(r,*n,"E1200","struct-lit arity","expected (struct-lit %dst StructName [ field1 %v1 ... ])"); r.success=false; continue; } std::string dst=sym(1), stName=sym(2); if(dst.empty()||stName.empty()){ error_code(r,*n,"E1201","struct-lit symbols","supply %dst StructName [ ... ]"); r.success=false; continue; } auto sit=structs_.find(stName); if(sit==structs_.end()){ error_code(r,*n,"E1202","unknown struct","declare struct before literal"); r.success=false; continue; } if(!il[3]||!std::holds_alternative<vector_t>(il[3]->data)){ error_code(r,*n,"E1203","struct-lit fields must be vector","wrap field list in [ ]"); r.success=false; continue; } auto &vec=std::get<vector_t>(il[3]->data).elems; if(vec.size()!=sit->second.fields.size()*2){ error_code(r,*n,"E1204","struct-lit field count mismatch","provide name/value pairs for all fields"); r.success=false; } bool orderOk=true; size_t fi=0; for(size_t i=0;i<vec.size(); i+=2,++fi){ if(fi>=sit->second.fields.size()) break; if(!vec[i]||!std::holds_alternative<symbol>(vec[i]->data)){ error_code(r,*n,"E1205","field name must be symbol","use declared field names"); r.success=false; orderOk=false; break; } std::string fname=std::get<symbol>(vec[i]->data).name; if(fname!=sit->second.fields[fi].name){ error_code(r,*n,"E1206","field order/name mismatch","use declared order"); r.success=false; orderOk=false; } if(i+1>=vec.size()||!vec[i+1]||!std::holds_alternative<symbol>(vec[i+1]->data)){ error_code(r,*n,"E1207","field value must be %var symbol","prefix with %"); r.success=false; orderOk=false; continue; } std::string val=std::get<symbol>(vec[i+1]->data).name; if(val.empty()||val[0] != '%'){ error_code(r,*n,"E1207","field value must be %var symbol","prefix with %"); r.success=false; orderOk=false; continue; } auto vt=get_var(val.substr(1)); if(vt!=(TypeId)-1 && vt!=sit->second.fields[fi].type){ type_mismatch(r,*n,"E1208","struct field", sit->second.fields[fi].type, vt); r.success=false; } } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1209","redefinition of variable","rename destination"); r.success=false; } TypeId sty=ctx_.get_struct(stName); TypeId pty=ctx_.get_pointer(sty); var_types_[dst.substr(1)]=pty; attach(n,pty);} else { error_code(r,*n,"E1201","struct-lit symbols","destination must be %var"); r.success=false; } continue; }
     if(op=="array-lit"){ if(il.size()!=5){ error_code(r,*n,"E1210","array-lit arity","expected (array-lit %dst <elem-type> <size> [ %e0 %e1 ... ])"); r.success=false; continue; } std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1211","array-lit dst must be %var","prefix destination with %"); r.success=false; continue; } TypeId elem=parse_type_node(il[2],r); if(!il[3]||!std::holds_alternative<int64_t>(il[3]->data)){ error_code(r,*n,"E1212","array-lit size int","size must be integer literal"); r.success=false; continue; } uint64_t asz=(uint64_t)std::get<int64_t>(il[3]->data); if(asz==0){ error_code(r,*n,"E1213","array size > 0","use positive size"); r.success=false; } if(!il[4]||!std::holds_alternative<vector_t>(il[4]->data)){ error_code(r,*n,"E1214","array-lit elems must be vector","wrap elements in [ ]"); r.success=false; continue; } auto &elemsVec=std::get<vector_t>(il[4]->data).elems; if(elemsVec.size()!=asz){ error_code(r,*n,"E1215","array-lit count mismatch","element count must equal declared size"); r.success=false; } for(auto &e: elemsVec){ if(!e||!std::holds_alternative<symbol>(e->data)){ error_code(r,*n,"E1216","array elem must be %var","prefix each element with %"); r.success=false; continue; } std::string v=std::get<symbol>(e->data).name; if(v.empty()||v[0] != '%'){ error_code(r,*n,"E1216","array elem must be %var","prefix each element with %"); r.success=false; continue; } auto vt=get_var(v.substr(1)); if(vt!=(TypeId)-1 && vt!=elem){ type_mismatch(r,*n,"E1217","array elem", elem, vt); r.success=false; } } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1218","redefinition of variable","rename destination"); r.success=false; } TypeId aty=ctx_.get_array(elem, asz); TypeId pty=ctx_.get_pointer(aty); var_types_[dst.substr(1)]=pty; attach(n,pty); } else { error_code(r,*n,"E1211","array-lit dst must be %var","prefix destination with %"); r.success=false; } continue; }
+    if(op=="panic"){ // (panic) – aborts immediately; no result
+        if(il.size()!=1){ error_code(r,*n,"E1440","panic arity","expected (panic)"); r.success=false; continue; }
+        // No types to attach; allowed in any function. Frontends should ensure control flow after panic is unreachable.
+        continue;
+    }
     if(op=="phi"){ // (phi %dst <type> [ (%val %label) ... ])
         if(il.size()!=4){ error_code(r,*n,"E0300","phi arity","expected (phi %dst <type> [ (%v %label) ... ])"); r.success=false; continue; }
         std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E0301","phi dst must be %var","use %name for SSA value"); r.success=false; continue; }

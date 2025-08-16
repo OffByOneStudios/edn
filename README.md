@@ -191,6 +191,7 @@ Docs:
 - docs/TRAITS.md
 - docs/GENERICS.md
 - docs/SUMS.md
+ - docs/EXTERNALS.md
 
 Note on IR printing: LLVM quotes symbol names that contain special characters. For example, generic instances are mangled like `id@i32`, which will appear in IR as `@"id@i32"`. Tests and string matches should account for the quotes.
 
@@ -249,7 +250,7 @@ See [CHANGELOG.md](CHANGELOG.md) for detailed changes.
 $env:EDN_DIAG_JSON=1; ./build/Debug/phase3_driver edn/phase3/globals_const_notes.edn use
 ```
 
-## Phase 4 (experimental): Traits, Generics, Sum Types
+## Phase 4 (experimental): Traits, Generics, Sum Types, Closures
 
 Phase 4 adds experimental surface macros for traits, generics, and sum types with lowering into the core typed IR. These are exercised by tests and a small example.
 
@@ -269,3 +270,14 @@ Important constraints from the type checker:
 - Don’t take the address of an alloca result twice: pass `%obj` directly to `(make-trait-obj ...)`.
 
 See the new example target `edn_traits_example` in `examples/` and the detailed notes in `docs/TRAITS.md`.
+
+### Closures
+- Minimal thunk form: `(closure %dst (ptr <fn-type>) %fn [ %env ])`
+	- Non-escaping, single-capture. Type checks in E1430–E1435. Lowers to a private thunk + private env global; `%dst` is the thunk fnptr.
+- Record form: `(make-closure %dst Callee [ %env ])` builds a closure record and `(call-closure %dst <ret> %clos %args...)` invokes it.
+	- Layout: `struct __edn.closure.<Callee> { i8* fn; <EnvType> env; }`
+	- Call semantics: the stored `fn` is called indirectly with `env` as the first argument followed by user args; return type must match `<ret>`.
+	- Validation:
+		- `make-closure` arity and capture checks (E1436 for arity; E1433/E1434 for capture vector/typing).
+		- `call-closure` return/arg checks and closure type checks (E1437 family).
+- Tests: `tests/phase4_closures_min_test.cpp`, `tests/phase4_closures_record_test.cpp`, `tests/phase4_closures_negative_test.cpp`.

@@ -1,6 +1,6 @@
 # Phase 4 Plan – Platform Infrastructure for Modern Language Support
 
-Status: In progress (2025-08-15)
+Status: In progress (2025-08-16)
 
 Goal: Equip EDN with cross-cutting capabilities (types, ABI, runtime hooks, codegen QoL) needed to host front‑ends for modern languages (Rust, TypeScript, Python, Zig). Focus on reusable primitives, tight diagnostics, and testable, incremental delivery.
 
@@ -106,7 +106,7 @@ Ordering can adjust; aim to land self-contained slices with tests.
 - Feature flags stable; default build remains functional without them.
 - Roadmap prototypes (Phase 5) unblocked by Phase 4 primitives.
 
-## Progress summary (as of 2025-08-15)
+## Progress summary (as of 2025-08-16)
 - M4.1 Sum Types & Match: DONE
    - Implemented sums (constructors, tag test, field get), match helper with binds, exhaustiveness checks, and result-as-value form with PHI merge.
    - Error codes E1400–E1423 added; structured diagnostics with JSON option.
@@ -115,6 +115,7 @@ Ordering can adjust; aim to land self-contained slices with tests.
    - Pass pipeline behind `EDN_ENABLE_PASSES`; disabled during golden tests for determinism.
 - M4.10 Lints/Verifier & Golden IR Tests: PARTIAL
    - Golden IR harness in place for ADTs/match. Lints (unreachable, missing terminators, unused) pending.
+   - Update: lints recognize `(panic)` as a terminator for reachability (no false positives after it).
 - M4.2 Generics – Monomorphization: DONE
    - Reader‑macro expander implemented (`include/edn/generics.hpp`), integrated pre‑type‑check.
    - Rewrites `(gcall ...)` → `(call ...)`, generates specializations, preserves header, dedups instances.
@@ -124,7 +125,24 @@ Ordering can adjust; aim to land self-contained slices with tests.
     - Generates `<Trait>VT` and `<Trait>Obj`, lowers `make-trait-obj` and `trait-call` to core IR.
     - Tests passing; example target `edn_traits_example` verifies IR.
     - Docs: `docs/TRAITS.md` (shape, lowering, constraints).
-- Remaining milestones (M4.4 Closures, M4.5 Exceptions, M4.6 Coroutines, M4.7 GC/Statepoints, M4.9 Debug Info): NOT STARTED
+- M4.4 Closures & Captures: DONE (phase 4 scope)
+   - Implemented minimal, non‑escaping closures with a single capture.
+   - IR form accepted: `(closure %dst (ptr <fn-type>) %fn [ %env ])`.
+   - Lowering (minimal): per‑site private thunk that loads `%env` from a private global and calls the target as `Target(env, args...)`; result is the thunk function pointer.
+   - Type checker validation added for closure form (arity, `%dst`/types, callee signature, single capture type) and error codes reserved in E143x.
+   - Test added: `tests/phase4_closures_min_test.cpp` (verifies thunk synthesis/builds); suite green.
+   - Record path: Added `(make-closure ...)` and `(call-closure ...)` with explicit struct `{ i8* fn, <EnvType> env }` named `__edn.closure.<callee>`; `call-closure` indirect-calls using the loaded fnptr and the callee’s function type (env first).
+   - Tests: `tests/phase4_closures_record_test.cpp` and negative cases in `tests/phase4_closures_negative_test.cpp` and `tests/phase4_closures_capture_mismatch_test.cpp`.
+   - JIT runtime smoke passes.
+   - Next (out of current scope): multi‑capture env struct and escaping closures with lifetime management.
+- M4.5 Exceptions & Panics: PARTIAL
+   - Minimal `(panic)` op added to the IR and emitter lowers it to `llvm.trap` followed by `unreachable` (panic=abort slice).
+   - Type checker: rule added (E1440 arity) and lints updated to treat panic as a terminator.
+   - Current issue: the panic minimal test fails because the type checker reports `EGEN unknown instruction` for `(panic)`, causing `phase4_eh_panic_test.cpp` to assert at line 25.
+     - Observed test output snippet: "panic test type/emission failed\nEGEN unknown instruction\nAssertion failed: tcres.success && mod, file tests/phase4_eh_panic_test.cpp, line 25".
+     - Suspected cause: opcode dispatch gating not consistently recognizing `panic` in `check_instruction_list` in all locations; ensure the top‑level op handler includes `panic` (not nested under another op) and that any fast‑path filters don’t omit it.
+     - Next steps: audit `include/edn/type_check.inl` for all opcode branches and fix placement; add a negative shape test for `(panic x)` arity; re‑run tests.
+- Remaining milestones (M4.6 Coroutines, M4.7 GC/Statepoints, M4.9 Debug Info): NOT STARTED
 
 ### Pointers (docs & examples)
 - Docs:
@@ -134,3 +152,10 @@ Ordering can adjust; aim to land self-contained slices with tests.
    - Built in `build/examples/Release/` and verified via LLVM IR verifier
 
 Error code allocation note: M4.1 consumed E1400–E1423 (including result-as-value). Adjust later milestone ranges to avoid collisions (e.g., use E147x+ for Generics).
+
+## Open issues / notes (2025‑08‑16)
+- Panic minimal test is red:
+   - Symptom: `EGEN unknown instruction` for `(panic)`, assert at `tests/phase4_eh_panic_test.cpp:25`.
+   - Status: Emitter wiring is correct (`llvm.trap` + `unreachable`). Checker branch for panic exists but may be misplaced. Lints updated to treat it as a terminator.
+   - Action tomorrow: hoist `(panic)` handler in `check_instruction_list` to top‑level, ensure it’s included in any op allow‑lists, rebuild, re‑run tests.
+- Phase 3 examples smoke: `edn/phase3/union_access.edn` still throws during type check ("invalid vector subscript"). We currently tolerate one failure in the examples smoke harness. Decide whether to fix the example or mark it explicitly as expected‑negative.

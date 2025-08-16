@@ -10,6 +10,7 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -178,6 +179,140 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					std::string dst=trimPct(symName(il[1])); TypeId retTy; try{ retTy=tctx_.parse_type(il[2]); }catch(...){ continue; } std::string fptrName=trimPct(symName(il[3])); if(fptrName.empty()) continue; if(!vtypes.count(fptrName)) continue; TypeId fpty=vtypes[fptrName]; const Type& FPT=tctx_.at(fpty); if(FPT.kind!=Type::Kind::Pointer) continue; const Type& FT=tctx_.at(FPT.pointee); if(FT.kind!=Type::Kind::Function) continue; auto *calleeV=vmap[fptrName]; if(!calleeV) continue; std::vector<llvm::Value*> args; bool bad=false; for(size_t ai=4; ai<il.size(); ++ai){ std::string an=trimPct(symName(il[ai])); if(an.empty()||!vmap.count(an)){ bad=true; break;} args.push_back(vmap[an]); }
 					if(bad) continue; llvm::FunctionType* fty = llvm::cast<llvm::FunctionType>(map_type(FPT.pointee)); auto *ci=builder.CreateCall(fty, calleeV, args, fty->getReturnType()->isVoidTy()?"":dst); if(!fty->getReturnType()->isVoidTy()){ vmap[dst]=ci; vtypes[dst]=retTy; }
 				}
+					else if(op=="closure" && il.size()>=5){ // (closure %dst (ptr (fn-type ...)) Callee [ %env ])
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					TypeId fnPtrTy; try{ fnPtrTy=tctx_.parse_type(il[2]); }catch(...){ continue; }
+					std::string callee=symName(il[3]); if(callee.empty()) continue;
+					if(!std::holds_alternative<vector_t>(il[4]->data)) continue; auto caps = std::get<vector_t>(il[4]->data).elems; if(caps.size()!=1) continue;
+					std::string envVar=trimPct(symName(caps[0])); if(envVar.empty()||!vmap.count(envVar)) continue;
+					// Build or get callee function
+					auto *TargetF = module_->getFunction(callee);
+					if(!TargetF) {
+						// Attempt: construct from current known types (first param is env)
+						// Find header from AST if exists
+						bool foundHeader=false; 
+						for(size_t ti=1; ti<top.size(); ++ti) { 
+							auto &fnNode = top[ti]; 
+							if(!fnNode || !std::holds_alternative<list>(fnNode->data)) continue; 
+							auto &fl2 = std::get<list>(fnNode->data).elems; 
+							if(fl2.empty() || !std::holds_alternative<symbol>(fl2[0]->data) || std::get<symbol>(fl2[0]->data).name != "fn") continue; 
+							std::string fname2; 
+							TypeId retHeader = tctx_.get_base(BaseType::Void); 
+							std::vector<TypeId> paramTypeIds; 
+							bool varargFlag = false; 
+							for(size_t j=1; j<fl2.size(); ++j) { 
+								if(!fl2[j] || !std::holds_alternative<keyword>(fl2[j]->data)) break; 
+								std::string kw = std::get<keyword>(fl2[j]->data).name; 
+								if(++j >= fl2.size()) break; 
+								auto val = fl2[j]; 
+								if(kw == "name") { 
+									fname2 = symName(val); 
+								} else if(kw == "ret") { 
+									try { 
+										retHeader = tctx_.parse_type(val);
+									} catch(...) { 
+										retHeader = tctx_.get_base(BaseType::Void); 
+									} 
+								} else if(kw == "params" && val && std::holds_alternative<vector_t>(val->data)) { 
+									for(auto &p: std::get<vector_t>(val->data).elems) { 
+										if(!p || !std::holds_alternative<list>(p->data)) continue; 
+										auto &pl = std::get<list>(p->data).elems; 
+										if(pl.size() == 3 && std::holds_alternative<symbol>(pl[0]->data) && std::get<symbol>(pl[0]->data).name == "param") { 
+											try { 
+												TypeId pty = tctx_.parse_type(pl[1]); 
+												paramTypeIds.push_back(pty);
+											} catch(...) { 
+											} 
+										} 
+									} 
+								} else if(kw == "vararg") { 
+									if(val && std::holds_alternative<bool>(val->data)) 
+										varargFlag = std::get<bool>(val->data); 
+								} 
+							}
+							if(fname2 == callee) { 
+								std::vector<llvm::Type*> pls; 
+								for(auto pid: paramTypeIds) 
+									pls.push_back(map_type(pid)); 
+								auto *fty = llvm::FunctionType::get(map_type(retHeader), pls, varargFlag); 
+								TargetF = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, callee, module_.get()); 
+								foundHeader = true; 
+								break; 
+							}
+						}
+						if(!TargetF) continue; // bail if we cannot resolve
+					}
+					// Create a unique private global to hold env pointer for this closure site
+					auto *envVal = vmap[envVar]; llvm::Type* envPtrTy = envVal->getType();
+					std::string gname = "__edn.closure.env."+std::to_string(reinterpret_cast<uintptr_t>(envVal)) + "." + std::to_string(cfCounter++);
+					auto *G = new llvm::GlobalVariable(*module_, envPtrTy, false, llvm::GlobalValue::PrivateLinkage, llvm::Constant::getNullValue(envPtrTy), gname);
+					builder.CreateStore(envVal, G);
+					// Synthesize a thunk with signature fnPtrTy's function type that loads env from G and calls TargetF(env, ...args)
+					const Type& PT = tctx_.at(fnPtrTy); if(PT.kind!=Type::Kind::Pointer) continue; const Type& FT = tctx_.at(PT.pointee); if(FT.kind!=Type::Kind::Function) continue;
+					std::vector<llvm::Type*> thunkParams; thunkParams.reserve(FT.params.size()); for(auto pid: FT.params) thunkParams.push_back(map_type(pid)); auto *thunkFTy = llvm::FunctionType::get(map_type(FT.ret), thunkParams, FT.variadic);
+					std::string thunkName = "__edn.closure.thunk."+callee+"."+std::to_string(cfCounter++);
+					auto *ThunkF = llvm::Function::Create(thunkFTy, llvm::Function::PrivateLinkage, thunkName, module_.get()); size_t ai2=0; for(auto &a : ThunkF->args()) a.setName("a"+std::to_string(ai2++)); auto *thunkEntry = llvm::BasicBlock::Create(*llctx_, "entry", ThunkF); llvm::IRBuilder<> tb(thunkEntry);
+					// Build call args: env loaded from G, then all thunk params
+					llvm::Value* loadedEnv = tb.CreateLoad(envPtrTy, G, "env"); std::vector<llvm::Value*> callArgs; callArgs.push_back(loadedEnv); for(auto &a : ThunkF->args()) callArgs.push_back(&a);
+					auto *targetFTy = llvm::cast<llvm::FunctionType>(TargetF->getFunctionType()); auto *call = tb.CreateCall(targetFTy, TargetF, callArgs, targetFTy->getReturnType()->isVoidTy()?"":"retv"); if(targetFTy->getReturnType()->isVoidTy()) tb.CreateRetVoid(); else tb.CreateRet(call);
+					// Provide result as function pointer value
+					vmap[dst]=ThunkF; vtypes[dst]=fnPtrTy;
+				}
+					else if(op=="make-closure" && il.size()>=4){ // (make-closure %dst Callee [ %env ])
+						std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; std::string callee=symName(il[2]); if(callee.empty()) continue; if(!std::holds_alternative<vector_t>(il[3]->data)) continue; auto caps=std::get<vector_t>(il[3]->data).elems; if(caps.size()!=1) continue; std::string envVar=trimPct(symName(caps[0])); if(envVar.empty()||!vmap.count(envVar)) continue;
+						// Ensure callee exists or create from header
+						auto *TargetF = module_->getFunction(callee); if(!TargetF){
+							for(size_t ti=1; ti<top.size(); ++ti){ auto &fnNode = top[ti]; if(!fnNode||!std::holds_alternative<list>(fnNode->data)) continue; auto &fl2 = std::get<list>(fnNode->data).elems; if(fl2.empty()||!std::holds_alternative<symbol>(fl2[0]->data) || std::get<symbol>(fl2[0]->data).name!="fn") continue; std::string fname2; TypeId retHeader=tctx_.get_base(BaseType::Void); std::vector<TypeId> paramTypeIds; bool varargFlag=false; for(size_t j=1;j<fl2.size(); ++j){ if(!fl2[j]||!std::holds_alternative<keyword>(fl2[j]->data)) break; std::string kw=std::get<keyword>(fl2[j]->data).name; if(++j>=fl2.size()) break; auto val=fl2[j]; if(kw=="name"){ fname2=symName(val); } else if(kw=="ret"){ try{ retHeader=tctx_.parse_type(val);}catch(...){ retHeader=tctx_.get_base(BaseType::Void);} } else if(kw=="params" && val && std::holds_alternative<vector_t>(val->data)){ for(auto &p: std::get<vector_t>(val->data).elems){ if(!p||!std::holds_alternative<list>(p->data)) continue; auto &pl=std::get<list>(p->data).elems; if(pl.size()==3 && std::holds_alternative<symbol>(pl[0]->data) && std::get<symbol>(pl[0]->data).name=="param"){ try{ TypeId pty=tctx_.parse_type(pl[1]); paramTypeIds.push_back(pty);}catch(...){ } } } } else if(kw=="vararg"){ if(val && std::holds_alternative<bool>(val->data)) varargFlag=std::get<bool>(val->data); } }
+								if(fname2==callee){ std::vector<llvm::Type*> pls; for(auto pid: paramTypeIds) pls.push_back(map_type(pid)); auto *fty=llvm::FunctionType::get(map_type(retHeader), pls, varargFlag); TargetF = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, callee, module_.get()); break; }
+							}
+							if(!TargetF) continue;
+						}
+						// Create closure struct type: { i8* fn, <env type> }
+						std::string sname = "__edn.closure."+callee;
+						auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname);
+						if(!ST){
+							auto *i8ptr = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_));
+							std::vector<llvm::Type*> flds = { i8ptr, vmap[envVar]->getType() };
+							ST = llvm::StructType::create(*llctx_, flds, "struct."+sname);
+						}
+						// Allocate and initialize record
+						auto *allocaPtr = builder.CreateAlloca(ST, nullptr, dst);
+						llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0);
+						// env at index 1
+						llvm::Value* idxEnv=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),1);
+						auto *envPtr=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,idxEnv}, dst+".env.addr");
+						builder.CreateStore(vmap[envVar], envPtr);
+						// fnptr at index 0 (store as i8*)
+						llvm::Value* idxFn=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0);
+						auto *fnPtr=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,idxFn}, dst+".fn.addr");
+						auto *i8ptr = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_));
+						llvm::Value* fnAsI8 = builder.CreateBitCast(TargetF, i8ptr, dst+".fn.cast");
+						builder.CreateStore(fnAsI8, fnPtr);
+						vmap[dst]=allocaPtr; // pointer to closure struct
+						vtypes[dst]=tctx_.get_pointer(tctx_.get_struct(sname));
+					}
+					else if(op=="call-closure" && il.size()>=4){ // (call-closure %dst <ret> %clos %args...)
+						std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId retTy; try{ retTy=tctx_.parse_type(il[2]); }catch(...){ continue; } std::string clos=trimPct(symName(il[3])); if(clos.empty()||!vmap.count(clos)) continue;
+						auto ctyIt=vtypes.find(clos); if(ctyIt==vtypes.end()) continue; const Type& CT=tctx_.at(ctyIt->second); if(CT.kind!=Type::Kind::Pointer) continue; const Type& STy=tctx_.at(CT.pointee); if(STy.kind!=Type::Kind::Struct) continue; std::string sname=STy.struct_name; auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue;
+						// Load fnptr (i8*) and env (field 1)
+						llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0);
+						llvm::Value* idxFn=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0);
+						llvm::Value* idxEnv=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),1);
+						auto *fnPtrAddr=builder.CreateInBoundsGEP(ST, vmap[clos], {zero,idxFn}, dst+".fn.addr");
+						auto *envAddr=builder.CreateInBoundsGEP(ST, vmap[clos], {zero,idxEnv}, dst+".env.addr");
+						auto *i8ptr2 = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_));
+						llvm::Value* fnI8 = builder.CreateLoad(i8ptr2, fnPtrAddr, dst+".fn");
+						llvm::Type* envTy = ST->getElementType(1);
+						llvm::Value* envV = builder.CreateLoad(envTy, envAddr, dst+".env");
+						std::vector<llvm::Value*> args; args.push_back(envV);
+						for(size_t ai=4; ai<il.size(); ++ai){ std::string an=trimPct(symName(il[ai])); if(an.empty()||!vmap.count(an)){ args.clear(); break;} args.push_back(vmap[an]); }
+						if(args.empty()) continue;
+						// Derive function signature from the named callee and call via loaded pointer
+						std::string prefix = "__edn.closure."; if(sname.rfind(prefix,0)!=0) continue; std::string callee = sname.substr(prefix.size());
+						auto *TargetF = module_->getFunction(callee); if(!TargetF) continue; auto *calleeFTy = TargetF->getFunctionType();
+						auto *call=builder.CreateCall(calleeFTy, fnI8, args, calleeFTy->getReturnType()->isVoidTy()?"":dst);
+						if(!calleeFTy->getReturnType()->isVoidTy()){ vmap[dst]=call; vtypes[dst]=retTy; }
+					}
 				else if((op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv") && il.size()==5){ std::string dst=trimPct(symName(il[1])); TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb||dst.empty()) continue; llvm::Value* r=nullptr; if(op=="fadd") r=builder.CreateFAdd(va,vb,dst); else if(op=="fsub") r=builder.CreateFSub(va,vb,dst); else if(op=="fmul") r=builder.CreateFMul(va,vb,dst); else r=builder.CreateFDiv(va,vb,dst); vmap[dst]=r; vtypes[dst]=ty; }
 				else if(op=="fcmp" && il.size()==7){
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; if(!std::holds_alternative<keyword>(il[3]->data)) continue; std::string pred=symName(il[4]); auto *va=getVal(il[5]); auto *vb=getVal(il[6]); if(!va||!vb) continue; llvm::CmpInst::Predicate P=llvm::CmpInst::FCMP_OEQ;
@@ -277,6 +412,12 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					auto *rawPtr = builder.CreateBitCast(storagePtr, fieldPtrTy, dst+".cast");
 					auto *lv = builder.CreateLoad(fieldLL, rawPtr, dst);
 					vmap[dst]=lv; vtypes[dst]=fieldTy; }
+				else if(op=="panic" && il.size()==1){ // (panic) -> call llvm.trap(); unreachable
+					auto callee = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::trap);
+					builder.CreateCall(callee);
+					builder.CreateUnreachable();
+					functionDone = true; return;
+				}
 				else if(op=="member-addr" && il.size()==5){ std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string base=trimPct(symName(il[3])); std::string fname=symName(il[4]); if(dst.empty()||sname.empty()||base.empty()||fname.empty()) continue; auto bit=vmap.find(base); if(bit==vmap.end()||!vtypes.count(base)) continue; TypeId bty=vtypes[base]; const Type& BT=tctx_.at(bty); TypeId structId=0; bool baseIsPtr=false; if(BT.kind==Type::Kind::Pointer){ baseIsPtr=true; if(tctx_.at(BT.pointee).kind==Type::Kind::Struct) structId=BT.pointee; } else if(BT.kind==Type::Kind::Struct) structId=bty; if(structId==0||!baseIsPtr) continue; const Type& ST=tctx_.at(structId); if(ST.kind!=Type::Kind::Struct || ST.struct_name!=sname) continue; auto stIt=struct_types_.find(sname); if(stIt==struct_types_.end()) continue; auto idxIt=struct_field_index_.find(sname); if(idxIt==struct_field_index_.end()) continue; auto fIt=idxIt->second.find(fname); if(fIt==idxIt->second.end()) continue; size_t fidx=fIt->second; auto ftIt=struct_field_types_.find(sname); if(ftIt==struct_field_types_.end()||fidx>=ftIt->second.size()) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* fieldIndex=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),(uint32_t)fidx); auto *gep=builder.CreateInBoundsGEP(stIt->second, bit->second, {zero,fieldIndex}, dst); vmap[dst]=gep; vtypes[dst]=tctx_.get_pointer(ftIt->second[fidx]); }
 				else if(op=="call" && il.size()>=4){ std::string dst=trimPct(symName(il[1])); TypeId retTy; try{ retTy=tctx_.parse_type(il[2]); }catch(...){ continue; } std::string callee=symName(il[3]); if(callee.empty()) continue; llvm::Function* CF=module_->getFunction(callee); if(!CF){ // create forward decl; attempt to detect variadic via type cache by matching existing function type if any
 					// Scan original module AST for function header to recover signature & variadic flag

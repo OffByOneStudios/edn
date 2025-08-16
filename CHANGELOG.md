@@ -33,3 +33,11 @@ All notable changes will be documented here once releases begin.
 
 ### Fixed
 - Added validation preventing mutation of const globals.
+
+### Added (Phase 3 Completion & Phase 4 Kickoff)
+- Phase 3 finalized: pointer arithmetic, address-of/deref, function pointers & indirect calls, typedef, enums, unions, variadics (with intrinsics), for/continue, switch, and cast sugar. Structured diagnostics extended (JSON mode in tests).
+- Phase 4 progress:
+	- Sum types and match helper with error codes E1400–E1423 and golden IR tests.
+	- Generics (monomorphization) and Traits (dictionary passing/vtables) via reader-macro expanders.
+	- Opt-in pass pipeline gated by `EDN_ENABLE_PASSES` (disabled in golden tests).
+	- Closures (minimal): `(closure %dst (ptr <fn-type>) %fn [ %env ])` non-escaping single-capture; type checks (E143x) and emitter lowering to per-site thunk with private env global; test `phase4_closures_min_test.cpp` added.

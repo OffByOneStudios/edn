@@ -38,6 +38,7 @@ Status: Initial extraction on 2025-08-14. Keep this file in sync when adding / r
 | E138x    | Continue statement                      |
 | E139x    | Switch construct                        |
 | E13Ax    | Cast sugar `(as ...)`                   |
+| E143x    | Closures & captures `(closure ...)`      |
 
 ---
 
@@ -439,3 +440,29 @@ Notes appear only when a mismatch occurs; they do not change the primary error c
 Out-of-Scope (Phase 3) – Optimization pass pipeline & extended suggestion coverage are deferred and may introduce new ranges later.
 
 _Last updated: 2025-08-15_
+
+---
+
+### E143x – Closures & Captures
+Form: `(closure %dst (ptr <fn-type>) %fn [ %captures... ])` – currently supports a minimal slice with a single `%env` capture for non‑escaping closures.
+
+| Code  | Title                         | Condition / When Emitted                               | Hint |
+|-------|-------------------------------|---------------------------------------------------------|------|
+| E1430 | closure arity                 | Wrong arity / malformed operands                        | use `(closure %dst (ptr <fn-type>) %fn [ %env ])` |
+| E1431 | closure dst must be %var      | Destination missing `%`                                 | prefix destination |
+| E1432 | closure annotation must be fnptr | Second operand not `(ptr (fn-type ...))`             | annotate with function pointer type |
+| E1433 | closure unknown callee        | `%fn` not a known function symbol                       | define target function earlier |
+| E1434 | closure signature mismatch    | Annotated thunk signature disagrees with target (ret/params/vararg) | align closure fn type with target |
+| E1435 | closure capture type mismatch | Provided `%env` type disagrees with callee's first param | pass matching env value type |
+
+Record-based closures:
+- `(make-closure %dst Callee [ %env ])`
+- `(call-closure %dst <ret> %clos %args...)`
+
+| Code  | Title                              | Condition / When Emitted                                   | Hint |
+|-------|------------------------------------|-------------------------------------------------------------|------|
+| E1436 | make-closure arity                 | Wrong arity (missing closure pieces like capture vector)    | use `(make-closure %dst Callee [ %env ])` |
+| E1437 | call-closure validation failure    | Arg count/type mismatch, bad closure value, or ret mismatch | ensure `%clos` is a closure, args exclude env, and `<ret>` matches |
+
+Notes:
+- Current implementation lowers closures to a per‑site thunk with a private global storing `%env`. Future iterations will construct an explicit closure record `{ fnptr, env }` and support multiple captures and escaping semantics.

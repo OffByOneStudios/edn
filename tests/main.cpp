@@ -35,6 +35,12 @@ void run_phase4_generics_two_params_test();
 void run_phase4_generics_dedup_test();
 void run_phase4_generics_negative_tests();
 void run_phase4_traits_macro_test();
+void run_phase4_closures_min_test();
+void run_phase4_closures_record_test();
+void run_phase4_closures_negative_tests();
+void run_phase4_closures_capture_mismatch_test();
+void run_phase4_closures_jit_smoke_test();
+void run_phase4_eh_panic_test();
 
 int main(){
     using namespace edn;
@@ -108,6 +114,18 @@ int main(){
     std::cout << "[dbg] before run_phase4_traits_macro_test" << std::endl;
     run_phase4_traits_macro_test();
     std::cout << "[dbg] after run_phase4_traits_macro_test" << std::endl;
+    run_phase4_closures_min_test();
+    std::cout << "[dbg] after run_phase4_closures_min_test" << std::endl;
+    run_phase4_closures_record_test();
+    std::cout << "[dbg] after run_phase4_closures_record_test" << std::endl;
+    run_phase4_closures_negative_tests();
+    std::cout << "[dbg] after run_phase4_closures_negative_tests" << std::endl;
+    run_phase4_closures_capture_mismatch_test();
+    std::cout << "[dbg] after run_phase4_closures_capture_mismatch_test" << std::endl;
+    run_phase4_closures_jit_smoke_test();
+    std::cout << "[dbg] after run_phase4_closures_jit_smoke_test" << std::endl;
+    run_phase4_eh_panic_test();
+    std::cout << "[dbg] after run_phase4_eh_panic_test" << std::endl;
     std::cout << "All tests passed" << std::endl;
     return 0;
 }
