@@ -35,6 +35,7 @@ private:
     std::unordered_map<std::string, llvm::StructType*> struct_types_;
     std::unordered_map<std::string, std::vector<TypeId>> struct_field_types_;
     std::unordered_map<std::string, std::unordered_map<std::string,size_t>> struct_field_index_; // struct name -> field name -> index
+    std::unordered_map<std::string, std::vector<unsigned>> struct_field_lines_; // struct name -> field declaration line numbers
     // For unions we represent each union as a single-field struct containing a byte array big enough to hold the largest field.
     // We still need to remember each field's logical type so that (union-member ...) can bitcast and load correctly.
     std::unordered_map<std::string, std::unordered_map<std::string,TypeId>> union_field_types_; // union name -> field name -> TypeId

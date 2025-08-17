@@ -67,6 +67,8 @@ private:
     std::unordered_map<std::string, SumInfo> sums_;
     std::unordered_map<std::string, FunctionInfoTC> functions_;
     std::unordered_map<std::string, GlobalInfoTC> globals_;
+    // usage tracking for lints
+    std::unordered_set<std::string> used_globals_;
     // typedef aliases: name -> underlying TypeId
     std::unordered_map<std::string, TypeId> typedefs_;
     // enums: name -> underlying TypeId, plus constants map (flattened constant name -> (TypeId,value))

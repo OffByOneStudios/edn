@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <cstdint>
+#include <cstdlib>
 
 namespace edn {
 
@@ -70,6 +71,12 @@ namespace detail {
     inline node_ptr parse_tagged(reader& r){ int sl=r.line,sc=r.col; if(r.peek()=='{'){ r.get(); return parse_list_like(r,'}',sl,sc,true);} std::string tag; while(is_symbol_char(r.peek())) tag+=r.get(); r.skip_ws(); auto inner=parse_value(r); auto n=make_node(tagged_value{symbol{tag},inner}); attach_pos(*n,sl,sc,r.last_line,r.last_col); return n; }
 
     inline node_ptr parse_value(reader& r){ r.skip_ws(); char c=r.peek(); switch(c){ case '"': return parse_string(r); case '(': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,')',sl,sc);} case '[': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,']',sl,sc);} case '{': {int sl=r.line,sc=r.col; r.get(); return parse_list_like(r,'}',sl,sc);} case '#': { r.get(); return parse_tagged(r);} default: break; } if(is_digit(c)||c=='+'||c=='-') return parse_number(r); if(c==':'||is_symbol_start(c)) return parse_symbol_or_keyword(r); throw parse_error("unexpected character"); }
+// Feature flags sourced from environment
+inline bool env_flag_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    return v && (v[0]=='1' || v[0]=='t' || v[0]=='T' || v[0]=='y' || v[0]=='Y');
+}
+
 }
 
 inline node_ptr parse(std::string_view input){ detail::reader r(input); r.skip_ws(); auto v=detail::parse_value(r); r.skip_ws(); if(!r.eof()) throw parse_error("unexpected trailing characters"); return v; }

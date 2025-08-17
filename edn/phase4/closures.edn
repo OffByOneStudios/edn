@@ -1,0 +1,13 @@
+(module
+  (fn :name "adder" :ret i32 :params [ (param i32 %env) (param i32 %x) ] :body [
+    (add %r i32 %env %x)
+    (ret i32 %r)
+  ])
+  (fn :name "main" :ret i32 :params [] :body [
+    (const %ten i32 10)
+    (const %five i32 5)
+    (make-closure %c adder [ %ten ])
+    (call-closure %res i32 %c %five)
+    (ret i32 %res)
+  ])
+)

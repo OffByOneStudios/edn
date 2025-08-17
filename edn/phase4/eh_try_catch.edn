@@ -1,0 +1,7 @@
+(module
+  (fn :name "main" :ret i32 :params [] :body [
+    (try :body [ (panic) ] :catch [ (const %h i32 7) ])
+    (const %ok i32 0)
+    (ret i32 %ok)
+  ])
+)

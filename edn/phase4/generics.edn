@@ -1,0 +1,10 @@
+(module
+  (gfn :name "id" :generics [ T ] :ret T :params [ (param T %x) ] :body [
+    (ret T %x)
+  ])
+  (fn :name "main" :ret i32 :params [] :body [
+    (const %a i32 42)
+    (gcall %r i32 id :types [ i32 ] %a)
+    (ret i32 %r)
+  ])
+)

@@ -192,6 +192,8 @@ Docs:
 - docs/GENERICS.md
 - docs/SUMS.md
  - docs/EXTERNALS.md
+ - docs/EH.md
+ - docs/COROUTINES.md
 
 Note on IR printing: LLVM quotes symbol names that contain special characters. For example, generic instances are mangled like `id@i32`, which will appear in IR as `@"id@i32"`. Tests and string matches should account for the quotes.
 

@@ -1,0 +1,9 @@
+(module
+  (fn :name "co" :ret i32 :params [] :body [
+    (coro-begin %h)
+    (coro-suspend %st %h)
+    (coro-end %h)
+    (const %z i32 0)
+    (ret i32 %z)
+  ])
+)

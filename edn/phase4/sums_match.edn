@@ -1,0 +1,18 @@
+(module
+  (sum :name T :variants [ (variant :name A :fields [ i32 i64 ]) (variant :name B :fields [ i32 ]) ])
+  (fn :name "main" :ret i32 :params [ (param i32 %x) (param i64 %y) ] :body [
+    (sum-new %s T A [ %x %y ])
+    (match %r i32 T %s :cases [
+      (case A :binds [ (bind %a 0) (bind %b 1) ] :body [
+        (trunc %b32 i32 %b)
+        (add %sum i32 %a %b32)
+        :value %sum
+      ])
+      (case B :body [
+        (const %one i32 1)
+        :value %one
+      ])
+    ] :default (default :body [ (const %z i32 0) :value %z ]))
+    (ret i32 %r)
+  ])
+)

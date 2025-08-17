@@ -8,6 +8,7 @@
 #include <memory>
 #include <algorithm>
 #include <functional>
+#include <variant>
 
 namespace edn {
 

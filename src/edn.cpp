@@ -12,9 +12,16 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/DIBuilder.h>
+#include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/IR/Attributes.h>
 #include <cstdlib>
+#include <iostream>
+#include <unordered_map>
+#include <functional>
 
 namespace edn {
 
@@ -59,9 +66,167 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 	maybe_print_json(tc_result);
 	if(!tc_result.success) return nullptr;
 	module_ = std::make_unique<llvm::Module>("edn.module", *llctx_);
+		// Optional: enable LLVM Debug Info (DWARF/CodeView agnostic in IR)
+		bool enableDebugInfo = false;
+		if(const char* dbg = std::getenv("EDN_ENABLE_DEBUG"); dbg && std::string(dbg) == "1"){
+			enableDebugInfo = true;
+		}
+		std::unique_ptr<llvm::DIBuilder> DIB;
+		llvm::DICompileUnit* DI_CU = nullptr;
+		llvm::DIFile* DI_File = nullptr;
+		if(enableDebugInfo){
+			// Minimal, backend-agnostic setup
+			module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
+			module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 5u);
+			DIB = std::make_unique<llvm::DIBuilder>(*module_);
+			// Use synthetic file info (tests often embed strings). Allow override via env.
+			std::string srcFile = "inline.edn";
+			std::string srcDir = ".";
+			if(const char* sf = std::getenv("EDN_DEBUG_FILE")){ srcFile = sf; }
+			if(const char* sd = std::getenv("EDN_DEBUG_DIR")){ srcDir = sd; }
+			DI_File = DIB->createFile(srcFile, srcDir);
+			DI_CU = DIB->createCompileUnit(llvm::dwarf::DW_LANG_C, DI_File, "edn", /*isOptimized*/ false, "", 0);
+		}
+		// Minimal DI type mapper with a small cache
+		std::unordered_map<TypeId, llvm::DIType*> DITypeCache;
+		std::function<llvm::DIType*(TypeId)> diTypeOf;
+		diTypeOf = [&](TypeId id)->llvm::DIType*{
+			if(!enableDebugInfo || !DIB) return nullptr;
+			if(auto it = DITypeCache.find(id); it!=DITypeCache.end()) return it->second;
+			llvm::DIType* out = nullptr;
+			const Type& T = tctx_.at(id);
+			switch(T.kind){
+				case Type::Kind::Base: {
+					if(T.base==BaseType::Void){ out=nullptr; break; }
+					unsigned bits = base_type_bit_width(T.base);
+					unsigned enc = 0;
+					switch(T.base){
+						case BaseType::F32: case BaseType::F64: enc = llvm::dwarf::DW_ATE_float; break;
+						case BaseType::U8: case BaseType::U16: case BaseType::U32: case BaseType::U64: enc = llvm::dwarf::DW_ATE_unsigned; break;
+						default: enc = llvm::dwarf::DW_ATE_signed; break;
+					}
+					out = DIB->createBasicType(tctx_.to_string(id), bits, enc);
+					break;
+				}
+				case Type::Kind::Pointer: {
+					auto *pointee = diTypeOf(T.pointee);
+					const auto &DL = module_->getDataLayout();
+					uint64_t psz = DL.getPointerSizeInBits(); if(psz==0) psz=64;
+					uint32_t palignBits = (uint32_t)DL.getPointerABIAlignment(0).value() * 8;
+					out = DIB->createPointerType(pointee, psz, palignBits);
+					break;
+				}
+				case Type::Kind::Struct: {
+					// Build member list with offsets/sizes from DataLayout
+					auto ftIt = struct_field_types_.find(T.struct_name);
+					const auto &DL = module_->getDataLayout();
+					llvm::StructType* ST = llvm::StructType::getTypeByName(*llctx_, "struct."+T.struct_name);
+					if(!ST && ftIt!=struct_field_types_.end()){
+						std::vector<llvm::Type*> elemLL;
+						for(auto tid: ftIt->second) elemLL.push_back(map_type(tid));
+						ST = llvm::StructType::create(*llctx_, elemLL, "struct."+T.struct_name);
+					}
+					uint64_t szBits = 0; uint32_t aBits = 0;
+					if(ST){ szBits = DL.getTypeAllocSize(ST)*8; aBits = (uint32_t)DL.getABITypeAlign(ST).value()*8; }
+					std::vector<llvm::Metadata*> membersMD;
+					if(ftIt!=struct_field_types_.end() && ST){
+							std::cout << "[di] building struct DI for '" << T.struct_name << "' with " << ftIt->second.size() << " fields\n";
+						auto idxIt = struct_field_index_.find(T.struct_name);
+						// Rebuild ordered field name list by index
+						std::vector<std::string> fieldNames(ftIt->second.size());
+						if(idxIt!=struct_field_index_.end()){
+							for(const auto &p: idxIt->second){ if(p.second<fieldNames.size()) fieldNames[p.second]=p.first; }
+						}
+						auto *SL = DL.getStructLayout(ST);
+							for(size_t i=0;i<ftIt->second.size(); ++i){
+							TypeId fid = ftIt->second[i];
+							auto *fDI = diTypeOf(fid);
+							llvm::Type* fLL = map_type(fid);
+							uint64_t fSizeBits = DL.getTypeAllocSize(fLL)*8;
+							uint32_t fAlignBits = (uint32_t)DL.getABITypeAlign(fLL).value()*8;
+							uint64_t offBits = SL ? SL->getElementOffsetInBits((unsigned)i) : 0;
+							std::string fname = (i<fieldNames.size() && !fieldNames[i].empty()) ? fieldNames[i] : ("field"+std::to_string(i));
+								unsigned fLine = 1; {
+									auto flIt = struct_field_lines_.find(T.struct_name);
+									if(flIt != struct_field_lines_.end() && i < flIt->second.size() && flIt->second[i] > 0){ fLine = flIt->second[i]; }
+								}
+								auto *mem = DIB->createMemberType(/*Scope*/DI_File, fname, DI_File, /*Line*/fLine, fSizeBits, fAlignBits, offBits, llvm::DINode::FlagZero, fDI);
+							membersMD.push_back(mem);
+						}
+					}
+						std::cout << "[di] built " << membersMD.size() << " member DI entries for struct '" << T.struct_name << "'\n";
+					out = DIB->createStructType(DI_File, T.struct_name, DI_File, /*Line*/1, /*SizeInBits*/szBits, /*AlignInBits*/aBits, llvm::DINode::FlagZero, nullptr, DIB->getOrCreateArray(membersMD));
+					break;
+				}
+				case Type::Kind::Array: {
+					auto *elemTy = diTypeOf(T.elem);
+					uint64_t ebits = 0; const Type& ET = tctx_.at(T.elem);
+					if(ET.kind==Type::Kind::Base) ebits = base_type_bit_width(ET.base);
+					uint64_t sizeBits = ebits * T.array_size;
+					auto subrange = DIB->getOrCreateSubrange(0, (int64_t)T.array_size);
+					// Compute ABI alignment for the full array type
+					uint32_t aalignBits = 0; {
+						llvm::Type* arrLL = llvm::ArrayType::get(map_type(T.elem), (uint64_t)T.array_size);
+						const auto &DL = module_->getDataLayout(); aalignBits = (uint32_t)DL.getABITypeAlign(arrLL).value() * 8;
+					}
+					out = DIB->createArrayType(sizeBits, aalignBits, elemTy, DIB->getOrCreateArray({subrange}));
+					break;
+				}
+				case Type::Kind::Function: {
+					auto *retTy = diTypeOf(T.ret);
+					std::vector<llvm::Metadata*> all;
+					all.push_back(retTy ? static_cast<llvm::Metadata*>(retTy) : nullptr);
+					for(auto pid: T.params){ auto *pti = diTypeOf(pid); all.push_back(static_cast<llvm::Metadata*>(pti)); }
+					auto arr = DIB->getOrCreateTypeArray(all);
+					out = DIB->createSubroutineType(arr);
+					break;
+				}
+			}
+			DITypeCache[id]=out; return out;
+		};
+	// Optional: allow tests to steer the target triple (e.g., x86_64-apple-darwin)
+	if(const char* triple = std::getenv("EDN_TARGET_TRIPLE"); triple && *triple){
+		module_->setTargetTriple(triple);
+	}
 	if(!rewritten || !std::holds_alternative<list>(rewritten->data)) return nullptr; auto &top = std::get<list>(rewritten->data).elems; if(top.empty()) return nullptr;
 
-	auto collect_structs = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data)|| std::get<symbol>(l[0]->data).name!="struct") continue; std::string sname; std::vector<TypeId> ftypes; std::vector<std::string> fnames; for(size_t i=1;i<l.size();++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) continue; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty){ fnames.push_back(fname); ftypes.push_back(fty);} } } } if(!sname.empty()&& !ftypes.empty()){ get_or_create_struct(sname,ftypes); struct_field_types_[sname]=ftypes; auto &m=struct_field_index_[sname]; for(size_t ix=0; ix<fnames.size(); ++ix) m[fnames[ix]]=ix; } } };
+	// Optional: configure an EH personality for all defined functions if requested via env
+	llvm::Constant* selectedPersonality = nullptr;
+	bool enableEHItanium = false; // gate for emitting invoke/landingpad/resume
+	bool enableEHSEH = false; // gate for emitting Windows SEH funclets
+	bool panicUnwind = false; // gate for panic=unwind IR shape
+	bool enableCoro = false; // gate for emitting coroutine intrinsics
+	if(const char* c = std::getenv("EDN_ENABLE_CORO"); c && std::string(c) == "1"){
+		enableCoro = true;
+	}
+	if(const char* eh = std::getenv("EDN_EH_MODEL"); eh){
+		std::string model = eh; for(char &c : model) c = (char)tolower((unsigned char)c);
+		llvm::FunctionType* persFTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(*llctx_), /*isVarArg*/ true);
+		if(model == "itanium"){
+			auto callee = module_->getOrInsertFunction("__gxx_personality_v0", persFTy);
+			selectedPersonality = llvm::cast<llvm::Constant>(callee.getCallee());
+			// Enable Itanium EH emission only when explicitly requested
+			if(const char* enable = std::getenv("EDN_ENABLE_EH"); enable && std::string(enable) == "1"){
+				enableEHItanium = true;
+			}
+			// Panic mode selection (only meaningful with EH enabled)
+			if(const char* pm = std::getenv("EDN_PANIC"); pm && std::string(pm) == "unwind"){
+				panicUnwind = true;
+			}
+		}else if(model == "seh"){
+			// Windows SEH base personality used by MSVC-style funclets
+			auto callee = module_->getOrInsertFunction("__C_specific_handler", persFTy);
+			selectedPersonality = llvm::cast<llvm::Constant>(callee.getCallee());
+			if(const char* enable = std::getenv("EDN_ENABLE_EH"); enable && std::string(enable) == "1"){
+				enableEHSEH = true;
+			}
+			if(const char* pm = std::getenv("EDN_PANIC"); pm && std::string(pm) == "unwind"){
+				panicUnwind = true;
+			}
+		}
+	}
+
+	auto collect_structs = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data)|| std::get<symbol>(l[0]->data).name!="struct") continue; std::string sname; std::vector<TypeId> ftypes; std::vector<std::string> fnames; std::vector<unsigned> flines; for(size_t i=1;i<l.size();++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) continue; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty){ fnames.push_back(fname); ftypes.push_back(fty); unsigned ln = (unsigned)edn::line(*f); if(ln==0) ln=1; flines.push_back(ln);} } } } if(!sname.empty()&& !ftypes.empty()){ get_or_create_struct(sname,ftypes); struct_field_types_[sname]=ftypes; auto &m=struct_field_index_[sname]; for(size_t ix=0; ix<fnames.size(); ++ix) m[fnames[ix]]=ix; struct_field_lines_[sname]=flines; } } };
 	// Collect sums: represent as { i32 tag, [N x i8] payload }
 	auto collect_sums = [&](const std::vector<node_ptr>& elems){ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="sum") continue; std::string sname; node_ptr variantsNode; for(size_t i=1;i<l.size(); ++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="variants") variantsNode=val; }
 		if(sname.empty()||!variantsNode||!std::holds_alternative<vector_t>(variantsNode->data)) continue; std::vector<std::vector<TypeId>> variants; std::unordered_map<std::string,int> vtags; uint64_t maxPayload=0; int tag=0; for(auto &vn : std::get<vector_t>(variantsNode->data).elems){ if(!vn||!std::holds_alternative<list>(vn->data)) continue; auto &vl=std::get<list>(vn->data).elems; if(vl.empty()||!std::holds_alternative<symbol>(vl[0]->data) || std::get<symbol>(vl[0]->data).name!="variant") continue; std::string vname; node_ptr fieldsNode; for(size_t k=1;k<vl.size(); ++k){ if(!std::holds_alternative<keyword>(vl[k]->data)) break; std::string kw=std::get<keyword>(vl[k]->data).name; if(++k>=vl.size()) break; auto val=vl[k]; if(kw=="name") vname=symName(val); else if(kw=="fields") fieldsNode=val; }
@@ -121,10 +286,68 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 			std::vector<TypeId> paramIds; for(auto &pr: params) paramIds.push_back(pr.second);
 			auto ftyId=tctx_.get_function(paramIds, retTy, isVariadic); auto *fty=llvm::cast<llvm::FunctionType>(map_type(ftyId)); (void)llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
 			continue; }
-		auto ftyId=tctx_.get_function(paramIds, retTy, isVariadic); auto *fty=llvm::cast<llvm::FunctionType>(map_type(ftyId)); auto *F=llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get()); size_t ai=0; for(auto &arg: F->args()) arg.setName(params[ai++].first); auto *entry=llvm::BasicBlock::Create(*llctx_,"entry",F); llvm::IRBuilder<> builder(entry); std::unordered_map<std::string,llvm::Value*> vmap; std::unordered_map<std::string,TypeId> vtypes; for(auto &pr: params){ vtypes[pr.first]=pr.second; } for(auto &arg: F->args()){ vmap[std::string(arg.getName())]=&arg; }
+		auto ftyId=tctx_.get_function(paramIds, retTy, isVariadic); auto *fty=llvm::cast<llvm::FunctionType>(map_type(ftyId)); auto *F=llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
+			// Attach a DISubprogram to the function if debug is enabled
+			llvm::DISubprogram* DI_SP = nullptr;
+			if(enableDebugInfo && DIB && DI_File){
+				// Build a real subroutine type for the function signature
+				std::vector<llvm::Metadata*> sigTys;
+				// Return type first
+				sigTys.push_back(static_cast<llvm::Metadata*>(diTypeOf(retTy)));
+				// Param types
+				for(auto &pr : params){ sigTys.push_back(static_cast<llvm::Metadata*>(diTypeOf(pr.second))); }
+				auto *subTy = DIB->createSubroutineType(DIB->getOrCreateTypeArray(sigTys));
+				unsigned lineNo = edn::line(*fl[0]); // best-effort: use the "fn" token start line
+				if(lineNo == 0) lineNo = 1;
+				DI_SP = DIB->createFunction(
+					/*Scope=*/DI_File,
+					/*Name=*/fname,
+					/*LinkageName=*/fname,
+					/*File=*/DI_File,
+					/*LineNo=*/lineNo,
+					/*Type=*/subTy,
+					/*ScopeLine=*/lineNo,
+					/*Flags=*/llvm::DINode::FlagZero,
+					/*SPFlags=*/llvm::DISubprogram::SPFlagDefinition
+				);
+				F->setSubprogram(DI_SP);
+			}
+		// If coroutines are enabled, mark functions as pre-split coroutine to use the Switch-Resumed ABI
+		if(enableCoro){
+			// Add both the well-known enum AttrKind and the string form (harmless redundancy); CoroEarly
+			// checks the built-in kind via F.isPresplitCoroutine().
+			F->addFnAttr(llvm::Attribute::AttrKind::PresplitCoroutine);
+			F->addFnAttr("presplitcoroutine");
+		}
+		// Attach selected personality if configured
+		if(selectedPersonality) F->setPersonalityFn(selectedPersonality);
+		// If EH is enabled for either model, add uwtable to ease unwinder table emission
+		if(selectedPersonality){ F->addFnAttr("uwtable"); }
+		size_t ai=0; for(auto &arg: F->args()) arg.setName(params[ai++].first); auto *entry=llvm::BasicBlock::Create(*llctx_,"entry",F); llvm::IRBuilder<> builder(entry); std::unordered_map<std::string,llvm::Value*> vmap; std::unordered_map<std::string,TypeId> vtypes; for(auto &pr: params){ vtypes[pr.first]=pr.second; } for(auto &arg: F->args()){ vmap[std::string(arg.getName())]=&arg; }
+			if(enableDebugInfo && F->getSubprogram()){
+				builder.SetCurrentDebugLocation(llvm::DILocation::get(*llctx_, F->getSubprogram()->getLine(), /*Col*/1, F->getSubprogram()));
+				// Emit parameter debug info at entry using dbg.value
+				unsigned argIndex = 1;
+				for(auto &arg : F->args()){
+					std::string an = std::string(arg.getName());
+					llvm::DIType* diTy = nullptr;
+					if(auto it=vtypes.find(an); it!=vtypes.end()) diTy = diTypeOf(it->second);
+					auto *pvar = DIB->createParameterVariable(F->getSubprogram(), an, argIndex, DI_File, F->getSubprogram()->getLine(), diTy, true);
+					auto *expr = DIB->createExpression();
+					(void)DIB->insertDbgValueIntrinsic(&arg, pvar, expr, builder.getCurrentDebugLocation(), entry);
+					++argIndex;
+				}
+			}
+		llvm::Value* lastCoroIdTok = nullptr; // holds last coro.id token for ops that need it
 		std::vector<llvm::BasicBlock*> loopEndStack; // for break targets (end blocks)
 		std::vector<llvm::BasicBlock*> loopContinueStack; // for continue targets (condition re-check or step blocks)
 		int cfCounter=0; bool functionDone=false;
+		// Reusable Windows SEH cleanup funclet block (created on first use)
+		llvm::BasicBlock* sehCleanupBB = nullptr;
+		// Stack of active SEH exception targets (catch dispatch blocks)
+		std::vector<llvm::BasicBlock*> sehExceptTargetStack;
+		// Stack of active Itanium exception targets (landingpad dispatch blocks)
+		std::vector<llvm::BasicBlock*> itnExceptTargetStack;
 		// Defer phi creation until predecessors exist: collect specs in current block then create at end of block emission phase.
 		struct PendingPhi { std::string dst; TypeId ty; std::vector<std::pair<std::string,std::string>> incomings; llvm::BasicBlock* insertBlock; };
 		std::vector<PendingPhi> pendingPhis;
@@ -342,7 +565,13 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					if(castV){ vmap[dst]=castV; vtypes[dst]=toTy; }
 				}
 				else if(op=="assign" && il.size()==3){ std::string dst=trimPct(symName(il[1])); std::string src=trimPct(symName(il[2])); if(dst.empty()||src.empty()) continue; auto it=vmap.find(src); if(it!=vmap.end()){ vmap[dst]=it->second; if(vtypes.count(src)) vtypes[dst]=vtypes[src]; } }
-				else if(op=="alloca" && il.size()==3){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *av=builder.CreateAlloca(map_type(ty), nullptr, dst); vmap[dst]=av; vtypes[dst]=tctx_.get_pointer(ty); }
+				else if(op=="alloca" && il.size()==3){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *av=builder.CreateAlloca(map_type(ty), nullptr, dst); vmap[dst]=av; vtypes[dst]=tctx_.get_pointer(ty);
+					if(enableDebugInfo && F->getSubprogram()){
+						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(ty));
+						auto *expr = DIB->createExpression();
+						(void)DIB->insertDeclare(av, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+					}
+				}
 				else if(op=="struct-lit" && il.size()==4){ // (struct-lit %dst StructName [ field1 %v1 ... ]) produce pointer to struct alloca
 					std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); if(dst.empty()||sname.empty()) continue; if(!std::holds_alternative<vector_t>(il[3]->data)) continue; auto idxIt=struct_field_index_.find(sname); auto ftIt=struct_field_types_.find(sname); if(idxIt==struct_field_index_.end()||ftIt==struct_field_types_.end()) continue; auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) { // create body if missed
 						std::vector<llvm::Type*> ftys; for(auto tid: ftIt->second) ftys.push_back(map_type(tid)); ST=llvm::StructType::create(*llctx_, ftys, "struct."+sname); }
@@ -350,6 +579,11 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					auto &vec= std::get<vector_t>(il[3]->data).elems; // expect name/value pairs in order
 					for(size_t i=0,fi=0;i+1<vec.size(); i+=2,++fi){ if(!std::holds_alternative<symbol>(vec[i]->data) || !std::holds_alternative<symbol>(vec[i+1]->data)) continue; std::string fname=symName(vec[i]); std::string val=trimPct(symName(vec[i+1])); if(val.empty()) continue; auto vit=vmap.find(val); if(vit==vmap.end()) continue; auto idxMapIt=idxIt->second.find(fname); if(idxMapIt==idxIt->second.end()) continue; uint32_t fidx=idxMapIt->second; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* fIndex=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),fidx); auto *gep=builder.CreateInBoundsGEP(ST, allocaPtr, {zero,fIndex}, dst+"."+fname+".addr"); builder.CreateStore(vit->second, gep); }
 					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(tctx_.get_struct(sname));
+					if(enableDebugInfo && F->getSubprogram()){
+						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(tctx_.get_struct(sname)));
+						auto *expr = DIB->createExpression();
+						(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+					}
 				}
 				else if(op=="sum-new" && (il.size()==4 || il.size()==5)){
 					// (sum-new %dst SumName Variant [ %v* ]) -> allocate struct, store tag, memcpy payload fields into byte array
@@ -371,6 +605,11 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 						offset += fsz;
 					}
 					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(tctx_.get_struct(sname));
+					if(enableDebugInfo && F->getSubprogram()){
+						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(tctx_.get_struct(sname)));
+						auto *expr = DIB->createExpression();
+						(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+					}
 				}
 				else if(op=="sum-is" && il.size()==5){ // (sum-is %dst SumName %val Variant)
 					std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) continue; if(!vmap.count(val)) continue; auto tIt=sum_variant_tag_.find(sname); if(tIt==sum_variant_tag_.end()) continue; auto vtIt=tIt->second.find(vname); if(vtIt==tIt->second.end()) continue; int tag=vtIt->second; auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+sname); if(!ST) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* tagIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); auto *tagPtr=builder.CreateInBoundsGEP(ST, vmap[val], {zero,tagIdx}, dst+".tag.addr"); auto *loaded=builder.CreateLoad(llvm::Type::getInt32Ty(*llctx_), tagPtr, dst+".tag"); auto *cmp=builder.CreateICmpEQ(loaded, llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint64_t)tag, true), dst); vmap[dst]=cmp; vtypes[dst]=tctx_.get_base(BaseType::I1);
@@ -395,6 +634,11 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 				else if(op=="array-lit" && il.size()==5){ // (array-lit %dst <elem-type> <size> [ %e0 ... ])
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId elemTy; try{ elemTy=tctx_.parse_type(il[2]); }catch(...){ continue; } if(!std::holds_alternative<int64_t>(il[3]->data)) continue; uint64_t asz=(uint64_t)std::get<int64_t>(il[3]->data); if(asz==0) continue; if(!std::holds_alternative<vector_t>(il[4]->data)) continue; auto &elems=std::get<vector_t>(il[4]->data).elems; if(elems.size()!=asz) continue; TypeId arrTy = tctx_.get_array(elemTy, asz); auto *AT = llvm::cast<llvm::ArrayType>(map_type(arrTy)); auto *allocaPtr = builder.CreateAlloca(AT, nullptr, dst); for(size_t i=0;i<elems.size(); ++i){ if(!std::holds_alternative<symbol>(elems[i]->data)) continue; std::string val=trimPct(symName(elems[i])); if(val.empty()) continue; auto vit=vmap.find(val); if(vit==vmap.end()) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* idx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),(uint32_t)i); auto *gep=builder.CreateInBoundsGEP(AT, allocaPtr, {zero,idx}, dst+".elem"+std::to_string(i)+".addr"); builder.CreateStore(vit->second, gep); }
 					vmap[dst]=allocaPtr; vtypes[dst]=tctx_.get_pointer(arrTy);
+					if(enableDebugInfo && F->getSubprogram()){
+						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(arrTy));
+						auto *expr = DIB->createExpression();
+						(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+					}
 				}
 				else if(op=="phi" && il.size()==4){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } if(!std::holds_alternative<vector_t>(il[3]->data)) continue; std::vector<std::pair<std::string,std::string>> incomings; for(auto &inc: std::get<vector_t>(il[3]->data).elems){ if(!inc||!std::holds_alternative<list>(inc->data)) continue; auto &pl=std::get<list>(inc->data).elems; if(pl.size()!=2) continue; std::string val=trimPct(symName(pl[0])); std::string label=symName(pl[1]); if(!val.empty() && !label.empty()) incomings.emplace_back(val,label); } pendingPhis.push_back(PendingPhi{dst,ty,std::move(incomings),builder.GetInsertBlock()}); }
 				else if(op=="store" && il.size()==4){ std::string ptrn=trimPct(symName(il[2])); std::string valn=trimPct(symName(il[3])); if(ptrn.empty()||valn.empty()) continue; auto pit=vmap.find(ptrn); auto vit=vmap.find(valn); if(pit==vmap.end()||vit==vmap.end()) continue; builder.CreateStore(vit->second,pit->second); }
@@ -412,13 +656,241 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					auto *rawPtr = builder.CreateBitCast(storagePtr, fieldPtrTy, dst+".cast");
 					auto *lv = builder.CreateLoad(fieldLL, rawPtr, dst);
 					vmap[dst]=lv; vtypes[dst]=fieldTy; }
-				else if(op=="panic" && il.size()==1){ // (panic) -> call llvm.trap(); unreachable
-					auto callee = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::trap);
-					builder.CreateCall(callee);
-					builder.CreateUnreachable();
-					functionDone = true; return;
+				else if(op=="panic" && il.size()==1){ // (panic) -> abort or unwind depending on EDN_PANIC
+					if(panicUnwind && enableEHItanium && selectedPersonality){
+						// Itanium: emit invoke to __cxa_throw so exceptional edge routes to active landingpad
+						auto *i8Ty = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8Ptr = llvm::PointerType::getUnqual(i8Ty);
+						auto *throwFTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*llctx_), { i8Ptr, i8Ptr, i8Ptr }, /*isVarArg*/ false);
+						auto throwCallee = module_->getOrInsertFunction("__cxa_throw", throwFTy);
+						llvm::Value* nullp = llvm::ConstantPointerNull::get(i8Ptr);
+						// Determine exceptional target
+						llvm::BasicBlock* exTarget = nullptr;
+						if(!itnExceptTargetStack.empty()){
+							exTarget = itnExceptTargetStack.back();
+						} else {
+							exTarget = llvm::BasicBlock::Create(*llctx_, "panic.lpad", F);
+							llvm::IRBuilder<> eb(exTarget);
+								if(enableDebugInfo && F->getSubprogram()) eb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
+							auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+							auto *lpadTy = llvm::StructType::get(*llctx_, { i8Ptr, i32 });
+							auto *lp = eb.CreateLandingPad(lpadTy, 0, "lpad");
+							lp->setCleanup(true);
+							eb.CreateResume(lp);
+						}
+						// Normal dest (never taken) just contains unreachable
+						auto *unwCont = llvm::BasicBlock::Create(*llctx_, "panic.cont", F);
+						builder.CreateInvoke(throwFTy, throwCallee.getCallee(), unwCont, exTarget, { nullp, nullp, nullp });
+						llvm::IRBuilder<> nb(unwCont);
+							if(enableDebugInfo && F->getSubprogram()) nb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
+						nb.CreateUnreachable();
+						// Current block is terminated; subsequent emission will continue in other blocks (e.g., handler/cont)
+					} else if(panicUnwind && enableEHSEH && selectedPersonality){
+						// SEH: emit invoke to RaiseException so unwind flows into catchswitch/catchpad if inside try
+						auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8ptr = llvm::PointerType::getUnqual(i8);
+						auto *raiseFTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*llctx_), { i32, i32, i32, i8ptr }, false);
+						auto raiseCallee = module_->getOrInsertFunction("RaiseException", raiseFTy);
+						auto *code = llvm::ConstantInt::get(i32, 0xE0ED0001);
+						auto *flags = llvm::ConstantInt::get(i32, 1);
+						auto *nargs = llvm::ConstantInt::get(i32, 0);
+						llvm::Value* argsPtr = llvm::ConstantPointerNull::get(i8ptr);
+						llvm::BasicBlock* exTarget = sehExceptTargetStack.empty() ? nullptr : sehExceptTargetStack.back();
+						if(!exTarget){
+							// Fallback to shared cleanup funclet
+							if(!sehCleanupBB){
+								sehCleanupBB = llvm::BasicBlock::Create(*llctx_, "seh.cleanup", F);
+								llvm::IRBuilder<> eb(sehCleanupBB);
+									if(enableDebugInfo && F->getSubprogram()) eb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
+								auto *tokNone = llvm::ConstantTokenNone::get(*llctx_);
+								auto *cp = eb.CreateCleanupPad(tokNone, {}, "cp");
+								eb.CreateCleanupRet(cp, nullptr);
+							}
+							exTarget = sehCleanupBB;
+						}
+						auto *unwCont = llvm::BasicBlock::Create(*llctx_, "panic.cont", F);
+						builder.CreateInvoke(raiseFTy, raiseCallee.getCallee(), unwCont, exTarget, { code, flags, nargs, argsPtr });
+						llvm::IRBuilder<> nb(unwCont);
+							if(enableDebugInfo && F->getSubprogram()) nb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
+						nb.CreateUnreachable();
+					} else {
+						// Default: abort via llvm.trap for deterministic tests
+						auto callee = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::trap);
+						builder.CreateCall(callee);
+						builder.CreateUnreachable();
+					}
+					continue;
 				}
 				else if(op=="member-addr" && il.size()==5){ std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string base=trimPct(symName(il[3])); std::string fname=symName(il[4]); if(dst.empty()||sname.empty()||base.empty()||fname.empty()) continue; auto bit=vmap.find(base); if(bit==vmap.end()||!vtypes.count(base)) continue; TypeId bty=vtypes[base]; const Type& BT=tctx_.at(bty); TypeId structId=0; bool baseIsPtr=false; if(BT.kind==Type::Kind::Pointer){ baseIsPtr=true; if(tctx_.at(BT.pointee).kind==Type::Kind::Struct) structId=BT.pointee; } else if(BT.kind==Type::Kind::Struct) structId=bty; if(structId==0||!baseIsPtr) continue; const Type& ST=tctx_.at(structId); if(ST.kind!=Type::Kind::Struct || ST.struct_name!=sname) continue; auto stIt=struct_types_.find(sname); if(stIt==struct_types_.end()) continue; auto idxIt=struct_field_index_.find(sname); if(idxIt==struct_field_index_.end()) continue; auto fIt=idxIt->second.find(fname); if(fIt==idxIt->second.end()) continue; size_t fidx=fIt->second; auto ftIt=struct_field_types_.find(sname); if(ftIt==struct_field_types_.end()||fidx>=ftIt->second.size()) continue; llvm::Value* zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),0); llvm::Value* fieldIndex=llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_),(uint32_t)fidx); auto *gep=builder.CreateInBoundsGEP(stIt->second, bit->second, {zero,fieldIndex}, dst); vmap[dst]=gep; vtypes[dst]=tctx_.get_pointer(ftIt->second[fidx]); }
+				// --- M4.6 Coroutines (minimal) ---
+				else if(op=="coro-begin" && il.size()==2){ // (coro-begin %hdl) -> ptr handle
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+					auto *i8p = llvm::PointerType::getUnqual(i8);
+					llvm::Value* hdl=nullptr;
+					if(enableCoro){
+						// Proper minimal sequence: id + begin
+						auto idDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_id);
+						auto beginDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_begin);
+						auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+						llvm::Value* alignV = llvm::ConstantInt::get(i32, 0); // default alignment semantics
+						llvm::Value* nullp = llvm::ConstantPointerNull::get(i8p);
+						// token %id = llvm.coro.id(i32 0, ptr null, ptr null, ptr null)
+						auto *idTok = builder.CreateCall(idDecl, { alignV, nullp, nullp, nullp }, "coro.id");
+						lastCoroIdTok = idTok;
+						// ptr %hdl = llvm.coro.begin(token %id, ptr null)
+						hdl = builder.CreateCall(beginDecl, { idTok, nullp }, dst);
+					}else{
+						hdl = llvm::ConstantPointerNull::get(i8p);
+					}
+					vmap[dst]=hdl; vtypes[dst]=tctx_.get_pointer(tctx_.get_base(BaseType::I8));
+				}
+				else if(op=="coro-suspend" && il.size()==3){ // (coro-suspend %st %hdlOrTok) -> i8 status
+					std::string dst=trimPct(symName(il[1])); std::string h=trimPct(symName(il[2])); if(dst.empty()||h.empty()||!vmap.count(h)) continue;
+					llvm::Value* stV=nullptr;
+					if(enableCoro){
+						auto suspendDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_suspend);
+						// If operand is a token, pass it; otherwise use token none.
+						auto *i1 = llvm::Type::getInt1Ty(*llctx_);
+						auto *tokArg = vmap[h]->getType()->isTokenTy()? vmap[h] : (llvm::Value*)llvm::ConstantTokenNone::get(*llctx_);
+						llvm::Value* isFinal = llvm::ConstantInt::getFalse(i1);
+						stV = builder.CreateCall(suspendDecl, { tokArg, isFinal }, dst);
+					} else {
+						stV = llvm::ConstantInt::get(llvm::Type::getInt8Ty(*llctx_), 0);
+					}
+					vmap[dst]=stV; vtypes[dst]=tctx_.get_base(BaseType::I8);
+				}
+				else if(op=="coro-final-suspend" && il.size()==3){ // (coro-final-suspend %st %hdlOrTok) -> i8 status
+					std::string dst=trimPct(symName(il[1])); std::string h=trimPct(symName(il[2])); if(dst.empty()||h.empty()||!vmap.count(h)) continue;
+					llvm::Value* stV=nullptr;
+					if(enableCoro){
+						auto suspendDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_suspend);
+						auto *i1 = llvm::Type::getInt1Ty(*llctx_);
+						auto *tokArg = vmap[h]->getType()->isTokenTy()? vmap[h] : (llvm::Value*)llvm::ConstantTokenNone::get(*llctx_);
+						llvm::Value* isFinal = llvm::ConstantInt::getTrue(i1);
+						stV = builder.CreateCall(suspendDecl, { tokArg, isFinal }, dst);
+					} else {
+						stV = llvm::ConstantInt::get(llvm::Type::getInt8Ty(*llctx_), 0);
+					}
+					vmap[dst]=stV; vtypes[dst]=tctx_.get_base(BaseType::I8);
+				}
+				else if(op=="coro-save" && il.size()==3){ // (coro-save %sv %hdl) -> token
+					std::string dst=trimPct(symName(il[1])); std::string h=trimPct(symName(il[2])); if(dst.empty()||h.empty()||!vmap.count(h)) continue;
+					llvm::Value* tokV=nullptr;
+					if(enableCoro){
+						auto saveDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_save);
+						tokV = builder.CreateCall(saveDecl, { vmap[h] }, dst);
+					} else {
+						// Represent as token none when disabled
+						tokV = llvm::ConstantTokenNone::get(*llctx_);
+					}
+					vmap[dst]=tokV; // type map uses a placeholder; TC tracks it as i8
+				}
+				else if(op=="coro-id" && il.size()==2){ // (coro-id %cid) -> token (bound for later ops)
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					if(lastCoroIdTok){ vmap[dst]=lastCoroIdTok; }
+				}
+				else if(op=="coro-size" && il.size()==2){ // (coro-size %sz) -> i64
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					llvm::Value* szV=nullptr;
+					if(enableCoro){
+						auto *i64 = llvm::Type::getInt64Ty(*llctx_);
+						auto sizeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_size, { i64 });
+						szV = builder.CreateCall(sizeDecl, {}, dst);
+					} else {
+						szV = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), 0);
+					}
+					vmap[dst]=szV; vtypes[dst]=tctx_.get_base(BaseType::I64);
+				}
+				else if(op=="coro-alloc" && il.size()==3){ // (coro-alloc %need %cid) -> i1
+					std::string dst=trimPct(symName(il[1])); std::string cid=trimPct(symName(il[2])); if(dst.empty()||cid.empty()||!vmap.count(cid)) continue;
+					llvm::Value* needV=nullptr;
+					if(enableCoro){
+						auto allocDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_alloc);
+						needV = builder.CreateCall(allocDecl, { vmap[cid] }, dst);
+					} else {
+						needV = llvm::ConstantInt::getFalse(llvm::Type::getInt1Ty(*llctx_));
+					}
+					vmap[dst]=needV; vtypes[dst]=tctx_.get_base(BaseType::I1);
+				}
+				else if(op=="coro-free" && il.size()==4){ // (coro-free %mem %cid %hdl) -> ptr
+					std::string dst=trimPct(symName(il[1])); std::string cid=trimPct(symName(il[2])); std::string h=trimPct(symName(il[3])); if(dst.empty()||cid.empty()||h.empty()||!vmap.count(cid)||!vmap.count(h)) continue;
+					llvm::Value* memV=nullptr;
+					if(enableCoro){
+						auto freeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_free);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
+						memV = builder.CreateCall(freeDecl, { vmap[cid], hdlCast }, dst);
+					} else {
+						memV = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
+					}
+					vmap[dst]=memV; vtypes[dst]=tctx_.get_pointer(tctx_.get_base(BaseType::I8));
+				}
+				else if(op=="coro-promise" && il.size()==3){ // (coro-promise %p %hdl) -> ptr
+					std::string dst=trimPct(symName(il[1])); std::string h=trimPct(symName(il[2])); if(dst.empty()||h.empty()||!vmap.count(h)) continue;
+					llvm::Value* pV=nullptr;
+					if(enableCoro){
+						auto promDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_promise);
+						auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+						auto *i1  = llvm::Type::getInt1Ty(*llctx_);
+						auto *i8  = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						llvm::Value* alignZero = llvm::ConstantInt::get(i32, 0);
+						llvm::Value* fromPromise = llvm::ConstantInt::getFalse(i1);
+						// coro.promise(ptr handle, i32 align, i1 fromPromise) -> ptr
+						auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
+						pV = builder.CreateCall(promDecl, { hdlCast, alignZero, fromPromise }, dst);
+					} else {
+						pV = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
+					}
+					vmap[dst]=pV; vtypes[dst]=tctx_.get_pointer(tctx_.get_base(BaseType::I8));
+				}
+				else if(op=="coro-resume" && il.size()==2){ // (coro-resume %hdl)
+					std::string h=trimPct(symName(il[1])); if(h.empty()||!vmap.count(h)) continue;
+					if(enableCoro){
+						auto resumeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_resume);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
+						builder.CreateCall(resumeDecl, { hdlCast });
+					}
+				}
+				else if(op=="coro-destroy" && il.size()==2){ // (coro-destroy %hdl)
+					std::string h=trimPct(symName(il[1])); if(h.empty()||!vmap.count(h)) continue;
+					if(enableCoro){
+						auto destroyDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_destroy);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
+						builder.CreateCall(destroyDecl, { hdlCast });
+					}
+				}
+				else if(op=="coro-done" && il.size()==3){ // (coro-done %d %hdl) -> i1
+					std::string dst=trimPct(symName(il[1])); std::string h=trimPct(symName(il[2])); if(dst.empty()||h.empty()||!vmap.count(h)) continue;
+					llvm::Value* dV=nullptr;
+					if(enableCoro){
+						auto doneDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_done);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
+						dV = builder.CreateCall(doneDecl, { hdlCast }, dst);
+					} else {
+						dV = llvm::ConstantInt::getFalse(llvm::Type::getInt1Ty(*llctx_));
+					}
+					vmap[dst]=dV; vtypes[dst]=tctx_.get_base(BaseType::I1);
+				}
+		else if(op=="coro-end" && il.size()==2){ // (coro-end %hdl)
+					std::string h=trimPct(symName(il[1])); if(h.empty()||!vmap.count(h)) continue;
+					if(enableCoro){
+						auto endDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_end);
+						auto *i1=llvm::Type::getInt1Ty(*llctx_);
+						llvm::Value* u0=llvm::ConstantInt::getFalse(i1);
+			auto *tokNone = llvm::ConstantTokenNone::get(*llctx_);
+			( void ) builder.CreateCall(endDecl, { vmap[h], u0, tokNone }, "coro.end");
+					}
+				}
 				else if(op=="call" && il.size()>=4){ std::string dst=trimPct(symName(il[1])); TypeId retTy; try{ retTy=tctx_.parse_type(il[2]); }catch(...){ continue; } std::string callee=symName(il[3]); if(callee.empty()) continue; llvm::Function* CF=module_->getFunction(callee); if(!CF){ // create forward decl; attempt to detect variadic via type cache by matching existing function type if any
 					// Scan original module AST for function header to recover signature & variadic flag
 					bool foundHeader=false; std::vector<llvm::Type*> headerParamLL; bool headerVariadic=false; // fallback param list from current call if header parse fails
@@ -433,7 +905,50 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 						std::vector<llvm::Type*> argLTys; argLTys.reserve(il.size()-4); for(size_t ai=4; ai<il.size(); ++ai){ std::string av=trimPct(symName(il[ai])); if(av.empty()||!vtypes.count(av)){ argLTys.clear(); break;} argLTys.push_back(map_type(vtypes[av])); }
 						CF=llvm::Function::Create(llvm::FunctionType::get(map_type(retTy), argLTys, false), llvm::Function::ExternalLinkage, callee, module_.get()); }
 				}
-				std::vector<llvm::Value*> args; for(size_t ai=4; ai<il.size(); ++ai){ auto *v=getVal(il[ai]); if(!v){ args.clear(); break;} args.push_back(v);} if(args.size()+4!=il.size()) continue; auto *callInst=builder.CreateCall(CF,args, CF->getReturnType()->isVoidTy()?"":dst); if(!CF->getReturnType()->isVoidTy()){ vmap[dst]=callInst; vtypes[dst]=retTy; } }
+				std::vector<llvm::Value*> args; for(size_t ai=4; ai<il.size(); ++ai){ auto *v=getVal(il[ai]); if(!v){ args.clear(); break;} args.push_back(v);} if(args.size()+4!=il.size()) continue;
+				if(enableEHItanium && selectedPersonality){
+					// Emit invoke with landingpad on exceptional edge; use shared try-target if present.
+					auto *contBB = llvm::BasicBlock::Create(*llctx_, "invoke.cont."+std::to_string(cfCounter++), F);
+					llvm::BasicBlock* exTarget = nullptr;
+					if(!itnExceptTargetStack.empty()){
+						exTarget = itnExceptTargetStack.back();
+					}else{
+						exTarget = llvm::BasicBlock::Create(*llctx_, "invoke.lpad."+std::to_string(cfCounter++), F);
+						llvm::IRBuilder<> eb(exTarget);
+						auto *i8ptr = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_));
+						auto *lpadTy = llvm::StructType::get(*llctx_, { i8ptr, llvm::Type::getInt32Ty(*llctx_) });
+						auto *lp = eb.CreateLandingPad(lpadTy, 0, "lpad");
+						lp->setCleanup(true);
+						eb.CreateResume(lp);
+					}
+					llvm::InvokeInst* inv = builder.CreateInvoke(CF, contBB, exTarget, args, CF->getReturnType()->isVoidTy()?"":dst);
+					// Normal continuation
+					builder.SetInsertPoint(contBB);
+					if(!CF->getReturnType()->isVoidTy()){
+						vmap[dst]=inv; vtypes[dst]=retTy;
+					}
+				} else if(enableEHSEH && selectedPersonality){
+					// Windows SEH: emit invoke with a single shared cleanup funclet per function.
+					auto *contBB = llvm::BasicBlock::Create(*llctx_, "invoke.cont."+std::to_string(cfCounter++), F);
+					if(!sehCleanupBB){
+						sehCleanupBB = llvm::BasicBlock::Create(*llctx_, "seh.cleanup", F);
+						llvm::IRBuilder<> eb(sehCleanupBB);
+						auto *tokNone = llvm::ConstantTokenNone::get(*llctx_);
+						auto *cp = eb.CreateCleanupPad(tokNone, {}, "cp");
+						eb.CreateCleanupRet(cp, nullptr);
+					}
+					llvm::BasicBlock* exTarget = sehExceptTargetStack.empty() ? sehCleanupBB : sehExceptTargetStack.back();
+					llvm::InvokeInst* inv = builder.CreateInvoke(CF, contBB, exTarget, args, CF->getReturnType()->isVoidTy()?"":dst);
+					// Normal continuation
+					builder.SetInsertPoint(contBB);
+					if(!CF->getReturnType()->isVoidTy()){
+						vmap[dst]=inv; vtypes[dst]=retTy;
+					}
+				} else {
+					auto *callInst=builder.CreateCall(CF,args, CF->getReturnType()->isVoidTy()?"":dst);
+					if(!CF->getReturnType()->isVoidTy()){ vmap[dst]=callInst; vtypes[dst]=retTy; }
+				}
+			}
 				else if(op=="va-start" && il.size()==2){ // allocate simple i8* zero for va_list handle
 					std::string ap=trimPct(symName(il[1])); if(ap.empty()) continue; // represent va_list as i8* pointer to first extra arg placeholder (not implemented)
 					llvm::Value* nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
@@ -444,6 +959,82 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					llvm::Type* lty=map_type(ty); llvm::Value* uv=llvm::UndefValue::get(lty); vmap[dst]=uv; vtypes[dst]=ty; }
 				else if(op=="va-end" && il.size()==2){ /* no-op */ }
 				else if(op=="if"){ if(il.size()>=3){ std::string cond=trimPct(symName(il[1])); auto itc=vmap.find(cond); if(itc==vmap.end()) continue; auto *thenBB=llvm::BasicBlock::Create(*llctx_,"if.then."+std::to_string(cfCounter++),F); llvm::BasicBlock* elseBB=nullptr; auto *mergeBB=llvm::BasicBlock::Create(*llctx_,"if.end."+std::to_string(cfCounter++),F); bool hasElse=il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data); if(hasElse) elseBB=llvm::BasicBlock::Create(*llctx_,"if.else."+std::to_string(cfCounter++),F); if(!builder.GetInsertBlock()->getTerminator()) builder.CreateCondBr(itc->second, thenBB, hasElse?elseBB:mergeBB); builder.SetInsertPoint(thenBB); if(std::holds_alternative<vector_t>(il[2]->data)) emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref); if(!thenBB->getTerminator()) builder.CreateBr(mergeBB); if(hasElse){ builder.SetInsertPoint(elseBB); emit_ref(std::get<vector_t>(il[3]->data).elems, emit_ref); if(!elseBB->getTerminator()) builder.CreateBr(mergeBB);} builder.SetInsertPoint(mergeBB);} }
+				else if(op=="try"){ // (try :body [ ... ] :catch [ ... ])  -- Itanium & SEH (catch-all minimal)
+					// Parse sections
+					node_ptr bodyNode=nullptr, catchNode=nullptr;
+					for(size_t i=1;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i]; if(kw=="body" && val && std::holds_alternative<vector_t>(val->data)) bodyNode=val; else if(kw=="catch" && val && std::holds_alternative<vector_t>(val->data)) catchNode=val; }
+					if(!bodyNode || !catchNode){ continue; }
+					// Create blocks
+					auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "try.body."+std::to_string(cfCounter++), F);
+					auto *contBB = llvm::BasicBlock::Create(*llctx_, "try.end."+std::to_string(cfCounter++), F);
+					if(enableEHSEH && selectedPersonality){
+						// SEH path: catchswitch/catchpad/catchret to handler
+						auto *catchDispatch = llvm::BasicBlock::Create(*llctx_, "try.catch.dispatch."+std::to_string(cfCounter++), F);
+						auto *catchPadBB = llvm::BasicBlock::Create(*llctx_, "try.catch.pad."+std::to_string(cfCounter++), F);
+						auto *catchHandlerBB = llvm::BasicBlock::Create(*llctx_, "try.handler."+std::to_string(cfCounter++), F);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(bodyBB);
+						builder.SetInsertPoint(catchDispatch);
+						auto *tokNone = llvm::ConstantTokenNone::get(*llctx_);
+						auto *cs = builder.CreateCatchSwitch(tokNone, contBB, 1, "cs");
+						auto *csi = llvm::cast<llvm::CatchSwitchInst>(cs);
+						csi->addHandler(catchPadBB);
+						builder.SetInsertPoint(catchPadBB);
+						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+						auto *i8p = llvm::PointerType::getUnqual(i8);
+						auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+						llvm::Value* ti0 = llvm::ConstantPointerNull::get(i8p);
+						llvm::Value* ti1 = llvm::ConstantInt::get(i32, 0);
+						llvm::Value* ti2 = llvm::ConstantPointerNull::get(i8p);
+						auto *cpad = builder.CreateCatchPad(cs, { ti0, ti1, ti2 }, "cpad");
+						builder.CreateCatchRet(cpad, catchHandlerBB);
+						// Body with SEH exception target
+						builder.SetInsertPoint(bodyBB);
+						sehExceptTargetStack.push_back(catchDispatch);
+						emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
+						sehExceptTargetStack.pop_back();
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(contBB);
+						// Handler body
+						builder.SetInsertPoint(catchHandlerBB);
+						emit_ref(std::get<vector_t>(catchNode->data).elems, emit_ref);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(contBB);
+						builder.SetInsertPoint(contBB);
+					}else if(enableEHItanium && selectedPersonality){
+						// Itanium path: landingpad catch-all -> handler
+						auto *lpadBB = llvm::BasicBlock::Create(*llctx_, "try.lpad."+std::to_string(cfCounter++), F);
+						auto *handlerBB = llvm::BasicBlock::Create(*llctx_, "try.handler."+std::to_string(cfCounter++), F);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(bodyBB);
+						// Landingpad with catch-all
+						{
+							llvm::IRBuilder<> eb(lpadBB);
+								if(enableDebugInfo && F->getSubprogram()) eb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
+							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
+							auto *i8p = llvm::PointerType::getUnqual(i8);
+							auto *i32 = llvm::Type::getInt32Ty(*llctx_);
+							auto *lpadTy = llvm::StructType::get(*llctx_, { i8p, i32 });
+							auto *lp = eb.CreateLandingPad(lpadTy, 1, "lpad");
+							lp->addClause(llvm::ConstantPointerNull::get(i8p)); // catch-all
+							eb.CreateBr(handlerBB);
+						}
+						// Body with Itanium exception target
+						builder.SetInsertPoint(bodyBB);
+						itnExceptTargetStack.push_back(lpadBB);
+						emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
+						itnExceptTargetStack.pop_back();
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(contBB);
+						// Handler body
+						builder.SetInsertPoint(handlerBB);
+						emit_ref(std::get<vector_t>(catchNode->data).elems, emit_ref);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(contBB);
+						builder.SetInsertPoint(contBB);
+					}else{
+						// No EH enabled: just emit body then catch (no-op structural)
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(bodyBB);
+						builder.SetInsertPoint(bodyBB);
+						emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(contBB);
+						builder.SetInsertPoint(contBB);
+					}
+				}
 				else if(op=="while"){ if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)){ std::string cond=trimPct(symName(il[1])); auto itc=vmap.find(cond); if(itc==vmap.end()) continue; auto *condBB=llvm::BasicBlock::Create(*llctx_,"while.cond."+std::to_string(cfCounter++),F); auto *bodyBB=llvm::BasicBlock::Create(*llctx_,"while.body."+std::to_string(cfCounter++),F); auto *endBB=llvm::BasicBlock::Create(*llctx_,"while.end."+std::to_string(cfCounter++),F); if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(condBB); builder.SetInsertPoint(condBB); builder.CreateCondBr(itc->second, bodyBB, endBB); builder.SetInsertPoint(bodyBB); loopEndStack.push_back(endBB); loopContinueStack.push_back(condBB); emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref); loopContinueStack.pop_back(); loopEndStack.pop_back(); if(!bodyBB->getTerminator()) builder.CreateBr(condBB); builder.SetInsertPoint(endBB);} }
 				else if(op=="for"){ // (for :init [..] :cond %c :step [..] :body [..])
 					// Parse keyword sections
@@ -587,6 +1178,8 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		}
 		if(!entry->getTerminator()){ if(fty->getReturnType()->isVoidTy()) builder.CreateRetVoid(); else builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType())); }
 	}
+		// Finalize DI after all functions are emitted
+		if(enableDebugInfo && DIB){ DIB->finalize(); }
 	// Optional: run a small optimization pipeline if enabled
 	if(const char* enable = std::getenv("EDN_ENABLE_PASSES"); enable && std::string(enable) == "1"){
 		llvm::PassBuilder PB;

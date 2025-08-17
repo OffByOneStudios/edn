@@ -18,7 +18,7 @@ inline void TypeChecker::error_code(TypeCheckResult& r, const node& n, std::stri
     ErrorReporter rep{&r.errors,&r.warnings};
     rep.emit_error(rep.make_error(std::move(code), std::move(msg), std::move(hint), line(n), col(n)));
 }
-inline void TypeChecker::reset(){ structs_.clear(); unions_.clear(); sums_.clear(); functions_.clear(); globals_.clear(); var_types_.clear(); }
+inline void TypeChecker::reset(){ structs_.clear(); unions_.clear(); sums_.clear(); functions_.clear(); globals_.clear(); var_types_.clear(); used_globals_.clear(); }
 inline void TypeChecker::collect_typedefs(TypeCheckResult& r, const std::vector<node_ptr>& elems){
     for(size_t i=1;i<elems.size(); ++i){
         auto &n = elems[i];
@@ -267,6 +267,21 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
                 continue;
             }
             if(op=="if"){ bool thenReach=true, elseReach=true; if(il.size()>=2) noteUse(symAt(1)); if(il.size()>=3 && il[2] && std::holds_alternative<vector_t>(il[2]->data)) scan(std::get<vector_t>(il[2]->data).elems, thenReach); if(il.size()>=4 && il[3] && std::holds_alternative<vector_t>(il[3]->data)) scan(std::get<vector_t>(il[3]->data).elems, elseReach); reachable = thenReach || elseReach; continue; }
+            if(op=="try"){ // (try :body [ ... ] :catch [ ... ])
+                // Descend into both body and catch to track uses and reachability.
+                node_ptr bodyNode=nullptr, catchNode=nullptr; bool haveBody=false, haveCatch=false;
+                for(size_t j=1;j<il.size(); ++j){
+                    if(!il[j] || !std::holds_alternative<keyword>(il[j]->data)) break;
+                    std::string kw = std::get<keyword>(il[j]->data).name; if(++j>=il.size()) break; auto val = il[j];
+                    if(kw=="body" && val && std::holds_alternative<vector_t>(val->data)){ bodyNode=val; haveBody=true; }
+                    else if(kw=="catch" && val && std::holds_alternative<vector_t>(val->data)){ catchNode=val; haveCatch=true; }
+                }
+                bool bodyReach=true, catchReach=true;
+                if(haveBody) scan(std::get<vector_t>(bodyNode->data).elems, bodyReach);
+                if(haveCatch) scan(std::get<vector_t>(catchNode->data).elems, catchReach);
+                reachable = bodyReach || catchReach; // control continues if any arm can continue
+                continue;
+            }
             if(op=="while"){ if(il.size()>=2) noteUse(symAt(1)); // while may loop 0 times -> reachable continues
                 if(il.size()>=3 && il[2] && std::holds_alternative<vector_t>(il[2]->data)){ bool bodyReach=true; scan(std::get<vector_t>(il[2]->data).elems, bodyReach); }
                 continue; }
@@ -405,6 +420,130 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         if(retTy != finfo->ret){ type_mismatch(r,*n,"E1437","call-closure return", finfo->ret, retTy); r.success=false; }
         var_types_[dst.substr(1)] = retTy; attach(n, retTy); continue;
     }
+    // --- M4.6 Coroutines (minimal, behind EDN_ENABLE_CORO) ---
+    if(op=="coro-begin"){ // (coro-begin %hdl)
+        if(il.size()!=2){ error_code(r,*n,"E1460","coro-begin arity","expected (coro-begin %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1461","coro-begin dst must be %var","prefix destination with %"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for handle"); r.success=false; }
+        // Handle type is opaque i8* (coro frame pointer)
+        TypeId i8 = ctx_.get_base(BaseType::I8);
+        TypeId hty = ctx_.get_pointer(i8);
+        var_types_[dst.substr(1)] = hty; attach(n, hty); continue;
+    }
+    if(op=="coro-suspend"){ // (coro-suspend %st %hdl) -> %st i8
+        if(il.size()!=3){ error_code(r,*n,"E1462","coro-suspend arity","expected (coro-suspend %st %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), h=sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1462","coro-suspend arity","%st required as destination"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1463","coro-suspend handle must be %var","pass handle from coro-begin"); r.success=false; continue; }
+        auto ht = get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1463","coro-suspend handle undefined","call coro-begin first"); r.success=false; }
+        else {
+            const Type& HT = ctx_.at(ht);
+            bool ok = (HT.kind==Type::Kind::Pointer && ctx_.at(HT.pointee).kind==Type::Kind::Base && ctx_.at(HT.pointee).base==BaseType::I8);
+            if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); type_mismatch(r,*n,"E1463","coro handle", expected, ht); r.success=false; }
+        }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %st"); r.success=false; }
+        // status is i8 from llvm.coro.suspend
+        TypeId st = ctx_.get_base(BaseType::I8);
+        var_types_[dst.substr(1)] = st; attach(n, st); continue;
+    }
+    if(op=="coro-final-suspend"){ // (coro-final-suspend %st %hdlOrTok)
+        if(il.size()!=3){ error_code(r,*n,"E1462","coro-final-suspend arity","expected (coro-final-suspend %st %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), h=sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1462","coro-final-suspend arity","%st required as destination"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1463","coro-final-suspend handle must be %var","pass handle/token"); r.success=false; continue; }
+        auto ht = get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1463","coro-final-suspend operand undefined","call coro-begin or coro-save first"); r.success=false; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %st"); r.success=false; }
+        TypeId st = ctx_.get_base(BaseType::I8);
+        var_types_[dst.substr(1)] = st; attach(n, st); continue;
+    }
+    if(op=="coro-save"){ // (coro-save %sv %hdl) -> token as i8 placeholder
+        if(il.size()!=3){ error_code(r,*n,"E1466","coro-save arity","expected (coro-save %sv %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), h=sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1466","coro-save arity","%sv required as destination"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1466","coro-save arity","handle must be %var from coro-begin"); r.success=false; continue; }
+        auto ht=get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1466","coro-save handle undefined","call coro-begin first"); r.success=false; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %sv"); r.success=false; }
+        // We don't model token in type system yet; use i8 placeholder for SSA bookkeeping
+        TypeId placeholder = ctx_.get_base(BaseType::I8);
+        var_types_[dst.substr(1)] = placeholder; attach(n, placeholder); continue;
+    }
+    if(op=="coro-promise"){ // (coro-promise %p %hdl) -> ptr
+        if(il.size()!=3){ error_code(r,*n,"E1467","coro-promise arity","expected (coro-promise %p %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), h=sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1467","coro-promise arity","%p required as destination"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1468","coro-promise handle must be %var","pass handle from coro-begin"); r.success=false; continue; }
+        auto ht=get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1468","coro-promise handle undefined","call coro-begin first"); r.success=false; }
+        else { const Type& HT=ctx_.at(ht); bool ok=(HT.kind==Type::Kind::Pointer && ctx_.at(HT.pointee).kind==Type::Kind::Base && ctx_.at(HT.pointee).base==BaseType::I8);
+            if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); type_mismatch(r,*n,"E1468","coro handle", expected, ht); r.success=false; }
+        }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %p"); r.success=false; }
+        // Promise pointer is opaque ptr (i8*)
+        TypeId pty = ctx_.get_pointer(ctx_.get_base(BaseType::I8));
+        var_types_[dst.substr(1)] = pty; attach(n, pty); continue;
+    }
+    if(op=="coro-resume"){ // (coro-resume %hdl)
+        if(il.size()!=2){ error_code(r,*n,"E1469","coro-resume arity","expected (coro-resume %hdl)"); r.success=false; continue; }
+        std::string h=sym(1); if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1469","coro-resume arity","handle must be %var"); r.success=false; continue; }
+        auto ht=get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1469","coro-resume handle undefined","call coro-begin first"); r.success=false; }
+        continue;
+    }
+    if(op=="coro-destroy"){ // (coro-destroy %hdl)
+        if(il.size()!=2){ error_code(r,*n,"E1470","coro-destroy arity","expected (coro-destroy %hdl)"); r.success=false; continue; }
+        std::string h=sym(1); if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1470","coro-destroy arity","handle must be %var"); r.success=false; continue; }
+        auto ht=get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1470","coro-destroy handle undefined","call coro-begin first"); r.success=false; }
+        continue;
+    }
+    if(op=="coro-done"){ // (coro-done %d %hdl) -> i1
+        if(il.size()!=3){ error_code(r,*n,"E1471","coro-done arity","expected (coro-done %d %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), h=sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1471","coro-done arity","%d required as destination"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1471","coro-done arity","handle must be %var"); r.success=false; continue; }
+        auto ht=get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1471","coro-done handle undefined","call coro-begin first"); r.success=false; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %d"); r.success=false; }
+        TypeId b = ctx_.get_base(BaseType::I1);
+        var_types_[dst.substr(1)] = b; attach(n, b); continue;
+    }
+    if(op=="coro-id"){ // (coro-id %cid) binds current id token to a name (placeholder type)
+        if(il.size()!=2){ error_code(r,*n,"E1472","coro-id arity","expected (coro-id %cid)"); r.success=false; continue; }
+        std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1472","coro-id arity","%cid required as destination"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %cid"); r.success=false; }
+        var_types_[dst.substr(1)] = ctx_.get_base(BaseType::I8); attach(n, ctx_.get_base(BaseType::I8)); continue;
+    }
+    if(op=="coro-size"){ // (coro-size %sz) -> i64
+        if(il.size()!=2){ error_code(r,*n,"E1473","coro-size arity","expected (coro-size %sz)"); r.success=false; continue; }
+        std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1473","coro-size arity","%sz required as destination"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %sz"); r.success=false; }
+        auto t = ctx_.get_base(BaseType::I64); var_types_[dst.substr(1)] = t; attach(n, t); continue;
+    }
+    if(op=="coro-alloc"){ // (coro-alloc %need %cid) -> i1
+        if(il.size()!=3){ error_code(r,*n,"E1474","coro-alloc arity","expected (coro-alloc %need %cid)"); r.success=false; continue; }
+        std::string dst=sym(1), cid=sym(2); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1474","coro-alloc arity","%need required as destination"); r.success=false; continue; }
+        if(cid.empty()||cid[0] != '%'){ error_code(r,*n,"E1474","coro-alloc arity","%cid must be a %var"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %need"); r.success=false; }
+        var_types_[dst.substr(1)] = ctx_.get_base(BaseType::I1); attach(n, ctx_.get_base(BaseType::I1)); continue;
+    }
+    if(op=="coro-free"){ // (coro-free %mem %cid %hdl) -> ptr
+        if(il.size()!=4){ error_code(r,*n,"E1475","coro-free arity","expected (coro-free %mem %cid %hdl)"); r.success=false; continue; }
+        std::string dst=sym(1), cid=sym(2), h=sym(3);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1475","coro-free arity","%mem required as destination"); r.success=false; continue; }
+        if(cid.empty()||cid[0] != '%'){ error_code(r,*n,"E1475","coro-free arity","%cid must be %var"); r.success=false; continue; }
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1475","coro-free arity","%hdl must be %var"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1464","redefinition of variable","use fresh SSA name for %mem"); r.success=false; }
+        auto p = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); var_types_[dst.substr(1)] = p; attach(n, p); continue;
+    }
+    if(op=="coro-end"){ // (coro-end %hdl)
+        if(il.size()!=2){ error_code(r,*n,"E1465","coro-end arity","expected (coro-end %hdl)"); r.success=false; continue; }
+        std::string h=sym(1);
+        if(h.empty()||h[0] != '%'){ error_code(r,*n,"E1465","coro-end arity","handle must be %var from coro-begin"); r.success=false; continue; }
+        auto ht = get_var(h.substr(1)); if(ht==(TypeId)-1){ error_code(r,*n,"E1465","coro-end handle undefined","call coro-begin first"); r.success=false; }
+        else {
+            const Type& HT = ctx_.at(ht);
+            bool ok = (HT.kind==Type::Kind::Pointer && ctx_.at(HT.pointee).kind==Type::Kind::Base && ctx_.at(HT.pointee).base==BaseType::I8);
+            if(!ok){ TypeId expected = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); type_mismatch(r,*n,"E1465","coro handle", expected, ht); r.success=false; }
+        }
+        continue;
+    }
     // --- M4.1 Sum constructors and tag test ---
     if(op=="sum-new"){ // (sum-new %dst SumType Variant [ %v0 %v1 ... ])
         if(il.size()<4){ error_code(r,*n,"E1409","sum-new arity","expected (sum-new %dst SumType Variant [ %vals* ])"); r.success=false; continue; }
@@ -464,6 +603,18 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
     }
     if(op=="block"){ std::unordered_map<std::string,TypeId> saved=var_types_; for(size_t i=1;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i]; if(kw=="locals"){ if(val && std::holds_alternative<vector_t>(val->data)){ for(auto &d: std::get<vector_t>(val->data).elems){ if(!d||!std::holds_alternative<list>(d->data)) continue; auto &dl=std::get<list>(d->data).elems; if(dl.size()==3 && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="local"){ TypeId lty=parse_type_node(dl[1],r); if(std::holds_alternative<symbol>(dl[2]->data)){ std::string vn=std::get<symbol>(dl[2]->data).name; if(!vn.empty()&&vn[0]=='%') vn.erase(0,1); if(var_types_.count(vn)){ error(r,*d,"duplicate local"); r.success=false; } else var_types_[vn]=lty; } } } } } else if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)) check_instruction_list(r, std::get<vector_t>(val->data).elems, fn); } } var_types_=saved; continue; }
     if(op=="if"){ if(il.size()<3){ error_code(r,*n,"E1000","if arity","expected (if %cond [ then ] [ else ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1001","if cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1002","if cond must be i1","use boolean (i1) value"); r.success=false; } } if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn); if(il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data)) check_instruction_list(r, std::get<vector_t>(il[3]->data).elems, fn); continue; }
+    if(op=="try"){ // (try :body [ ... ] :catch [ ... ])
+        node_ptr bodyNode=nullptr, catchNode=nullptr; bool haveBody=false, haveCatch=false;
+        for(size_t i=1;i<il.size(); ++i){ if(!il[i] || !std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i];
+            if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)){ bodyNode=val; haveBody=true; } else { error_code(r,*n,"E1451","try :body must be vector","wrap body in [ ... ]"); r.success=false; } }
+            else if(kw=="catch"){ if(val && std::holds_alternative<vector_t>(val->data)){ catchNode=val; haveCatch=true; } else { error_code(r,*n,"E1452","try :catch must be vector","wrap handler in [ ... ]"); r.success=false; } }
+        }
+        if(!haveBody){ error_code(r,*n,"E1450","try missing :body","add :body [ ... ]"); r.success=false; }
+        if(!haveCatch){ error_code(r,*n,"E1453","try missing :catch","add :catch [ ... ]"); r.success=false; }
+        if(bodyNode && std::holds_alternative<vector_t>(bodyNode->data)) check_instruction_list(r, std::get<vector_t>(bodyNode->data).elems, fn, loop_depth);
+        if(catchNode && std::holds_alternative<vector_t>(catchNode->data)) check_instruction_list(r, std::get<vector_t>(catchNode->data).elems, fn, loop_depth);
+        continue;
+    }
     if(op=="while"){ if(il.size()<3){ error_code(r,*n,"E1003","while arity","expected (while %cond [ body ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1004","while cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1005","while cond must be i1","use boolean (i1) value"); r.success=false; } } if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn, loop_depth+1); continue; }
     // --- Phase 3 For Loop (E137x) ---
     if(op=="for"){ // (for :init [ ... ] :cond %c :step [ ... ] :body [ ... ]) order flexible but all required
@@ -881,8 +1032,8 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E0818","redefinition of variable","rename destination"); r.success=false; } TypeId pty=ctx_.get_pointer(fit->second->type); var_types_[dst.substr(1)]=pty; attach(n, pty);} else { error_code(r,*n,"E0817","member-addr dst must be %var","prefix destination with %"); r.success=false; } continue; }
     if(op=="load"){ if(il.size()!=4){ error_code(r,*n,"E0200","load arity","expected (load %dst <type> %ptr)"); r.success=false; continue; } std::string dst=sym(1), ptr=sym(3); if(dst.empty()||ptr.empty()){ error_code(r,*n,"E0201","load symbols","supply %dst and %ptr"); r.success=false; continue; } TypeId ty=parse_type_node(il[2],r); if(ptr[0]=='%'){ auto pt=get_var(ptr.substr(1)); if(pt==(TypeId)-1){ error_code(r,*n,"E0202","ptr undefined","define pointer variable before load"); r.success=false; } else { const Type& PT=ctx_.at(pt); if(PT.kind!=Type::Kind::Pointer){ error_code(r,*n,"E0203","ptr not pointer to type","pointer must be (ptr <type>)"); r.success=false; } else if(PT.pointee!=ty){ type_mismatch(r,*n,"E0203","load ptr",ctx_.get_pointer(ty),pt); r.success=false; } } } if(dst[0]=='%'){ var_types_[dst.substr(1)]=ty; attach(n,ty);} else { error_code(r,*n,"E0204","load dst must be %var","prefix destination with %"); r.success=false; } continue; }
     if(op=="store"){ if(il.size()!=4){ error_code(r,*n,"E0210","store arity","expected (store <type> %ptr %val)"); r.success=false; continue; } TypeId ty=parse_type_node(il[1],r); std::string ptr=sym(2), val=sym(3); if(ptr.empty()||val.empty()){ error_code(r,*n,"E0211","store symbols","provide %ptr and %val"); r.success=false; continue; } if(ptr[0]=='%'){ auto pt=get_var(ptr.substr(1)); if(pt==(TypeId)-1){ error_code(r,*n,"E0212","ptr undefined","define pointer before store"); r.success=false; } else { const Type& PT=ctx_.at(pt); if(PT.kind!=Type::Kind::Pointer || PT.pointee!=ty){ if(PT.kind==Type::Kind::Pointer) type_mismatch(r,*n,"E0213","store ptr",ty,PT.pointee); else error_code(r,*n,"E0213","store ptr type mismatch","pointer pointee must match <type>"); r.success=false; } } } if(val[0]=='%'){ auto vt=get_var(val.substr(1)); if(vt!=(TypeId)-1 && vt!=ty){ type_mismatch(r,*n,"E0214","store value",ty,vt); r.success=false; } } continue; }
-    if(op=="gload"){ if(il.size()!=4){ error_code(r,*n,"E0900","gload arity","expected (gload %dst <type> GlobalName)"); r.success=false; continue;} std::string dst=sym(1), gname=sym(3); if(dst.empty()||gname.empty()){ error_code(r,*n,"E0901","gload symbols","supply %dst and global name"); r.success=false; continue;} TypeId ty=parse_type_node(il[2],r); GlobalInfoTC* gi=nullptr; if(!lookup_global(gname,gi)){ size_t before=r.errors.size(); error_code(r,*n,"E0902","unknown global","declare (global :name ...)"); if(before<r.errors.size()){ std::vector<std::string> names; names.reserve(globals_.size()); for(auto &kv: globals_) names.push_back(kv.first); auto sugg=fuzzy_candidates(gname,names); append_suggestions(r.errors.back(),sugg); } r.success=false; } else if(gi->type!=ty){ type_mismatch(r,*n,"E0903","gload", gi->type, ty); r.success=false; } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E0905","redefinition of variable","rename destination"); r.success=false;} var_types_[dst.substr(1)]=ty; attach(n,ty);} else { error_code(r,*n,"E0904","gload dst must be %var","prefix destination with %"); r.success=false;} continue; }
-    if(op=="gstore"){ if(il.size()!=4){ error_code(r,*n,"E0910","gstore arity","expected (gstore <type> GlobalName %val)"); r.success=false; continue;} TypeId ty=parse_type_node(il[1],r); std::string gname=sym(2), val=sym(3); if(gname.empty()||val.empty()){ error_code(r,*n,"E0911","gstore symbols","provide global name and %val"); r.success=false; continue;} GlobalInfoTC* gi=nullptr; if(!lookup_global(gname,gi)){ error_code(r,*n,"E0912","unknown global","declare (global :name ...)"); r.success=false; } else { if(gi->type!=ty){ type_mismatch(r,*n,"E0913","gstore", gi->type, ty); r.success=false; } if(gi->is_const){ error_code(r,*n,"E1226","cannot store to const global","remove :const or avoid mutation"); r.success=false; } } if(val[0]=='%'){ auto vt=get_var(val.substr(1)); if(vt!=(TypeId)-1 && vt!=ty){ type_mismatch(r,*n,"E0914","gstore value", ty, vt); r.success=false; } } else { error_code(r,*n,"E0915","gstore value must be %var","prefix value with %"); r.success=false; } continue; }
+    if(op=="gload"){ if(il.size()!=4){ error_code(r,*n,"E0900","gload arity","expected (gload %dst <type> GlobalName)"); r.success=false; continue;} std::string dst=sym(1), gname=sym(3); if(dst.empty()||gname.empty()){ error_code(r,*n,"E0901","gload symbols","supply %dst and global name"); r.success=false; continue;} TypeId ty=parse_type_node(il[2],r); GlobalInfoTC* gi=nullptr; if(!lookup_global(gname,gi)){ size_t before=r.errors.size(); error_code(r,*n,"E0902","unknown global","declare (global :name ...)"); if(before<r.errors.size()){ std::vector<std::string> names; names.reserve(globals_.size()); for(auto &kv: globals_) names.push_back(kv.first); auto sugg=fuzzy_candidates(gname,names); append_suggestions(r.errors.back(),sugg); } r.success=false; } else if(gi->type!=ty){ type_mismatch(r,*n,"E0903","gload", gi->type, ty); r.success=false; } else { used_globals_.insert(gname); } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E0905","redefinition of variable","rename destination"); r.success=false;} var_types_[dst.substr(1)]=ty; attach(n,ty);} else { error_code(r,*n,"E0904","gload dst must be %var","prefix destination with %"); r.success=false;} continue; }
+    if(op=="gstore"){ if(il.size()!=4){ error_code(r,*n,"E0910","gstore arity","expected (gstore <type> GlobalName %val)"); r.success=false; continue;} TypeId ty=parse_type_node(il[1],r); std::string gname=sym(2), val=sym(3); if(gname.empty()||val.empty()){ error_code(r,*n,"E0911","gstore symbols","provide global name and %val"); r.success=false; continue;} GlobalInfoTC* gi=nullptr; if(!lookup_global(gname,gi)){ error_code(r,*n,"E0912","unknown global","declare (global :name ...)"); r.success=false; } else { if(gi->type!=ty){ type_mismatch(r,*n,"E0913","gstore", gi->type, ty); r.success=false; } if(gi->is_const){ error_code(r,*n,"E1226","cannot store to const global","remove :const or avoid mutation"); r.success=false; } else { used_globals_.insert(gname); } } if(val[0]=='%'){ auto vt=get_var(val.substr(1)); if(vt!=(TypeId)-1 && vt!=ty){ type_mismatch(r,*n,"E0914","gstore value", ty, vt); r.success=false; } } else { error_code(r,*n,"E0915","gstore value must be %var","prefix value with %"); r.success=false; } continue; }
     if(op=="index"){ if(il.size()!=5){ error_code(r,*n,"E0820","index arity","expected (index %dst <elem-type> %basePtr %idx)"); r.success=false; continue; } std::string dst=sym(1), base=sym(3), idx=sym(4); if(dst.empty()||base.empty()||idx.empty()){ error_code(r,*n,"E0821","index symbols","supply %dst %base %idx"); r.success=false; continue; } TypeId elem=parse_type_node(il[2],r); if(base[0]=='%'){ auto bt=get_var(base.substr(1)); if(bt==(TypeId)-1){ error_code(r,*n,"E0822","base undefined","define base pointer earlier"); r.success=false; } else { const Type& BT=ctx_.at(bt); if(BT.kind!=Type::Kind::Pointer){ error_code(r,*n,"E0823","index base not pointer","use pointer to array"); r.success=false; } else { const Type& AT=ctx_.at(BT.pointee); if(AT.kind!=Type::Kind::Array){ error_code(r,*n,"E0824","base not pointer to array elem type","ensure pointer to (array ...)"); r.success=false; } else if(AT.elem!=elem){ TypeId expectedPtr = ctx_.get_pointer(ctx_.get_array(elem, AT.array_size)); type_mismatch(r,*n,"E0824","index base", expectedPtr, bt); r.success=false; } } } } if(idx[0]=='%'){ auto it=get_var(idx.substr(1)); if(it!=(TypeId)-1 && !is_int(it)){ error_code(r,*n,"E0825","index must be int","index variable must be integer type"); r.success=false; } } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E0827","redefinition of variable","rename destination"); r.success=false; } var_types_[dst.substr(1)]=ctx_.get_pointer(elem); attach(n, ctx_.get_pointer(elem)); } else { error_code(r,*n,"E0826","index dst must be %var","prefix destination with %"); r.success=false; } continue; }
     if(op=="alloca"){ if(il.size()!=3){ error_code(r,*n,"E1108","alloca arity","expected (alloca %dst <type>)"); r.success=false; continue; } std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1109","alloca dst must be %var","prefix destination with %"); r.success=false; continue; } TypeId ty=parse_type_node(il[2],r); if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1110","redefinition of variable","rename destination"); r.success=false; } TypeId pty=ctx_.get_pointer(ty); var_types_[dst.substr(1)]=pty; attach(n,pty); continue; }
     if(op=="struct-lit"){ if(il.size()!=4){ error_code(r,*n,"E1200","struct-lit arity","expected (struct-lit %dst StructName [ field1 %v1 ... ])"); r.success=false; continue; } std::string dst=sym(1), stName=sym(2); if(dst.empty()||stName.empty()){ error_code(r,*n,"E1201","struct-lit symbols","supply %dst StructName [ ... ]"); r.success=false; continue; } auto sit=structs_.find(stName); if(sit==structs_.end()){ error_code(r,*n,"E1202","unknown struct","declare struct before literal"); r.success=false; continue; } if(!il[3]||!std::holds_alternative<vector_t>(il[3]->data)){ error_code(r,*n,"E1203","struct-lit fields must be vector","wrap field list in [ ]"); r.success=false; continue; } auto &vec=std::get<vector_t>(il[3]->data).elems; if(vec.size()!=sit->second.fields.size()*2){ error_code(r,*n,"E1204","struct-lit field count mismatch","provide name/value pairs for all fields"); r.success=false; } bool orderOk=true; size_t fi=0; for(size_t i=0;i<vec.size(); i+=2,++fi){ if(fi>=sit->second.fields.size()) break; if(!vec[i]||!std::holds_alternative<symbol>(vec[i]->data)){ error_code(r,*n,"E1205","field name must be symbol","use declared field names"); r.success=false; orderOk=false; break; } std::string fname=std::get<symbol>(vec[i]->data).name; if(fname!=sit->second.fields[fi].name){ error_code(r,*n,"E1206","field order/name mismatch","use declared order"); r.success=false; orderOk=false; } if(i+1>=vec.size()||!vec[i+1]||!std::holds_alternative<symbol>(vec[i+1]->data)){ error_code(r,*n,"E1207","field value must be %var symbol","prefix with %"); r.success=false; orderOk=false; continue; } std::string val=std::get<symbol>(vec[i+1]->data).name; if(val.empty()||val[0] != '%'){ error_code(r,*n,"E1207","field value must be %var symbol","prefix with %"); r.success=false; orderOk=false; continue; } auto vt=get_var(val.substr(1)); if(vt!=(TypeId)-1 && vt!=sit->second.fields[fi].type){ type_mismatch(r,*n,"E1208","struct field", sit->second.fields[fi].type, vt); r.success=false; } } if(dst[0]=='%'){ if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1209","redefinition of variable","rename destination"); r.success=false; } TypeId sty=ctx_.get_struct(stName); TypeId pty=ctx_.get_pointer(sty); var_types_[dst.substr(1)]=pty; attach(n,pty);} else { error_code(r,*n,"E1201","struct-lit symbols","destination must be %var"); r.success=false; } continue; }
@@ -946,6 +1097,16 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
     error(r,*n,"unknown instruction"); r.success=false; }
 }
 // (removed stray extra brace that previously closed namespace early)
-inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_sums(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); return res; }
+inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_sums(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); 
+    // Emit lints for unused globals (W1405) unless disabled
+    if(const char* lintEnv = std::getenv("EDN_LINT")){ if(lintEnv[0]=='0') return res; }
+    {
+        ErrorReporter rep{&res.errors,&res.warnings};
+        for(const auto& kv : globals_){ if(!used_globals_.count(kv.first)){
+                rep.emit_warning(rep.make_warning("W1405","unused global '"+kv.first+"'","remove or reference it", -1, -1));
+            }
+        }
+    }
+    return res; }
 
 } // namespace edn

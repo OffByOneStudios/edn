@@ -40,6 +40,8 @@ Status: Initial extraction on 2025-08-14. Keep this file in sync when adding / r
 | E13Ax    | Cast sugar `(as ...)`                   |
 | E143x    | Closures & captures `(closure ...)`      |
 
+| E145x    | Try/Catch construct                       |
+
 ---
 
 ## Detailed Codes
@@ -466,3 +468,18 @@ Record-based closures:
 
 Notes:
 - Current implementation lowers closures to a per‑site thunk with a private global storing `%env`. Future iterations will construct an explicit closure record `{ fnptr, env }` and support multiple captures and escaping semantics.
+
+---
+
+### E145x – Try/Catch
+Form: `(try :body [ ... ] :catch [ ... ])` – minimal catch‑all support initially. The type checker validates structure; semantics are lowered per EH model (Itanium landingpads; SEH funclets).
+
+| Code  | Title                        | Condition / When Emitted                                 | Hint |
+|-------|------------------------------|-----------------------------------------------------------|------|
+| E1450 | try missing :body            | `:body` section absent                                    | add `:body [ ... ]` (can be empty) |
+| E1451 | try :body must be vector     | `:body` present but not a vector                          | wrap body ops in `[ ... ]` |
+| E1452 | try :catch must be vector    | `:catch` present but not a vector                         | wrap catch ops in `[ ... ]` |
+| E1453 | try missing :catch           | `:catch` section absent                                   | add `:catch [ ... ]` |
+
+Reachability and lints:
+- The lints analyzer treats try/catch as reachable if either body or catch can reach a terminator.

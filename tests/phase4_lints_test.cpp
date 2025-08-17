@@ -26,5 +26,9 @@ void run_phase4_lints_tests(){
     auto m3 = parse("(module (fn :name \"h\" :ret i32 :params [ (param i32 %p) ] :body [ (const %z i32 0) (const %u i32 42) (ret i32 %z) ]) )");
     auto r3 = tc.check_module(m3); assert(r3.success); assert(hasWarning(r3, "W1404")); assert(hasWarning(r3, "W1403"));
 
+    // W1405: unused global warning
+    auto m4 = parse("(module (global :name G :type i32 :const false :init 0) (fn :name \"use_none\" :ret i32 :params [] :body [ (const %z i32 0) (ret i32 %z) ]) )");
+    auto r4 = tc.check_module(m4); assert(r4.success); assert(hasWarning(r4, "W1405"));
+
     std::cout << "Phase 4 lints tests passed\n";
 }

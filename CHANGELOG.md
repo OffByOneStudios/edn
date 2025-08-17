@@ -41,3 +41,4 @@ All notable changes will be documented here once releases begin.
 	- Generics (monomorphization) and Traits (dictionary passing/vtables) via reader-macro expanders.
 	- Opt-in pass pipeline gated by `EDN_ENABLE_PASSES` (disabled in golden tests).
 	- Closures (minimal): `(closure %dst (ptr <fn-type>) %fn [ %env ])` non-escaping single-capture; type checks (E143x) and emitter lowering to per-site thunk with private env global; test `phase4_closures_min_test.cpp` added.
+	- Panics (minimal): `(panic)` recognized by the checker (E1440 arity) and lowered to `llvm.trap` + `unreachable`; smoke and negative tests added.
