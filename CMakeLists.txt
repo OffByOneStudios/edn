@@ -14,6 +14,8 @@ endif()
 find_package(LLVM CONFIG REQUIRED)
 find_package(cxxopts CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
+find_package(taocpp-pegtl CONFIG QUIET)
+find_package(pegtl CONFIG QUIET)
 
 add_library(edn STATIC
     src/edn.cpp
@@ -55,6 +57,11 @@ if(TARGET fmt::fmt)
 endif()
 if(TARGET cxxopts::cxxopts)
     target_link_libraries(edn PUBLIC cxxopts::cxxopts)
+endif()
+if(TARGET taocpp::pegtl)
+    target_link_libraries(edn PUBLIC taocpp::pegtl)
+elseif(TARGET pegtl::pegtl)
+    target_link_libraries(edn PUBLIC pegtl::pegtl)
 endif()
 
 message(STATUS "Found LLVM 18: ${LLVM_PACKAGE_VERSION}")

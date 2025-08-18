@@ -8,6 +8,8 @@ namespace rustlite {
 
 static node_ptr make_sym(const std::string& s){ return std::make_shared<node>( node{ symbol{s}, {} } ); }
 static node_ptr make_kw(const std::string& s){ return std::make_shared<node>( node{ keyword{s}, {} } ); }
+static node_ptr make_i64(int64_t v){ return std::make_shared<node>( node{ v, {} } ); }
+static std::string gensym(const std::string& base){ static uint64_t n=0; return "%__rl_" + base + "_" + std::to_string(++n); }
 
 edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     Transformer tx;
@@ -94,6 +96,690 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         matchL.elems.push_back(make_kw("default"));
         { list dfl; dfl.elems.push_back(make_sym("default")); dfl.elems.push_back(make_kw("body")); dfl.elems.push_back(elseVec); matchL.elems.push_back(std::make_shared<node>( node{ dfl, {} } )); }
         return std::make_shared<node>( node{ matchL, form.elems.front()->metadata } );
+    });
+
+    // rif / relse: if/else sugar → core (if %cond [..then..] [..else..])
+    tx.add_macro("rif", [](const list& form)->std::optional<node_ptr>{
+        // (rif %cond :then [ ... ] :else [ ... ])
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr cond = el[1];
+        node_ptr thenVec=nullptr; node_ptr elseVec=nullptr;
+        for(size_t i=2;i+1<el.size(); i+=2){
+            if(!std::holds_alternative<keyword>(el[i]->data)) break;
+            auto kw = std::get<keyword>(el[i]->data).name; auto v = el[i+1];
+            if(kw=="then") thenVec=v; else if(kw=="else") elseVec=v;
+        }
+        if(!thenVec || !std::holds_alternative<vector_t>(thenVec->data)) return std::nullopt;
+        if(elseVec && !std::holds_alternative<vector_t>(elseVec->data)) return std::nullopt;
+        list ifL; ifL.elems.push_back(make_sym("if")); ifL.elems.push_back(cond); ifL.elems.push_back(thenVec); if(elseVec) ifL.elems.push_back(elseVec);
+        return std::make_shared<node>( node{ ifL, form.elems.front()->metadata } );
+    });
+    tx.add_macro("relse", [](const list& form)->std::optional<node_ptr>{
+        // Alias of rif (useful for else-if chains)
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr cond = el[1]; node_ptr thenVec=nullptr; node_ptr elseVec=nullptr;
+        for(size_t i=2;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="then") thenVec=v; else if(kw=="else") elseVec=v; }
+        if(!thenVec || !std::holds_alternative<vector_t>(thenVec->data)) return std::nullopt; if(elseVec && !std::holds_alternative<vector_t>(elseVec->data)) return std::nullopt;
+        list ifL; ifL.elems = { make_sym("if"), cond, thenVec }; if(elseVec) ifL.elems.push_back(elseVec);
+        return std::make_shared<node>( node{ ifL, form.elems.front()->metadata } );
+    });
+
+    // rwhile: (rwhile %cond :body [ ... ]) → (while %cond [ ... ])
+    tx.add_macro("rwhile", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr cond = el[1]; node_ptr bodyVec=nullptr;
+        for(size_t i=2;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="body") bodyVec=v; }
+        if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+        list whileL; whileL.elems = { make_sym("while"), cond, bodyVec };
+        return std::make_shared<node>( node{ whileL, form.elems.front()->metadata } );
+    });
+
+    // rbreak / rcontinue: thin aliases
+    tx.add_macro("rbreak", [](const list& form)->std::optional<node_ptr>{
+        list l; l.elems = { make_sym("break") }; return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rcontinue", [](const list& form)->std::optional<node_ptr>{
+        list l; l.elems = { make_sym("continue") }; return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rfor: (rfor :init [ ... ] :cond %c :step [ ... ] :body [ ... ]) → core for with same keywords
+    tx.add_macro("rfor", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr initV=nullptr, condN=nullptr, stepV=nullptr, bodyV=nullptr;
+        for(size_t i=1;i+1<el.size(); i+=2){
+            if(!std::holds_alternative<keyword>(el[i]->data)) break;
+            auto kw = std::get<keyword>(el[i]->data).name; auto v = el[i+1];
+            if(kw=="init") initV=v; else if(kw=="cond") condN=v; else if(kw=="step") stepV=v; else if(kw=="body") bodyV=v;
+        }
+        if(!initV || !std::holds_alternative<vector_t>(initV->data)) return std::nullopt;
+        if(!condN) return std::nullopt;
+        if(!stepV || !std::holds_alternative<vector_t>(stepV->data)) return std::nullopt;
+        if(!bodyV || !std::holds_alternative<vector_t>(bodyV->data)) return std::nullopt;
+        list forL; forL.elems = { make_sym("for"), make_kw("init"), initV, make_kw("cond"), condN, make_kw("step"), stepV, make_kw("body"), bodyV };
+        return std::make_shared<node>( node{ forL, form.elems.front()->metadata } );
+    });
+
+    // rloop: infinite loop sugar → (block :body [ (const %__rl_true i1 1) (while %__rl_true [ ... ]) ])
+    tx.add_macro("rloop", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<2) return std::nullopt;
+        node_ptr bodyVec=nullptr;
+        for(size_t i=1;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="body") bodyVec=v; }
+        if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+        vector_t outV;
+        // (const %__rl_true i1 1)
+        { list c; c.elems = { make_sym("const"), make_sym("%__rl_true"), make_sym("i1"), std::make_shared<node>( node{ (int64_t)1, {} } ) }; outV.elems.push_back(std::make_shared<node>( node{ c, {} } )); }
+        // (while %__rl_true [ ...body... ])
+        {
+            list whileL; whileL.elems.push_back(make_sym("while")); whileL.elems.push_back(make_sym("%__rl_true"));
+            // reuse provided body vector
+            whileL.elems.push_back(bodyVec);
+            outV.elems.push_back(std::make_shared<node>( node{ whileL, {} } ));
+        }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ outV, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+        // rwhile-let: (rwhile-let Sum Variant %sum :bind %x :body [ ... ])
+        // Lowers to: while(true) { match Sum %sum { Variant(x) => { body; :value 1 } default => { break; :value 0 } } }
+        tx.add_macro("rwhile-let", [](const list& form)->std::optional<node_ptr>{
+                auto& el = form.elems; if(el.size()<5) return std::nullopt;
+                if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // Sum type name as symbol
+                auto sumName = std::get<symbol>(el[1]->data).name;
+                if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto variantName = std::get<symbol>(el[2]->data).name;
+                node_ptr sumVal = el[3];
+                node_ptr bindVar=nullptr; node_ptr bodyVec=nullptr;
+                for(size_t i=4;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="bind") bindVar=v; else if(kw=="body") bodyVec=v; }
+                if(!bindVar || !bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+                // Build block { const %t i1 1; while %t [ match %m i1 Sum %sum ... ] }
+                vector_t outV;
+                auto tName = gensym("true");
+                { list c; c.elems = { make_sym("const"), make_sym(tName), make_sym("i1"), make_i64(1) }; outV.elems.push_back(std::make_shared<node>( node{ c, {} } )); }
+                // match inside while body
+                list matchL; matchL.elems = { make_sym("match"), make_sym(gensym("m")), make_sym("i1"), make_sym(sumName), sumVal };
+                matchL.elems.push_back(make_kw("cases"));
+                vector_t casesV;
+                {
+                        list caseL; caseL.elems = { make_sym("case"), make_sym(variantName), make_kw("binds") };
+                        vector_t bindsV; { list b; b.elems = { make_sym("bind"), bindVar, make_i64(0) }; bindsV.elems.push_back(std::make_shared<node>( node{ b, {} } )); }
+                        caseL.elems.push_back(std::make_shared<node>( node{ bindsV, {} } ));
+                        // body then :value 1
+                        caseL.elems.push_back(make_kw("body"));
+                        vector_t caseBody = std::get<vector_t>(bodyVec->data);
+                        // append a true value
+                        vector_t thenV;
+                        for(auto &e : caseBody.elems){ thenV.elems.push_back(e); }
+                        { list oneC; oneC.elems = { make_sym("const"), make_sym(gensym("one")), make_sym("i1"), make_i64(1) }; auto oneN = std::make_shared<node>( node{ oneC, {} } ); thenV.elems.push_back(oneN); auto oneSym = std::get<list>(oneN->data).elems[1]; thenV.elems.push_back(make_kw("value")); thenV.elems.push_back(oneSym); }
+                        caseL.elems.push_back(std::make_shared<node>( node{ thenV, {} } ));
+                        casesV.elems.push_back(std::make_shared<node>( node{ caseL, {} } ));
+                }
+                matchL.elems.push_back(std::make_shared<node>( node{ casesV, {} } ));
+                matchL.elems.push_back(make_kw("default"));
+                { list dfl; dfl.elems.push_back(make_sym("default"));
+                    vector_t dv;
+                    // break; :value 0
+                    { list br; br.elems = { make_sym("break") }; dv.elems.push_back(std::make_shared<node>( node{ br, {} } )); }
+                    { list zeroC; zeroC.elems = { make_sym("const"), make_sym(gensym("zero")), make_sym("i1"), make_i64(0) }; auto zN = std::make_shared<node>( node{ zeroC, {} } ); dv.elems.push_back(zN); auto zSym = std::get<list>(zN->data).elems[1]; dv.elems.push_back(make_kw("value")); dv.elems.push_back(zSym); }
+                    dfl.elems.push_back(make_kw("body")); dfl.elems.push_back(std::make_shared<node>( node{ dv, {} } ));
+                    matchL.elems.push_back(std::make_shared<node>( node{ dfl, {} } )); }
+                // while %t [ <match> ]
+                { list whileL; whileL.elems = { make_sym("while"), make_sym(tName), std::make_shared<node>( node{ vector_t{ { std::make_shared<node>( node{ matchL, {} } ) } }, {} } ) };
+                    outV.elems.push_back(std::make_shared<node>( node{ whileL, {} } )); }
+                list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ outV, {} } ) };
+                return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+        });
+
+    // rmatch: simplified arm syntax → core match with :value result-mode
+    // (rmatch %dst <ret-ty> SumType %ptr :arms [ (arm Variant :binds [ %a %b ] :body [ ... :value %v ]) ... ] :else [ ... :value %v ])
+    tx.add_macro("rmatch", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<6) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        node_ptr dst = el[1]; node_ptr retTy = el[2];
+        if(!std::holds_alternative<symbol>(el[3]->data)) return std::nullopt;
+        auto sumName = std::get<symbol>(el[3]->data).name;
+        node_ptr scrut = el[4];
+        node_ptr armsV=nullptr; node_ptr elseV=nullptr;
+        for(size_t i=5;i+1<el.size(); i+=2){
+            if(!std::holds_alternative<keyword>(el[i]->data)) break;
+            auto kw = std::get<keyword>(el[i]->data).name; auto v=el[i+1];
+            if(kw=="arms" || kw=="cases") armsV=v; else if(kw=="else" || kw=="default") elseV=v;
+        }
+        if(!armsV || !std::holds_alternative<vector_t>(armsV->data)) return std::nullopt;
+        if(!elseV || !std::holds_alternative<vector_t>(elseV->data)) return std::nullopt;
+        list matchL; matchL.elems = { make_sym("match"), dst, retTy, make_sym(sumName), scrut };
+        matchL.elems.push_back(make_kw("cases"));
+        vector_t outCases;
+        for(auto &armNode : std::get<vector_t>(armsV->data).elems){
+            if(!std::holds_alternative<list>(armNode->data)) return std::nullopt;
+            auto arm = std::get<list>(armNode->data);
+            if(arm.elems.empty() || !std::holds_alternative<symbol>(arm.elems[0]->data)) return std::nullopt;
+            auto head = std::get<symbol>(arm.elems[0]->data).name;
+            if(head=="case"){ // pass-through core case form
+                outCases.elems.push_back(armNode);
+                continue;
+            }
+            if(head!="arm") return std::nullopt;
+            if(arm.elems.size()<2 || !std::holds_alternative<symbol>(arm.elems[1]->data)) return std::nullopt;
+            auto variantName = std::get<symbol>(arm.elems[1]->data).name;
+            node_ptr bindsList=nullptr; node_ptr bodyVec=nullptr;
+            for(size_t i=2;i+1<arm.elems.size(); i+=2){
+                if(!std::holds_alternative<keyword>(arm.elems[i]->data)) break;
+                auto kw = std::get<keyword>(arm.elems[i]->data).name; auto v = arm.elems[i+1];
+                if(kw=="binds") bindsList=v; else if(kw=="body") bodyVec=v;
+            }
+            if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+            list caseL; caseL.elems = { make_sym("case"), make_sym(variantName) };
+            if(bindsList){
+                // If bindsList is a vector of symbols, expand to (bind %sym idx). If already (bind ...) forms, pass through.
+                if(!std::holds_alternative<vector_t>(bindsList->data)) return std::nullopt;
+                vector_t bindsOut;
+                size_t idx=0;
+                for(auto &bnode : std::get<vector_t>(bindsList->data).elems){
+                    if(std::holds_alternative<symbol>(bnode->data)){
+                        list b; b.elems = { make_sym("bind"), bnode, std::make_shared<node>( node{ (int64_t)idx, {} } ) };
+                        bindsOut.elems.push_back(std::make_shared<node>( node{ b, {} } ));
+                        ++idx;
+                    }else if(std::holds_alternative<list>(bnode->data)){
+                        // assume already (bind %x N)
+                        bindsOut.elems.push_back(bnode);
+                    }else{
+                        return std::nullopt;
+                    }
+                }
+                caseL.elems.push_back(make_kw("binds"));
+                caseL.elems.push_back(std::make_shared<node>( node{ bindsOut, {} } ));
+            }
+            caseL.elems.push_back(make_kw("body")); caseL.elems.push_back(bodyVec);
+            outCases.elems.push_back(std::make_shared<node>( node{ caseL, {} } ));
+        }
+        matchL.elems.push_back(std::make_shared<node>( node{ outCases, {} } ));
+        // default
+        list dfl; dfl.elems = { make_sym("default"), make_kw("body"), elseV };
+        matchL.elems.push_back(make_kw("default"));
+        matchL.elems.push_back(std::make_shared<node>( node{ dfl, {} } ));
+        return std::make_shared<node>( node{ matchL, form.elems.front()->metadata } );
+    });
+
+    // Sum/Option/Result constructors sugar
+    // (rsum %dst SumType Variant :vals [ ... ]) → (sum-new %dst SumType Variant [ ... ])
+    tx.add_macro("rsum", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto sumName=std::get<symbol>(el[2]->data).name;
+        if(!std::holds_alternative<symbol>(el[3]->data)) return std::nullopt; auto variant=std::get<symbol>(el[3]->data).name;
+        node_ptr vals=nullptr; for(size_t i=4;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; if(kw=="vals") vals=el[i+1]; }
+        if(!vals || !std::holds_alternative<vector_t>(vals->data)) return std::nullopt;
+        list l; l.elems = { make_sym("sum-new"), dst, make_sym(sumName), make_sym(variant), vals };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rnone: (rnone %dst SumType)
+    tx.add_macro("rnone", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto sumName=std::get<symbol>(el[2]->data).name;
+        vector_t empty; list l; l.elems = { make_sym("sum-new"), dst, make_sym(sumName), make_sym("None"), std::make_shared<node>( node{ empty, {} } ) };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rsome: (rsome %dst SumType %val)
+    tx.add_macro("rsome", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto sumName=std::get<symbol>(el[2]->data).name;
+        node_ptr val = el[3]; vector_t v; v.elems.push_back(val);
+        list l; l.elems = { make_sym("sum-new"), dst, make_sym(sumName), make_sym("Some"), std::make_shared<node>( node{ v, {} } ) };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rok / rerr for Result-like types
+    tx.add_macro("rok", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto sumName=std::get<symbol>(el[2]->data).name;
+        node_ptr val = el[3]; vector_t v; v.elems.push_back(val);
+        list l; l.elems = { make_sym("sum-new"), dst, make_sym(sumName), make_sym("Ok"), std::make_shared<node>( node{ v, {} } ) };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rerr", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; auto sumName=std::get<symbol>(el[2]->data).name;
+        node_ptr val = el[3]; vector_t v; v.elems.push_back(val);
+        list l; l.elems = { make_sym("sum-new"), dst, make_sym(sumName), make_sym("Err"), std::make_shared<node>( node{ v, {} } ) };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rclosure: (rclosure %dst callee :captures [ ... ]) → (make-closure %dst callee [ ... ])
+    tx.add_macro("rclosure", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        node_ptr callee = el[2];
+        node_ptr capV=nullptr;
+        for(size_t i=3;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="captures") capV=v; }
+        if(!capV || !std::holds_alternative<vector_t>(capV->data)) return std::nullopt;
+        list l; l.elems = { make_sym("make-closure"), dst, callee, capV };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rcall-closure: (rcall-closure %dst RetTy %clos arg1 ...) → (call-closure %dst RetTy %clos arg1 ...)
+    tx.add_macro("rcall-closure", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        node_ptr retTy = el[2]; node_ptr clos = el[3];
+        list out; out.elems = { make_sym("call-closure"), dst, retTy, clos };
+        for(size_t i=4;i<el.size(); ++i){ out.elems.push_back(el[i]); }
+        return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
+    });
+
+    // rstruct: (rstruct :name Name :fields [ (a TyA) (b TyB) ]) → core struct
+    tx.add_macro("rstruct", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr nameN=nullptr; node_ptr fieldsV=nullptr;
+        for(size_t i=1;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="name") nameN=v; else if(kw=="fields") fieldsV=v; }
+        if(!nameN || !fieldsV || !std::holds_alternative<vector_t>(fieldsV->data)) return std::nullopt;
+        vector_t outFields;
+        for(auto &fld : std::get<vector_t>(fieldsV->data).elems){
+            if(std::holds_alternative<list>(fld->data)){
+                auto l = std::get<list>(fld->data);
+                if(l.elems.size()<2 || !std::holds_alternative<symbol>(l.elems[0]->data)) return std::nullopt;
+                list f; f.elems = { make_sym("field"), make_kw("name"), l.elems[0], make_kw("type"), l.elems[1] };
+                outFields.elems.push_back(std::make_shared<node>( node{ f, {} } ));
+            }else if(std::holds_alternative<symbol>(fld->data)){
+                // Bare symbol field name implies i32 by default (convention); better to require type.
+                return std::nullopt;
+            }else{
+                return std::nullopt;
+            }
+        }
+        list s; s.elems = { make_sym("struct"), make_kw("name"), nameN, make_kw("fields"), std::make_shared<node>( node{ outFields, {} } ) };
+        return std::make_shared<node>( node{ s, form.elems.front()->metadata } );
+    });
+
+    // renum (sum type): (renum :name Name :variants [ (None) (Some Ty) ... ]) → core sum/variant
+    tx.add_macro("renum", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr nameN=nullptr; node_ptr variantsV=nullptr;
+        for(size_t i=1;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="name") nameN=v; else if(kw=="variants") variantsV=v; }
+        if(!nameN || !variantsV || !std::holds_alternative<vector_t>(variantsV->data)) return std::nullopt;
+        vector_t outVars;
+        for(auto &vn : std::get<vector_t>(variantsV->data).elems){
+            if(std::holds_alternative<symbol>(vn->data)){
+                list v; v.elems = { make_sym("variant"), make_kw("name"), vn, make_kw("fields"), std::make_shared<node>( node{ vector_t{}, {} } ) };
+                outVars.elems.push_back(std::make_shared<node>( node{ v, {} } ));
+            }else if(std::holds_alternative<list>(vn->data)){
+                auto vl = std::get<list>(vn->data);
+                if(vl.elems.empty() || !std::holds_alternative<symbol>(vl.elems[0]->data)) return std::nullopt;
+                vector_t fields;
+                for(size_t i=1;i<vl.elems.size(); ++i){ fields.elems.push_back(vl.elems[i]); }
+                list v; v.elems = { make_sym("variant"), make_kw("name"), vl.elems[0], make_kw("fields"), std::make_shared<node>( node{ fields, {} } ) };
+                outVars.elems.push_back(std::make_shared<node>( node{ v, {} } ));
+            }else{
+                return std::nullopt;
+            }
+        }
+        list s; s.elems = { make_sym("sum"), make_kw("name"), nameN, make_kw("variants"), std::make_shared<node>( node{ outVars, {} } ) };
+        return std::make_shared<node>( node{ s, form.elems.front()->metadata } );
+    });
+
+    // rtypedef: alias to core typedef
+    tx.add_macro("rtypedef", [](const list& form)->std::optional<node_ptr>{
+        auto l = form; if(l.elems.empty()) return std::nullopt; l.elems[0] = make_sym("typedef");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rfn: Lightweight alias for core fn, keeping keyword args. Just replace head symbol.
+    tx.add_macro("rfn", [](const list& form)->std::optional<node_ptr>{
+        auto l = form; if(l.elems.empty()) return std::nullopt; l.elems[0] = make_sym("fn");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rextern-fn: core fn with :external true, preserving other keywords.
+    tx.add_macro("rextern-fn", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<2) return std::nullopt;
+        list out; out.elems.push_back(make_sym("fn"));
+        bool hasExternal=false;
+        for(size_t i=1;i<el.size(); ++i){
+            out.elems.push_back(el[i]);
+            if(std::holds_alternative<keyword>(el[i]->data) && std::get<keyword>(el[i]->data).name=="external"){
+                hasExternal=true;
+            }
+        }
+        if(!hasExternal){ out.elems.push_back(make_kw("external")); out.elems.push_back(std::make_shared<node>( node{ true, {} } )); }
+        return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
+    });
+    // rcall: positional sugar → core call
+    // (rcall %dst RetTy callee arg1 arg2 ...) or (rcall %dst RetTy callee [ args... ])
+    tx.add_macro("rcall", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        node_ptr retTy = el[2]; node_ptr callee = el[3];
+        list out; out.elems = { make_sym("call"), dst, retTy, callee };
+        if(el.size()>=5){
+            if(std::holds_alternative<vector_t>(el[4]->data)){
+                for(auto &a : std::get<vector_t>(el[4]->data).elems){ out.elems.push_back(a); }
+            }else{
+                for(size_t i=4;i<el.size(); ++i){ out.elems.push_back(el[i]); }
+            }
+        }
+        return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
+    });
+
+    // rand / ror: short-circuit boolean ops using rif. Form: (rand %dst %a %b)
+    // Avoid redefining %dst by declaring it once with 'as' and using 'assign' in branches.
+    tx.add_macro("rand", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()!=4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        node_ptr a = el[2]; node_ptr b = el[3];
+        // Build: (block :body [ (const %f i1 0) (as %dst i1 %f) (rif %a :then [ (assign %dst %b) ] :else [ (assign %dst %f) ]) ])
+        vector_t body;
+        {
+            list c; c.elems = { make_sym("const"), make_sym(gensym("f")), make_sym("i1"), make_i64(0) };
+            auto cnode = std::make_shared<node>( node{ c, {} } ); body.elems.push_back(cnode);
+            // Reference the const symbol we just made (second elem of const list)
+            auto fSym = std::get<list>(cnode->data).elems[1];
+            // Declare destination once, then branch-assign
+            { list asL; asL.elems = { make_sym("as"), dst, make_sym("i1"), fSym }; body.elems.push_back(std::make_shared<node>( node{ asL, {} } )); }
+            vector_t thenV; { list asg; asg.elems = { make_sym("assign"), dst, b }; thenV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
+            vector_t elseV; { list asg; asg.elems = { make_sym("assign"), dst, fSym }; elseV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
+            list rifL; rifL.elems = { make_sym("rif"), a, make_kw("then"), std::make_shared<node>( node{ thenV, {} } ), make_kw("else"), std::make_shared<node>( node{ elseV, {} } ) };
+            body.elems.push_back(std::make_shared<node>( node{ rifL, {} } ));
+        }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    tx.add_macro("ror", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()!=4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
+        node_ptr a = el[2]; node_ptr b = el[3];
+        // (block :body [ (const %t i1 1) (as %dst i1 %b) (rif %a :then [ (assign %dst %t) ] :else [ (assign %dst %b) ]) ])
+        vector_t body;
+        {
+            list c; c.elems = { make_sym("const"), make_sym(gensym("t")), make_sym("i1"), make_i64(1) };
+            auto cnode = std::make_shared<node>( node{ c, {} } ); body.elems.push_back(cnode);
+            auto tSym = std::get<list>(cnode->data).elems[1];
+            // Declare destination once (initialize to 'b' so else branch can be no-op if desired)
+            { list asL; asL.elems = { make_sym("as"), dst, make_sym("i1"), b }; body.elems.push_back(std::make_shared<node>( node{ asL, {} } )); }
+            vector_t thenV; { list asg; asg.elems = { make_sym("assign"), dst, tSym }; thenV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
+            vector_t elseV; { list asg; asg.elems = { make_sym("assign"), dst, b }; elseV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
+            list rifL; rifL.elems = { make_sym("rif"), a, make_kw("then"), std::make_shared<node>( node{ thenV, {} } ), make_kw("else"), std::make_shared<node>( node{ elseV, {} } ) };
+            body.elems.push_back(std::make_shared<node>( node{ rifL, {} } ));
+        }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // rassign: simple alias for core assign
+    tx.add_macro("rassign", [](const list& form)->std::optional<node_ptr>{
+        auto l = form; if(l.elems.size()!=3) return std::nullopt; l.elems[0] = make_sym("assign");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rret: alias for core ret
+    tx.add_macro("rret", [](const list& form)->std::optional<node_ptr>{
+        auto l = form; if(l.elems.size()!=3) return std::nullopt; l.elems[0] = make_sym("ret");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rpanic: alias to core panic (no operands)
+    tx.add_macro("rpanic", [](const list& form)->std::optional<node_ptr>{
+        auto l = form; if(l.elems.size()!=1) return std::nullopt; l.elems[0] = make_sym("panic");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // rassert: (rassert %cond) -> (if %cond [ ] [ (panic) ])
+    tx.add_macro("rassert", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()!=2) return std::nullopt; node_ptr cond = el[1];
+        // then branch: empty vector; else branch: [ (panic) ]
+        vector_t thenV; vector_t elseV; { list p; p.elems = { make_sym("panic") }; elseV.elems.push_back(std::make_shared<node>( node{ p, {} } )); }
+        list ifL; ifL.elems = { make_sym("if"), cond,
+            std::make_shared<node>( node{ thenV, {} } ),
+            std::make_shared<node>( node{ elseV, {} } ) };
+        return std::make_shared<node>( node{ ifL, form.elems.front()->metadata } );
+    });
+
+    // rassert-eq: (rassert-eq %a %b) -> { %t = (eq i1 %a %b); (rassert %t) }
+    tx.add_macro("rassert-eq", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body;
+        auto t = make_sym(gensym("cmp"));
+        { list cmp; cmp.elems = { make_sym("eq"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems = { make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    // rassert-ne: (rassert-ne %a %b) -> { %t = (ne i1 %a %b); (rassert %t) }
+    tx.add_macro("rassert-ne", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body;
+        auto t = make_sym(gensym("cmp"));
+        { list cmp; cmp.elems = { make_sym("ne"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems = { make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    // rassert-lt/le/gt/ge: compare producing i1 then rassert
+    tx.add_macro("rassert-lt", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body; auto t=make_sym(gensym("cmp"));
+        { list cmp; cmp.elems={ make_sym("lt"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems={ make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems={ make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rassert-le", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body; auto t=make_sym(gensym("cmp"));
+        { list cmp; cmp.elems={ make_sym("le"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems={ make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems={ make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rassert-gt", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body; auto t=make_sym(gensym("cmp"));
+        { list cmp; cmp.elems={ make_sym("gt"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems={ make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems={ make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rassert-ge", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=3) return std::nullopt; node_ptr a=el[1], b=el[2];
+        vector_t body; auto t=make_sym(gensym("cmp"));
+        { list cmp; cmp.elems={ make_sym("ge"), t, make_sym("i1"), a, b }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+        { list asrt; asrt.elems={ make_sym("rassert"), t }; body.elems.push_back(std::make_shared<node>( node{ asrt, {} } )); }
+        list blockL; blockL.elems={ make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // Traits sugar (thin aliases)
+    tx.add_macro("rtrait", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.empty()) return std::nullopt; l.elems[0]=make_sym("trait");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rfnptr", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()<3) return std::nullopt; l.elems[0]=make_sym("fnptr");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rmake-trait-obj", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()<5) return std::nullopt; l.elems[0]=make_sym("make-trait-obj");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rtrait-call", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()<6) return std::nullopt; l.elems[0]=make_sym("trait-call");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rimpl: populate a trait vtable with method implementations
+    // Forms supported:
+    //   (rimpl Trait %vt :methods [ (method :name foo :type (ptr (fn-type ...)) :impl foo_impl) ... ])
+    // Lowers to a block containing, per method:
+    //   (fnptr %fp <type> <impl>)
+    //   (member-addr %fld TraitVT %vt <name>)
+    //   (store <type> %fld %fp)
+    tx.add_macro("rimpl", [](const list& form)->std::optional<node_ptr>{
+        auto& el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // Trait
+        std::string trait = std::get<symbol>(el[1]->data).name;
+        node_ptr vt = el[2];
+        node_ptr methodsV = nullptr;
+        // parse keywords starting at i=3
+        for(size_t i=3;i+1<el.size(); i+=2){
+            if(!std::holds_alternative<keyword>(el[i]->data)) break;
+            auto kw = std::get<keyword>(el[i]->data).name;
+            auto v = el[i+1];
+            if(kw=="methods") methodsV = v;
+        }
+        if(!methodsV || !std::holds_alternative<vector_t>(methodsV->data)) return std::nullopt;
+        vector_t body;
+        for(auto &mn : std::get<vector_t>(methodsV->data).elems){
+            if(!mn || !std::holds_alternative<list>(mn->data)) return std::nullopt;
+            auto ml = std::get<list>(mn->data);
+            if(ml.elems.empty() || !std::holds_alternative<symbol>(ml.elems[0]->data) || std::get<symbol>(ml.elems[0]->data).name!="method") return std::nullopt;
+            node_ptr nameN=nullptr, typeN=nullptr, implN=nullptr;
+            for(size_t i=1;i+1<ml.elems.size(); i+=2){
+                if(!std::holds_alternative<keyword>(ml.elems[i]->data)) break;
+                auto kw = std::get<keyword>(ml.elems[i]->data).name;
+                auto v = ml.elems[i+1];
+                if(kw=="name") nameN=v; else if(kw=="type") typeN=v; else if(kw=="impl") implN=v;
+            }
+            if(!nameN || !typeN || !implN) return std::nullopt;
+            // %fp
+            auto fp = make_sym(gensym("fp"));
+            list fnptrL; fnptrL.elems = { make_sym("fnptr"), fp, typeN, implN };
+            body.elems.push_back(std::make_shared<node>( node{ fnptrL, {} } ));
+            // %fld = member-addr TraitVT %vt name
+            auto fld = make_sym(gensym("fld"));
+            list memL; memL.elems = { make_sym("member-addr"), fld, make_sym(trait+"VT"), vt, nameN };
+            body.elems.push_back(std::make_shared<node>( node{ memL, {} } ));
+            // store type %fld %fp
+            list stL; stL.elems = { make_sym("store"), typeN, fld, fp };
+            body.elems.push_back(std::make_shared<node>( node{ stL, {} } ));
+        }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // rmethod: thin alias for trait-call
+    // (rmethod %dst RetTy Trait %obj method args...) → (trait-call %dst RetTy Trait %obj method args...)
+    tx.add_macro("rmethod", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()<6) return std::nullopt; l.elems[0]=make_sym("trait-call");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // rdot: method-call sugar
+    // Forms:
+    //   Trait dispatch: (rdot %dst RetTy Trait %obj method arg1 arg2 ...) -> (trait-call %dst RetTy Trait %obj method arg1 arg2 ...)
+    //   Trait dot-path: (rdot %dst RetTy Trait.method %obj arg1 arg2 ...) -> split, same lowering as trait-call
+    //   Free fn with receiver: (rdot %dst RetTy callee %obj arg1 arg2 ...) -> (call %dst RetTy callee %obj arg1 arg2 ...)
+    tx.add_macro("rdot", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()<6) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        node_ptr dst=el[1]; node_ptr retTy=el[2];
+        // Dot-path trait form: (rdot %dst RetTy Trait.method %obj ...)
+        if(std::holds_alternative<symbol>(el[3]->data)){
+            auto s = std::get<symbol>(el[3]->data).name;
+            auto dot = s.rfind('.');
+            if(dot!=std::string::npos && el.size()>=5){
+                auto traitName = s.substr(0, dot);
+                auto methodName = s.substr(dot+1);
+                list l; l.elems = { make_sym("trait-call"), dst, retTy, make_sym(traitName), el[4], make_sym(methodName) };
+                for(size_t i=5;i<el.size(); ++i){ l.elems.push_back(el[i]); }
+                return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+            }
+        }
+        // Decide trait vs free-fn by arity and argument kinds. If we have at least 7 elements, assume trait form.
+        if(el.size()>=7){
+            // Trait, %obj, method, args...
+            list l; l.elems = { make_sym("trait-call"), dst, retTy, el[3], el[4], el[5] };
+            for(size_t i=6;i<el.size(); ++i){ l.elems.push_back(el[i]); }
+            return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+        }
+        // Free function with receiver: callee, %obj, args...
+        list l; l.elems = { make_sym("call"), dst, retTy, el[3], el[4] };
+        for(size_t i=5;i<el.size(); ++i){ l.elems.push_back(el[i]); }
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // Struct field sugar
+    // rget: (rget %dst Struct %base %field) -> (member %dst Struct %base %field)
+    tx.add_macro("rget", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data) ||
+           !std::holds_alternative<symbol>(el[2]->data) ||
+           !std::holds_alternative<symbol>(el[3]->data) ||
+           !std::holds_alternative<symbol>(el[4]->data)) return std::nullopt;
+        list m; m.elems = { make_sym("member"), el[1], el[2], el[3], el[4] };
+        return std::make_shared<node>( node{ m, form.elems.front()->metadata } );
+    });
+    // rset: (rset <FieldType> Struct %base %field %value)
+    // Lowers to block:
+    //   (member-addr %addr Struct %base %field)
+    //   (store <FieldType> %addr %value)
+    tx.add_macro("rset", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=6) return std::nullopt;
+        node_ptr fieldTy = el[1];
+        if(!std::holds_alternative<symbol>(el[2]->data) ||
+           !std::holds_alternative<symbol>(el[3]->data) ||
+           !std::holds_alternative<symbol>(el[4]->data)) return std::nullopt;
+        node_ptr st = el[2]; node_ptr base=el[3]; node_ptr fld=el[4]; node_ptr val=el[5];
+        vector_t body;
+        auto addr = make_sym(gensym("fldaddr"));
+        { list ma; ma.elems = { make_sym("member-addr"), addr, st, base, fld }; body.elems.push_back(std::make_shared<node>( node{ ma, {} } )); }
+        { list stl; stl.elems = { make_sym("store"), fieldTy, addr, val }; body.elems.push_back(std::make_shared<node>( node{ stl, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // Array indexing sugar
+    // rindex-addr: (rindex-addr %dst <ElemType> %base %idx) -> (index %dst <ElemType> %base %idx)
+    tx.add_macro("rindex-addr", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        list ix; ix.elems = { make_sym("index"), el[1], el[2], el[3], el[4] };
+        return std::make_shared<node>( node{ ix, form.elems.front()->metadata } );
+    });
+    // rindex: (rindex %dst <ElemType> %base %idx)
+    // Lowers to block:
+    //   (index %p <ElemType> %base %idx)
+    //   (load %dst <ElemType> %p)
+    tx.add_macro("rindex", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        node_ptr dst=el[1], elemTy=el[2], base=el[3], idx=el[4];
+        vector_t body; auto p = make_sym(gensym("elem"));
+        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
+        { list ld; ld.elems = { make_sym("load"), dst, elemTy, p }; body.elems.push_back(std::make_shared<node>( node{ ld, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // rindex-load: (rindex-load %dst <ElemType> %base %idx) -> index + load
+    tx.add_macro("rindex-load", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt;
+        node_ptr dst=el[1], elemTy=el[2], base=el[3], idx=el[4];
+        vector_t body; auto p = make_sym(gensym("elem"));
+        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
+        { list ld; ld.elems = { make_sym("load"), dst, elemTy, p }; body.elems.push_back(std::make_shared<node>( node{ ld, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // rindex-store: (rindex-store <ElemType> %base %idx %val)
+    // Lowers to block:
+    //   (index %p <ElemType> %base %idx)
+    //   (store <ElemType> %p %val)
+    tx.add_macro("rindex-store", [](const list& form)->std::optional<node_ptr>{
+        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
+        node_ptr elemTy=el[1], base=el[2], idx=el[3], val=el[4];
+        vector_t body; auto p = make_sym(gensym("elemaddr"));
+        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
+        { list st; st.elems = { make_sym("store"), elemTy, p, val }; body.elems.push_back(std::make_shared<node>( node{ st, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // Simple aliases for addr/deref
+    tx.add_macro("raddr", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()!=4) return std::nullopt; l.elems[0]=make_sym("addr");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rderef", [](const list& form)->std::optional<node_ptr>{
+        auto l=form; if(l.elems.size()!=4) return std::nullopt; l.elems[0]=make_sym("deref");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
     });
 
     return tx.expand(module_ast);

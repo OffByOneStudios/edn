@@ -27,6 +27,9 @@ public:
     // Define a sum type (enum)
     Builder& sum_enum(const std::string& name, const std::vector<std::pair<std::string,std::vector<std::string>>>& variants);
 
+    // Define a struct type via rustlite macro rstruct
+    Builder& rstruct(const std::string& name, const std::vector<std::pair<std::string,std::string>>& fields);
+
     // Define a function with a body of raw EDN instructions (already using macro shapes where needed)
     Builder& fn_raw(const std::string& name, const std::string& ret_type, const std::vector<std::pair<std::string,std::string>>& params, const std::string& body_ir_vec);
 

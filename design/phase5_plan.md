@@ -1,6 +1,7 @@
 # Phase 5 Plan — Language Prototypes toward the Modern Language Support North Star
 
-Status: Draft (2025-08-17) — Rustlite prototype bootstrapped; see `design/rustlite.md`.
+Status: In progress (2025-08-17) — Rustlite subset mostly complete; see `design/rustlite.md`.
+Update (2025-08-17): Rustlite macros and demos expanded (control flow, ADTs/match, traits sugar, assertions, field/index/pointer sugar, while‑let, and rdot including dot‑path). Full Rustlite driver suite runs green on Windows; IR shape checks cover ADTs, trait calls, generics, extern calls, and panic models.
 
 North Star (from modern_language_support_roadmap.md): EDN is a compact, deterministic S‑expression IR and toolchain enabling modern language front‑ends (Python, TypeScript, Rust, Zig) via the right semantic primitives, ABIs, and runtime integration points.
 
@@ -48,6 +49,30 @@ Deliverables:
 
 Notes:
 - A minimal Rustlite front-end exists under `languages/rustlite/` with macros for `rlet`, `rmut`, and `rif-let`; the demo driver verifies PHI correctness for result-mode match. Details in `design/rustlite.md`.
+
+Progress snapshot (2025-08-17)
+- Implemented macros (selected): locals and control (`rlet`, `rmut`, `rif/relse`, `rwhile`, `rfor`, `rloop`, `rbreak`, `rcontinue`), ADTs/match (`rmatch`, `rsum/rsome/rnone/rok/rerr`, `rif-let`, `rwhile-let`), functions/interop (`rfn`, `rextern-fn`, `rcall`), closures (`rclosure`, `rcall-closure`), traits sugar (`rtrait`, `rimpl`, `rmethod`, `rfnptr`, `rmake-trait-obj`, `rtrait-call`, `rdot` including `Trait.method` dot‑path), error handling (`rpanic`, `rassert`, `rassert-eq/ne/lt/le/gt/ge`), data and access sugar (`rstruct`, `renum`, `rtypedef`, `rget`, `rset`, `rindex-addr`, `rindex`, `rindex-store`, `rindex-load`, `raddr`, `rderef`). Short‑circuit logic `rand`/`ror` implemented SSA‑safely.
+- Demos/tests: comprehensive `rustlite_driver` now green; focused drivers `rustlite_minidriver`/`rustlite_negdriver` (field/index/pointer sugar), `rustlite_traitdriver` (trait‑object IR shape), `rustlite_genericsdriver` (mono demo), `rustlite_externdriver` (extern C call), `rustlite_panicdriver` (abort/unwind), `rustlite_logicdriver` (rand/ror), `rustlite_rwhilelet_driver` (while‑let), and `rustlite_rdot_{driver,negdriver}` (method‑call sugar). All pass on Windows.
+- Tooling: macros registered in the Rustlite expander; CMake targets and CTest wiring in place with positive/negative coverage and environment‑driven EH toggles.
+
+Progress: ~90% of Rust‑like subset deliverables complete.
+
+Coverage vs deliverables
+- Option/Result and enum match: Covered via `rsum` helpers and `rmatch`/`rif-let`; validated in drivers (PHI validation present).
+- Trait + trait-object call: Implemented via `rustlite_traitdriver` with golden IR shape checks.
+- Generic function (monomorphized, 2+ instantiations): Implemented via `rustlite_genericsdriver` with IR assertions for two specialized functions and direct calls.
+- C interop smoke (extern "C" call): Implemented via `rustlite_externdriver` with IR checks for external declaration and a direct call.
+- Panic model (abort|unwind) verification: Implemented via `rustlite_panicdriver` with tests that assert abort mode (`llvm.trap`/`unreachable`) and unwind mode (platform personality and `RaiseException`/`__cxa_throw`).
+
+Next actions (ordered, small and verifiable)
+1) Interop helpers: add `rextern-global`/`rextern-const` sugar over core `(global ...)`, `gload`, `gstore`; negative test for `gstore` to const (expect E1226).
+2) Literal helpers: `rcstr` (NUL‑terminated i8 array returning `(ptr i8)`) and `rbytes` (i8 array; optionally return pointer and length), with IR checks and a small extern consumer.
+3) ABI docs touch‑ups: confirm and document vtable layout and sum tagging used by Rustlite demos in `design/abi.md`.
+4) Optional: a tiny try/catch EH demo (if keeping unwind model around) to complement `rpanic` tests.
+5) CI: add an Itanium triple cross‑compile smoke for the Rustlite suite to validate non‑SEH EH paths.
+
+Exit for 4.1 after next actions
+- All 4.1 deliverables have concrete demos/tests; IR shape checks cover ADT layout and vtable call shapes on Windows; Itanium cross‑compile smoke added; interop/literal helpers in place. At that point we’re ready to invest in a real Rust frontend on top of the stable macro surface.
 
 Acceptance:
 - Examples compile and run, returning expected values.

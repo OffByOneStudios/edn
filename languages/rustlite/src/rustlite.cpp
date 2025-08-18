@@ -13,4 +13,9 @@ Builder& Builder::fn_raw(const std::string& name, const std::string& ret_type, c
     edn_ += os.str(); return *this;
 }
 
+Builder& Builder::rstruct(const std::string& name, const std::vector<std::pair<std::string,std::string>>& fields){
+    std::ostringstream os; os << "(rstruct :name \"" << name << "\" :fields [ "; bool first=true; for(auto &f : fields){ if(!first) os << ' '; first=false; os << "(" << f.first << ' ' << f.second << ")"; } os << " ]) ";
+    edn_ += os.str(); return *this;
+}
+
 } // namespace rustlite

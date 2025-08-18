@@ -6,6 +6,7 @@ void run_phase5_debug_info_preserve_test();
 void run_phase5_pipeline_override_test();
 void run_phase5_pipeline_fallback_test();
 void run_phase5_verify_ir_test();
+void run_phase5_pegtl_smoke_test();
 
 int main(){
     try{
@@ -18,6 +19,8 @@ int main(){
     run_phase5_debug_info_preserve_test();
     // Verify IR hook
     run_phase5_verify_ir_test();
+    // PEGTL smoke
+    run_phase5_pegtl_smoke_test();
     }catch(const std::exception& e){ std::cerr << "[phase5] exception: " << e.what() << "\n"; return 1; }
     return 0;
 }

@@ -16,37 +16,46 @@ int main(int argc, char** argv){
 
     std::cout << "[rustlite] building demo...\n";
     Builder b;
-    b.begin_module()
-     .sum_enum("OptionI32", { {"None", {}}, {"Some", {"i32"}} })
-     .fn_raw("use_option", "i32",
+    b.begin_module();
+    b.sum_enum("OptionI32", { {"None", {}}, {"Some", {"i32"}} });
+    b.sum_enum("ResultI32", { {"Ok", {"i32"}}, {"Err", {"i32"}} });
+    // Helper functions for calls/closures
+    b.fn_raw("adder", "i32", { {"env","i32"}, {"x","i32"} }, "[ (add %r i32 %env %x) (ret i32 %r) ]");
+    b.fn_raw("id64", "i64", { {"x","i64"} }, "[ (ret i64 %x) ]");
+    // Demos
+    b.fn_raw("use_option", "i32",
         { {"p", "(ptr (struct-ref OptionI32))"} },
-        // This body uses the built-in `match` form provided by EDN core.
-        "[ (match %ret i32 OptionI32 %p :cases [ (case None :body [ (const %z i32 0) :value %z ]) (case Some :binds [ (bind %x 0) ] :body [ :value %x ]) ] ) (ret i32 %ret) ]")
-      .fn_raw("use_option_rif", "i32",
-          { {"p", "(ptr (struct-ref OptionI32))"} },
-          // rif-let result-mode: binds Some(x) to %x -> returns x, else 0
-          "[ (rif-let %ret i32 OptionI32 Some %p :bind %x :then [ :value %x ] :else [ (const %z i32 0) :value %z ]) (ret i32 %ret) ]")
-     .fn_raw("let_demo", "i32",
-         { },
-         // rlet: declare %a: i32, initialized from %init, then return it outside the block
-         "[ (const %init i32 41) (rlet i32 %a %init :body [ ]) (ret i32 %a) ]")
-     .fn_raw("mut_demo", "i32",
-         { },
-         // rmut: declare %b: i32, initialized from %init, then mutate and return outside the block
-         "[ (const %init i32 1) (rmut i32 %b %init :body [ (const %one i32 1) (add %tmp i32 %b %one) (assign %b %tmp) ]) (ret i32 %b) ]")
-     .end_module();
+        "[ (match %ret i32 OptionI32 %p :cases [ (case None :body [ (const %z i32 0) :value %z ]) (case Some :binds [ (bind %x 0) ] :body [ :value %x ]) ] ) (ret i32 %ret) ]");
+    b.fn_raw("use_option_rif", "i32",
+        { {"p", "(ptr (struct-ref OptionI32))"} },
+        "[ (rif-let %ret i32 OptionI32 Some %p :bind %x :then [ :value %x ] :else [ (const %z i32 0) :value %z ]) (ret i32 %ret) ]");
+    b.fn_raw("let_demo", "i32", {}, "[ (const %init i32 41) (rlet i32 %a %init :body [ ]) (ret i32 %a) ]");
+    b.fn_raw("mut_demo", "i32", {}, "[ (const %init i32 1) (rmut i32 %b %init :body [ (const %one i32 1) (add %tmp i32 %b %one) (assign %b %tmp) ]) (ret i32 %b) ]");
+    b.fn_raw("if_demo", "i32", {}, "[ (const %one i32 1) (const %zero i32 0) (lt %c i32 %zero %one) (rif %c :then [ (ret i32 %one) ] :else [ (ret i32 %zero) ]) (ret i32 %one) ]");
+    b.fn_raw("while_demo", "i32", {}, "[ (alloca %p i32) (const %one i32 1) (store i32 %p %one) (const %t i1 1) (rwhile %t :body [ (break) ]) (load %v i32 %p) (ret i32 %v) ]");
+    b.fn_raw("for_demo", "i32", {}, "[ (rfor :init [ (const %cond i1 0) ] :cond %cond :step [ ] :body [ (continue) (break) ]) (const %z i32 2) (ret i32 %z) ]");
+    b.fn_raw("match_demo", "i32", {}, "[ (const %seven i32 7) (rsome %opt OptionI32 %seven) (rmatch %r i32 OptionI32 %opt :arms [ (arm Some :binds [ %x ] :body [ :value %x ]) ] :else [ (const %z i32 0) :value %z ]) (const %one i32 1) (rerr %res ResultI32 %one) (rmatch %r2 i32 ResultI32 %res :arms [ (arm Ok :binds [ %v ] :body [ :value %v ]) ] :else [ (const %z2 i32 0) :value %z2 ]) (ret i32 %r) ]");
+    b.fn_raw("call_demo", "i32", {}, "[ (const %sz i64 16) (rcall %r i64 id64 %sz) (const %zero i32 0) (ret i32 %zero) ]");
+    b.fn_raw("closure_demo", "i32", {}, "[ (const %ten i32 10) (const %five i32 5) (rclosure %c adder :captures [ %ten ]) (rcall-closure %res i32 %c %five) (ret i32 %res) ]");
+    b.fn_raw("types_demo", "i32", {}, "[ (const %z i32 0) (rret i32 %z) ]");
+    b.fn_raw("assign_demo", "i32", {}, "[ (const %init i32 2) (rmut i32 %x %init :body [ (const %one i32 1) (add %t i32 %x %one) (rassign %x %t) ]) (ret i32 %x) ]");
+    b.fn_raw("sc_demo", "i1", {}, "[ (const %t i1 1) (const %f i1 0) (rand %a %t %f) (ror %o %f %t) (ret i1 %a) ]");
+    b.fn_raw("assert_demo", "i32", {}, "[ (const %one i32 1) (const %zero i32 0) (gt %c i32 %one %zero) (rassert %c) (const %ans i32 42) (ret i32 %ans) ]");
+    b.fn_raw("assert2_demo", "i32", {}, "[ (const %t i1 1) (const %f i1 0) (rassert-eq %t %t) (rassert-ne %t %f) (const %ans i32 7) (ret i32 %ans) ]");
+    b.end_module();
 
     auto prog = b.build();
     auto ast = parse(prog.edn_text);
 
-    // Expand any shared macros (e.g., traits) if present; for now, sums/match are core, so expansion is identity.
-    auto expanded = rustlite::expand_rustlite(expand_traits(ast));
+    // Expand Rustlite surface first, then trait machinery
+    auto expanded = expand_traits(rustlite::expand_rustlite(ast));
 
     TypeContext tctx;
     TypeChecker tc(tctx);
     auto tcres = tc.check_module(expanded);
     if(!tcres.success){
         std::cerr << "[rustlite] type check failed\n";
+    std::cerr << "\n=== Generated EDN (pre-expand) ===\n" << prog.edn_text << "\n";
         for(const auto& e : tcres.errors){
             std::cerr << e.code << ": " << e.message << "\n";
             for(const auto& n : e.notes){ std::cerr << "  note: " << n.message << "\n"; }
