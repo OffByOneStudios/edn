@@ -354,6 +354,13 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		auto emit_list = [&](const std::vector<node_ptr>& insts, auto&& emit_ref) -> void {
 			if(functionDone) return; for(auto &inst: insts){ if(functionDone) break; if(!inst||!std::holds_alternative<list>(inst->data)) continue; auto &il=std::get<list>(inst->data).elems; if(il.empty()) continue; if(!std::holds_alternative<symbol>(il[0]->data)) continue; std::string op=std::get<symbol>(il[0]->data).name;
 				auto getVal=[&](const node_ptr& n)->llvm::Value*{ std::string nm=trimPct(symName(n)); if(nm.empty()) return nullptr; auto it=vmap.find(nm); return (it!=vmap.end())?it->second:nullptr; };
+				if(op=="block"){ // (block :locals [ ... ] :body [ ... ])
+					node_ptr bodyNode=nullptr;
+					for(size_t i=1;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i]; if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)) bodyNode=val; } }
+					if(bodyNode && std::holds_alternative<vector_t>(bodyNode->data)){
+						emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
+					}
+				}
 				if(op=="const" && il.size()==4){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } llvm::Type* lty=map_type(ty); llvm::Value* cv=nullptr; if(std::holds_alternative<int64_t>(il[3]->data)) cv=llvm::ConstantInt::get(lty,(uint64_t)std::get<int64_t>(il[3]->data),true); else if(std::holds_alternative<double>(il[3]->data)) cv=llvm::ConstantFP::get(lty,std::get<double>(il[3]->data)); if(!cv) cv=llvm::UndefValue::get(lty); vmap[dst]=cv; vtypes[dst]=ty; }
 				else if((op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem") && il.size()==5){ std::string dst=trimPct(symName(il[1])); TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb||dst.empty()) continue; llvm::Value* r=nullptr; if(op=="add") r=builder.CreateAdd(va,vb,dst); else if(op=="sub") r=builder.CreateSub(va,vb,dst); else if(op=="mul") r=builder.CreateMul(va,vb,dst); else if(op=="sdiv") r=builder.CreateSDiv(va,vb,dst); else if(op=="udiv") r=builder.CreateUDiv(va,vb,dst); else if(op=="srem") r=builder.CreateSRem(va,vb,dst); else r=builder.CreateURem(va,vb,dst); vmap[dst]=r; vtypes[dst]=ty; }
 				else if((op=="ptr-add"||op=="ptr-sub") && il.size()==5){ // (ptr-add %dst (ptr <T>) %base %offset)
@@ -1103,10 +1110,41 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					std::vector<CaseInfo> cases; cases.reserve(std::get<vector_t>(casesNode->data).elems.size());
 					for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)) continue; auto &cl=std::get<list>(cv->data).elems; if(cl.size()<3) continue; if(!std::holds_alternative<symbol>(cl[0]->data) || std::get<symbol>(cl[0]->data).name!="case") continue; std::string vname=symName(cl[1]); if(vname.empty()) continue; auto tIt=tagMap.find(vname); if(tIt==tagMap.end()) continue; // parse either simple vector body or :binds/:body form
 						std::vector<node_ptr> bodyElems; std::vector<std::pair<std::string,size_t>> binds; std::string valueVar;
-						if(std::holds_alternative<vector_t>(cl[2]->data)) bodyElems = std::get<vector_t>(cl[2]->data).elems;
+						if(std::holds_alternative<vector_t>(cl[2]->data)){
+							// Vector form: body may contain inline ":value %var" marker; extract it
+							auto &ve = std::get<vector_t>(cl[2]->data).elems;
+							bodyElems.reserve(ve.size());
+							for(size_t bi=0; bi<ve.size(); ++bi){
+								auto &bn = ve[bi];
+								if(bn && std::holds_alternative<keyword>(bn->data)){
+									std::string kw = std::get<keyword>(bn->data).name;
+									if(kw=="value" && bi+1<ve.size() && ve[bi+1] && std::holds_alternative<symbol>(ve[bi+1]->data)){
+										valueVar = trimPct(symName(ve[bi+1]));
+										++bi; // skip the symbol as well
+										continue; // don't add to body
+									}
+								}
+								bodyElems.push_back(bn);
+							}
+						}
 						else if(std::holds_alternative<keyword>(cl[2]->data)){
 							node_ptr bindsNode=nullptr, bodyNode=nullptr, valueNode=nullptr; for(size_t ci=2; ci<cl.size(); ++ci){ if(!cl[ci]||!std::holds_alternative<keyword>(cl[ci]->data)) break; std::string kw=std::get<keyword>(cl[ci]->data).name; if(++ci>=cl.size()) break; auto valn=cl[ci]; if(kw=="binds") bindsNode=valn; else if(kw=="body") bodyNode=valn; else if(kw=="value") valueNode=valn; }
-							if(bodyNode && std::holds_alternative<vector_t>(bodyNode->data)) bodyElems = std::get<vector_t>(bodyNode->data).elems; else bodyElems.clear();
+							if(bodyNode && std::holds_alternative<vector_t>(bodyNode->data)){
+								auto &ve = std::get<vector_t>(bodyNode->data).elems;
+								bodyElems.reserve(ve.size());
+								for(size_t bi=0; bi<ve.size(); ++bi){
+									auto &bn2 = ve[bi];
+									if(bn2 && std::holds_alternative<keyword>(bn2->data)){
+										std::string kw2 = std::get<keyword>(bn2->data).name;
+										if(kw2=="value" && bi+1<ve.size() && ve[bi+1] && std::holds_alternative<symbol>(ve[bi+1]->data)){
+											valueVar = trimPct(symName(ve[bi+1]));
+											++bi; // consume symbol
+											continue; // skip adding marker to body
+										}
+									}
+									bodyElems.push_back(bn2);
+								}
+							} else bodyElems.clear();
 							if(bindsNode && std::holds_alternative<vector_t>(bindsNode->data)){
 								for(auto &bn : std::get<vector_t>(bindsNode->data).elems){ if(!bn||!std::holds_alternative<list>(bn->data)) continue; auto &bl=std::get<list>(bn->data).elems; if(bl.size()!=3) continue; if(!std::holds_alternative<symbol>(bl[0]->data) || std::get<symbol>(bl[0]->data).name!="bind") continue; if(!std::holds_alternative<symbol>(bl[1]->data)) continue; std::string bname=trimPct(symName(bl[1])); if(bname.empty()) continue; if(!std::holds_alternative<int64_t>(bl[2]->data)) continue; int64_t idx=(int64_t)std::get<int64_t>(bl[2]->data); if(idx<0) continue; binds.emplace_back(bname,(size_t)idx); }
 							}
@@ -1149,9 +1187,52 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					}
 					// Default body can be a vector [ ... ] or a list with :body and :value
 					if(haveDefault){ builder.SetInsertPoint(defaultBB); std::vector<node_ptr> defaultBody; std::string defaultValueVar;
-						if(std::holds_alternative<vector_t>(defaultNode->data)) defaultBody = std::get<vector_t>(defaultNode->data).elems;
+						if(std::holds_alternative<vector_t>(defaultNode->data)){
+							auto &ve = std::get<vector_t>(defaultNode->data).elems;
+							defaultBody.reserve(ve.size());
+							for(size_t di=0; di<ve.size(); ++di){
+								auto &dn = ve[di];
+								if(dn && std::holds_alternative<keyword>(dn->data)){
+									std::string kw = std::get<keyword>(dn->data).name;
+									if(kw=="value" && di+1<ve.size() && ve[di+1] && std::holds_alternative<symbol>(ve[di+1]->data)){
+										defaultValueVar = trimPct(symName(ve[di+1]));
+										++di; // skip symbol
+										continue;
+									}
+								}
+								defaultBody.push_back(dn);
+							}
+						}
 						else if(std::holds_alternative<list>(defaultNode->data)){
-							auto &dl = std::get<list>(defaultNode->data).elems; for(size_t di=0; di<dl.size(); ++di){ if(!dl[di]||!std::holds_alternative<keyword>(dl[di]->data)) break; std::string kw=std::get<keyword>(dl[di]->data).name; if(++di>=dl.size()) break; auto valn=dl[di]; if(kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)) defaultBody = std::get<vector_t>(valn->data).elems; else if(kw=="value" && valn && std::holds_alternative<symbol>(valn->data)) defaultValueVar = trimPct(symName(valn)); }
+							auto &dl = std::get<list>(defaultNode->data).elems; 
+							// Some producers wrap default as (default :body [...]) - skip the leading symbol
+							size_t diStart = 0; if(!dl.empty() && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="default") diStart = 1;
+							for(size_t di=diStart; di<dl.size(); ++di){
+								if(!dl[di]||!std::holds_alternative<keyword>(dl[di]->data)) break; 
+								std::string kw=std::get<keyword>(dl[di]->data).name; 
+								if(++di>=dl.size()) break; 
+								auto valn=dl[di]; 
+								if(kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)){
+									// Extract optional ":value %var" from within the :body vector and filter it out
+									auto &ve = std::get<vector_t>(valn->data).elems; 
+									defaultBody.reserve(ve.size());
+									for(size_t bj=0; bj<ve.size(); ++bj){
+										auto &bn = ve[bj];
+										if(bn && std::holds_alternative<keyword>(bn->data)){
+											std::string kw2 = std::get<keyword>(bn->data).name; 
+											if(kw2=="value" && bj+1<ve.size() && ve[bj+1] && std::holds_alternative<symbol>(ve[bj+1]->data)){
+												defaultValueVar = trimPct(symName(ve[bj+1]));
+												++bj; // consume symbol
+												continue; // skip marker from body
+											}
+										}
+										defaultBody.push_back(bn);
+									}
+								}
+								else if(kw=="value" && valn && std::holds_alternative<symbol>(valn->data)){
+									defaultValueVar = trimPct(symName(valn));
+								}
+							}
 						}
 						emit_ref(defaultBody, emit_ref);
 						if(resultMode){ if(!defaultValueVar.empty() && vmap.count(defaultValueVar)) incomings.push_back({ vmap[defaultValueVar], defaultBB }); else if(resultTy){ incomings.push_back({ llvm::UndefValue::get(map_type(resultTy)), defaultBB }); } }
@@ -1180,8 +1261,9 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 	}
 		// Finalize DI after all functions are emitted
 		if(enableDebugInfo && DIB){ DIB->finalize(); }
-	// Optional: run a small optimization pipeline if enabled
+	// Optional: run an optimization pipeline if enabled. EDN_PASS_PIPELINE overrides presets.
 	if(const char* enable = std::getenv("EDN_ENABLE_PASSES"); enable && std::string(enable) == "1"){
+		// Setup PassBuilder and analysis managers once
 		llvm::PassBuilder PB;
 		llvm::LoopAnalysisManager LAM;
 		llvm::FunctionAnalysisManager FAM;
@@ -1192,9 +1274,54 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		PB.registerFunctionAnalyses(FAM);
 		PB.registerLoopAnalyses(LAM);
 		PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-		// Build a conservative default O1 pipeline
-		llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
-		MPM.run(*module_, MAM);
+
+		// If a textual pipeline is provided, try to parse and run it.
+		if(const char* pipeline = std::getenv("EDN_PASS_PIPELINE"); pipeline && *pipeline){
+			llvm::ModulePassManager MPM;
+			// parsePassPipeline returns llvm::Error in recent LLVM; consume on failure and fall back.
+			if(auto Err = PB.parsePassPipeline(MPM, pipeline)){
+				llvm::consumeError(std::move(Err));
+			} else {
+				// Optional IR verification before running pipeline (for debugging)
+				if(const char* v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1"){
+					if(llvm::verifyModule(*module_, &llvm::errs())){
+						llvm::errs() << "[edn] IR verify failed before custom pipeline\n";
+					}
+				}
+				MPM.run(*module_, MAM);
+				if(const char* v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1"){
+					if(llvm::verifyModule(*module_, &llvm::errs())){
+						llvm::errs() << "[edn] IR verify failed after custom pipeline\n";
+					}
+				}
+				return module_.get();
+			}
+		}
+
+		// No custom pipeline or parse failed: use presets via EDN_OPT_LEVEL (0/1/2/3)
+		llvm::OptimizationLevel optLevel = llvm::OptimizationLevel::O1; // default
+		if(const char* lvl = std::getenv("EDN_OPT_LEVEL"); lvl && *lvl){
+			std::string s = lvl; for(char &c : s) c = (char)tolower((unsigned char)c);
+			if(s == "0" || s == "o0") optLevel = llvm::OptimizationLevel::O0;
+			else if(s == "2" || s == "o2") optLevel = llvm::OptimizationLevel::O2;
+			else if(s == "3" || s == "o3") optLevel = llvm::OptimizationLevel::O3;
+			else optLevel = llvm::OptimizationLevel::O1;
+		}
+		if(optLevel != llvm::OptimizationLevel::O0){
+			llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel);
+			if(const char* v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1"){
+				if(llvm::verifyModule(*module_, &llvm::errs())){
+					llvm::errs() << "[edn] IR verify failed before preset pipeline\n";
+				}
+			}
+			MPM.run(*module_, MAM);
+			if(const char* v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1"){
+				if(llvm::verifyModule(*module_, &llvm::errs())){
+					llvm::errs() << "[edn] IR verify failed after preset pipeline\n";
+				}
+			}
+		}
+		// For O0, do nothing (preserve IR for debugging)
 	}
 	return module_.get();
 }

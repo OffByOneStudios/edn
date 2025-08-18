@@ -1,33 +1,57 @@
-file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-add_executable(edn_tests ${TEST_SOURCES})
+cmake_minimum_required(VERSION 3.20)
 
-# Ensure new files picked up even if glob cache lags
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_closures_jit_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_panic_negative_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_personality_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_target_triple_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_invoke_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_panic_unwind_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_seh_invoke_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_panic_unwind_seh_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_seh_cleanup_consolidation_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_disabled_no_invoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_seh_try_catch_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_itanium_try_catch_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_panic_inside_try_itanium_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_eh_panic_inside_try_seh_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_coro_jit_smoke_test.cpp)
-target_sources(edn_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/phase4_coro_negative_tests.cpp)
+# Core/unit tests runner (non-phase-prefixed files)
+set(EDN_TESTS_CORE
+	${CMAKE_CURRENT_SOURCE_DIR}/types_test.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/type_checker_test.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/ir_emitter_test.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/cast_test.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/globals_test.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/diagnostics_test.cpp
+)
+add_executable(edn_tests_core ${EDN_TESTS_CORE} ${CMAKE_CURRENT_SOURCE_DIR}/core_main.cpp)
+target_link_libraries(edn_tests_core PRIVATE edn)
+target_compile_features(edn_tests_core PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_core PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.core COMMAND edn_tests_core)
 
-target_link_libraries(edn_tests PRIVATE edn)
+# Phase 2 tests
+file(GLOB PHASE2_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase2_*.cpp")
+add_executable(edn_tests_phase2 ${PHASE2_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase2_main.cpp)
+target_link_libraries(edn_tests_phase2 PRIVATE edn)
+target_compile_features(edn_tests_phase2 PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_phase2 PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.phase2 COMMAND edn_tests_phase2)
 
-target_compile_features(edn_tests PRIVATE cxx_std_20)
+# Phase 3 tests
+file(GLOB PHASE3_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase3_*.cpp")
+add_executable(edn_tests_phase3 ${PHASE3_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase3_main.cpp)
+target_link_libraries(edn_tests_phase3 PRIVATE edn)
+target_compile_features(edn_tests_phase3 PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_phase3 PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.phase3 COMMAND edn_tests_phase3)
 
-# Provide project source dir to tests so they can open example .edn files reliably
-target_compile_definitions(edn_tests PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+# Phase 4 tests
+file(GLOB PHASE4_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase4_*.cpp")
+add_executable(edn_tests_phase4 ${PHASE4_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase4_main.cpp)
+target_link_libraries(edn_tests_phase4 PRIVATE edn)
+target_compile_features(edn_tests_phase4 PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_phase4 PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.phase4 COMMAND edn_tests_phase4)
 
-add_test(NAME edn.basic COMMAND edn_tests)
+# Phase 4 full tests (optional, includes JIT smokes when EDN_RUN_JIT=1)
+# Reuse Phase 4 sources but exclude the minimal phase4_main.cpp to avoid duplicate main
+list(FILTER PHASE4_SOURCES EXCLUDE REGEX ".*/phase4_main\\.cpp$")
+add_executable(edn_tests_phase4_full ${PHASE4_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase4_full_main.cpp)
+target_link_libraries(edn_tests_phase4_full PRIVATE edn)
+target_compile_features(edn_tests_phase4_full PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_phase4_full PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.phase4.full COMMAND edn_tests_phase4_full)
 
-# The test entry functions are declared in individual compilation units and called from main.cpp.
-# Add the new closures record test to the build by ensuring the source is compiled.
-# (Nothing else required here as tests are self-registered via run_* functions.)
+# Phase 5 tests
+file(GLOB PHASE5_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase5_*.cpp")
+add_executable(edn_tests_phase5 ${PHASE5_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase5_main.cpp)
+target_link_libraries(edn_tests_phase5 PRIVATE edn)
+target_compile_features(edn_tests_phase5 PRIVATE cxx_std_20)
+target_compile_definitions(edn_tests_phase5 PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME edn.phase5 COMMAND edn_tests_phase5)

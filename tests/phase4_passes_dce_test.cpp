@@ -42,11 +42,11 @@ void run_phase4_passes_dce_test(){
     };
 
     // Baseline: passes disabled -> the add should be present
-  int addsBefore = count_add_with_flag("0");
+  int addsBefore = count_add_with_flag("0"); (void)addsBefore;
   assert(addsBefore >= 1 && "expected an add instruction before optimization");
 
     // With passes enabled -> the dead add should be eliminated
-  int addsAfter = count_add_with_flag("1");
+  int addsAfter = count_add_with_flag("1"); (void)addsAfter;
   assert(addsAfter == 0 && "dead add should be removed by optimization pipeline (DCE)");
 
     std::cout << "[phase4] passes: DCE test passed\n";

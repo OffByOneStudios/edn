@@ -33,6 +33,7 @@ void run_phase4_eh_panic_unwind_test(){
     // Accept either direct call or invoke depending on context
     bool hasThrow = (ir.find("call void @__cxa_throw") != std::string::npos) ||
                     (ir.find("invoke void @__cxa_throw") != std::string::npos);
+    (void)hasThrow;
     assert(hasThrow);
     assert(ir.find("unreachable") != std::string::npos);
 

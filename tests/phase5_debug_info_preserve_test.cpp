@@ -9,11 +9,15 @@
 
 using namespace edn;
 
-void run_phase4_debug_info_smoke_test(){
-    std::cout << "[phase4] debug info smoke test...\n";
+void run_phase5_debug_info_preserve_test(){
+    std::cout << "[phase5] debug info preserve (O1) test...\n";
 #if defined(_WIN32)
+    _putenv_s("EDN_ENABLE_PASSES", "1");
+    _putenv_s("EDN_OPT_LEVEL", "1");
     _putenv_s("EDN_ENABLE_DEBUG", "1");
 #else
+    setenv("EDN_ENABLE_PASSES", "1", 1);
+    setenv("EDN_OPT_LEVEL", "1", 1);
     setenv("EDN_ENABLE_DEBUG", "1", 1);
 #endif
 
@@ -33,7 +37,7 @@ void run_phase4_debug_info_smoke_test(){
     (void)nmd;
     assert(nmd && nmd->getNumOperands() >= 1 && "missing DI compile unit");
 
-    // Function should have a DISubprogram and instructions with !dbg
+    // Function should have a DISubprogram and instructions with !dbg even after O1
     auto *F = mod->getFunction("add");
     assert(F && F->getSubprogram() && "function missing DISubprogram");
     bool hasDbg = false;
@@ -45,5 +49,5 @@ void run_phase4_debug_info_smoke_test(){
     }
     assert(hasDbg && "no instruction carried debug location");
 
-    std::cout << "[phase4] debug info smoke test passed\n";
+    std::cout << "[phase5] debug info preserve (O1) test passed\n";
 }

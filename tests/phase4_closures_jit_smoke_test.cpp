@@ -25,19 +25,20 @@ void run_phase4_closures_jit_smoke_test(){
       ])
     ))";
     auto ast = parse(SRC);
-    TypeContext tctx; IREmitter emitter(tctx); TypeCheckResult tcres; auto *mod = emitter.emit(ast, tcres);
+  TypeContext tctx; IREmitter emitter(tctx); TypeCheckResult tcres; auto *mod = emitter.emit(ast, tcres);
+  (void)mod;
     assert(tcres.success && mod);
     llvm::InitializeNativeTarget(); llvm::InitializeNativeTargetAsmPrinter();
-    auto jitExp = llvm::orc::LLJITBuilder().create(); assert(jitExp && "Failed to create JIT");
-    auto jit = std::move(*jitExp);
+  auto jitExp = llvm::orc::LLJITBuilder().create(); assert(jitExp && "Failed to create JIT"); (void)jitExp;
+  auto jit = std::move(*jitExp);
     // Resolve host symbols if needed
     jit->getMainJITDylib().addGenerator(llvm::cantFail(
         llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
             jit->getDataLayout().getGlobalPrefix())));
-    auto err = jit->addIRModule(emitter.toThreadSafeModule()); assert(!err && "Failed to add module to JIT");
-    auto sym = jit->lookup("main"); assert(sym && "main not found");
+  auto err = jit->addIRModule(emitter.toThreadSafeModule()); (void)err; assert(!err && "Failed to add module to JIT");
+  auto sym = jit->lookup("main"); (void)sym; assert(sym && "main not found");
     using FnTy = int(*)(void); auto fn = reinterpret_cast<FnTy>(sym->toPtr<void*>());
-    int result = fn();
+  int result = fn(); (void)result;
     assert(result == 15);
     std::cout << "[phase4] closures JIT smoke passed\n";
 }

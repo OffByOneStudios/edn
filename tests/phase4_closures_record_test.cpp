@@ -31,7 +31,7 @@ static void build_module(){
     }
     IREmitter emitter(ctx); TypeCheckResult res; auto *mod = emitter.emit(ast, res); assert(mod); assert(res.success);
     // Ensure closure struct type was created
-    bool foundStruct=false; for(auto &S : mod->getIdentifiedStructTypes()){ if(S->hasName() && S->getName().startswith("struct.__edn.closure.adder")){ foundStruct=true; break; } }
+    bool foundStruct=false; for(auto &S : mod->getIdentifiedStructTypes()){ if(S->hasName() && S->getName().starts_with("struct.__edn.closure.adder")){ foundStruct=true; break; } }
     assert(foundStruct);
 }
 

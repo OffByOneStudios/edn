@@ -31,6 +31,7 @@ void run_phase4_eh_panic_unwind_seh_test(){
     {
         bool hasRaise = (ir.find("call void @RaiseException") != std::string::npos) ||
                         (ir.find("invoke void @RaiseException") != std::string::npos);
+        (void)hasRaise;
         assert(hasRaise);
     }
     assert(ir.find("unreachable") != std::string::npos);

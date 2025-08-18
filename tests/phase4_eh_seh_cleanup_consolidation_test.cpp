@@ -29,13 +29,13 @@ void run_phase4_eh_seh_cleanup_consolidation_test(){
     assert(tcres.success && mod);
     std::string ir; { std::string s; llvm::raw_string_ostream rso(s); mod->print(rso, nullptr); rso.flush(); ir = std::move(s);}    
     // Expect exactly one cleanuppad occurrence and two invokes
-    size_t cp1 = ir.find("cleanuppad ");
+  size_t cp1 = ir.find("cleanuppad "); (void)cp1;
     assert(cp1 != std::string::npos);
-    size_t cp2 = ir.find("cleanuppad ", cp1+1);
+  size_t cp2 = ir.find("cleanuppad ", cp1+1); (void)cp2;
     assert(cp2 == std::string::npos);
-    size_t inv1 = ir.find("invoke ");
+  size_t inv1 = ir.find("invoke "); (void)inv1;
     assert(inv1 != std::string::npos);
-    size_t inv2 = ir.find("invoke ", inv1+1);
+  size_t inv2 = ir.find("invoke ", inv1+1); (void)inv2;
     assert(inv2 != std::string::npos);
     _putenv("EDN_EH_MODEL=");
     _putenv("EDN_ENABLE_EH=");

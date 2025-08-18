@@ -102,6 +102,9 @@ endif()
 # Examples (always build small samples)
 add_subdirectory(examples)
 
+# Benchmarks (tiny microbench harness)
+add_subdirectory(benchmarks)
+
 # Tools
 add_executable(phase1_driver tools/phase1_driver.cpp)
 target_link_libraries(phase1_driver PRIVATE edn ${llvm_libs})
@@ -110,3 +113,6 @@ target_compile_features(phase1_driver PRIVATE cxx_std_20)
 add_executable(phase3_driver tools/phase3_driver.cpp)
 target_link_libraries(phase3_driver PRIVATE edn ${llvm_libs})
 target_compile_features(phase3_driver PRIVATE cxx_std_20)
+
+# Languages (prototype front-ends)
+add_subdirectory(languages)

@@ -1,6 +1,6 @@
 # edn
 
-Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3/4 advanced features).
+Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3/4/5 features).
 
 ## Features (current)
 - Header-only: single include `#include <edn/edn.hpp>`
@@ -8,7 +8,7 @@ Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnost
 - Per-node metadata (line/col span) auto-populated; accessible for diagnostics
 - Macro / transformer system for syntactic extension & metadata enrichment
 - LLVM IR emission for a custom SSA instruction subset
-- Multi-phase language growth (Phases 1–3, plus experimental Phase 4) with stable error codes & structured notes
+- Multi-phase language growth (Phases 1–3, plus experimental Phase 4 and Phase 5 prototypes) with stable error codes & structured notes
 - JSON diagnostics export (`EDN_DIAG_JSON=1`)
 
 ### IR Instruction Set (Phases 1–3)
@@ -66,7 +66,7 @@ Additional Phase 2 / 3 instructions & forms:
 Phase 3 feature sample programs: see `edn/phase3/` for one `.edn` file per new construct plus a globals mismatch diagnostics example. Use the `phase3_driver` tool to JIT-run them, e.g.:
 ```pwsh
 cmake --build build --config Debug
-./build/Debug/phase3_driver edn/phase3/cast_sugar.edn cast_demo
+./build/Debug/phase3_driver.exe edn/phase3/cast_sugar.edn cast_demo
 ```
 
 Phase 2 adds explicit phi node support:
@@ -152,13 +152,25 @@ Diagnostics ensure initializer shapes and literal types match declared global ty
 ## Phase 3 Out-of-Scope / Deferred
 The following originally proposed Phase 3 items are now explicitly deferred:
 - Source span mapping for non-S-expression surface (would require alternate parser)
-- Optimization pass pipeline (`EDN_ENABLE_PASSES`) – design placeholder only
+Optimization pass pipeline (`EDN_ENABLE_PASSES`) with presets via `EDN_OPT_LEVEL` (O0/O1/O2)
 - Union write/store convenience op (current API only supports reads via `union-member`)
 - Active union variant tracking / safety tagging
 - Additional suggestion coverage for typedef / enum / union fields (basic may be present; advanced fuzzy ranking deferred)
 - Constant-folding control toggles (current cast materialization workaround accepted for tests)
 
 General future roadmap (unrelated to Phase 3 closure):
+Optimization presets (Phase 5):
+ - Set `EDN_ENABLE_PASSES=1` to enable the opt pipeline; select level with `EDN_OPT_LEVEL=0|1|2|3` (defaults to 1). `0` preserves IR (no passes), `1`/`2`/`3` use LLVM's default O1/O2/O3 module pipelines.
+ - Advanced: provide a custom textual LLVM pipeline via `EDN_PASS_PIPELINE` (e.g., `default<O2>` or `module(ipsccp,globalopt)`). When set, this overrides `EDN_OPT_LEVEL`.
+ - Debugging: set `EDN_VERIFY_IR=1` to run LLVM's IR verifier before and after the pass pipeline (custom or preset). Verification errors will be printed to stderr but will not abort emission.
+
+Micro-benchmarks:
+ - Build `edn_bench` and run the CSV-emitting microbench harness:
+ ```pwsh
+ cmake --build build --config Release --target edn_bench
+ ctest --test-dir build -C Release -R "edn\.bench\.basic$" --output-on-failure
+ ```
+ You can experiment with `EDN_ENABLE_PASSES` and `EDN_OPT_LEVEL` to observe IR size/time changes.
 - Big integers / ratios
 - Character literals
 - Namespaces for keywords & symbols
@@ -283,3 +295,12 @@ See the new example target `edn_traits_example` in `examples/` and the detailed 
 		- `make-closure` arity and capture checks (E1436 for arity; E1433/E1434 for capture vector/typing).
 		- `call-closure` return/arg checks and closure type checks (E1437 family).
 - Tests: `tests/phase4_closures_min_test.cpp`, `tests/phase4_closures_record_test.cpp`, `tests/phase4_closures_negative_test.cpp`.
+
+## Phase 5: Prototypes and Optimization Presets
+
+Phase 5 focuses on tiny language prototypes and opt/pipeline controls. A Rust-like prototype (Rustlite) lives under `languages/rustlite/` and demonstrates:
+- Sum types and result-mode match via a `rif-let` macro.
+- Simple `let`/`mut` sugar via macros lowering to EDN `block` bodies.
+- Driver-level PHI validation to ensure result-mode lowering never yields `undef` incoming values.
+
+Docs: see `design/phase5_plan.md` and `design/rustlite.md`.
