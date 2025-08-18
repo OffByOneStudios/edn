@@ -103,23 +103,39 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         // (rif %cond :then [ ... ] :else [ ... ])
         auto& el = form.elems; if(el.size()<3) return std::nullopt;
         node_ptr cond = el[1];
-        node_ptr thenVec=nullptr; node_ptr elseVec=nullptr;
+        node_ptr thenNode=nullptr; node_ptr elseNode=nullptr;
         for(size_t i=2;i+1<el.size(); i+=2){
             if(!std::holds_alternative<keyword>(el[i]->data)) break;
             auto kw = std::get<keyword>(el[i]->data).name; auto v = el[i+1];
-            if(kw=="then") thenVec=v; else if(kw=="else") elseVec=v;
+            if(kw=="then") thenNode=v; else if(kw=="else") elseNode=v;
         }
-        if(!thenVec || !std::holds_alternative<vector_t>(thenVec->data)) return std::nullopt;
-        if(elseVec && !std::holds_alternative<vector_t>(elseVec->data)) return std::nullopt;
+        if(!thenNode) return std::nullopt;
+        // Accept either a vector [ ... ] or a single list form, which we wrap into a vector
+        auto toVec = [](node_ptr n)->node_ptr{
+            if(!n) return nullptr;
+            if(std::holds_alternative<vector_t>(n->data)) return n;
+            if(std::holds_alternative<list>(n->data)){
+                vector_t v; v.elems.push_back(n); return std::make_shared<node>( node{ v, {} } );
+            }
+            return nullptr;
+        };
+        node_ptr thenVec = toVec(thenNode);
+        if(!thenVec) return std::nullopt;
+        node_ptr elseVec = elseNode? toVec(elseNode) : nullptr;
+        if(elseNode && !elseVec) return std::nullopt;
         list ifL; ifL.elems.push_back(make_sym("if")); ifL.elems.push_back(cond); ifL.elems.push_back(thenVec); if(elseVec) ifL.elems.push_back(elseVec);
         return std::make_shared<node>( node{ ifL, form.elems.front()->metadata } );
     });
     tx.add_macro("relse", [](const list& form)->std::optional<node_ptr>{
         // Alias of rif (useful for else-if chains)
         auto& el = form.elems; if(el.size()<3) return std::nullopt;
-        node_ptr cond = el[1]; node_ptr thenVec=nullptr; node_ptr elseVec=nullptr;
-        for(size_t i=2;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="then") thenVec=v; else if(kw=="else") elseVec=v; }
-        if(!thenVec || !std::holds_alternative<vector_t>(thenVec->data)) return std::nullopt; if(elseVec && !std::holds_alternative<vector_t>(elseVec->data)) return std::nullopt;
+        node_ptr cond = el[1]; node_ptr thenNode=nullptr; node_ptr elseNode=nullptr;
+        for(size_t i=2;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="then") thenNode=v; else if(kw=="else") elseNode=v; }
+        if(!thenNode) return std::nullopt;
+        auto toVec = [](node_ptr n)->node_ptr{
+            if(!n) return nullptr; if(std::holds_alternative<vector_t>(n->data)) return n; if(std::holds_alternative<list>(n->data)){ vector_t v; v.elems.push_back(n); return std::make_shared<node>( node{ v, {} } ); } return nullptr; };
+        node_ptr thenVec = toVec(thenNode); if(!thenVec) return std::nullopt;
+        node_ptr elseVec = elseNode? toVec(elseNode) : nullptr; if(elseNode && !elseVec) return std::nullopt;
         list ifL; ifL.elems = { make_sym("if"), cond, thenVec }; if(elseVec) ifL.elems.push_back(elseVec);
         return std::make_shared<node>( node{ ifL, form.elems.front()->metadata } );
     });
@@ -442,20 +458,46 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         if(!hasExternal){ out.elems.push_back(make_kw("external")); out.elems.push_back(std::make_shared<node>( node{ true, {} } )); }
         return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
     });
-    // rcall: positional sugar → core call
+    // rcall: positional sugar → core call, with intrinsic rewrite
     // (rcall %dst RetTy callee arg1 arg2 ...) or (rcall %dst RetTy callee [ args... ])
+    // If callee is a known intrinsic (add/sub/mul/div/eq/ne/lt/le/gt/ge/not), rewrite to core op form.
     tx.add_macro("rcall", [](const list& form)->std::optional<node_ptr>{
         auto& el = form.elems; if(el.size()<4) return std::nullopt;
         if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; node_ptr dst=el[1];
         node_ptr retTy = el[2]; node_ptr callee = el[3];
-        list out; out.elems = { make_sym("call"), dst, retTy, callee };
+        // Flatten args
+        std::vector<node_ptr> args;
         if(el.size()>=5){
             if(std::holds_alternative<vector_t>(el[4]->data)){
-                for(auto &a : std::get<vector_t>(el[4]->data).elems){ out.elems.push_back(a); }
+                for(auto &a : std::get<vector_t>(el[4]->data).elems){ args.push_back(a); }
             }else{
-                for(size_t i=4;i<el.size(); ++i){ out.elems.push_back(el[i]); }
+                for(size_t i=4;i<el.size(); ++i){ args.push_back(el[i]); }
             }
         }
+        // Intrinsic mapping
+        if(std::holds_alternative<symbol>(callee->data)){
+            std::string op = std::get<symbol>(callee->data).name;
+            auto is_bin = [&](const char* n){ return op==n; };
+            if(op=="add"||op=="sub"||op=="mul"||op=="div"||op=="eq"||op=="ne"||op=="lt"||op=="le"||op=="gt"||op=="ge"){
+                if(args.size()!=2) return std::nullopt; // arity mismatch
+                list out; out.elems = { make_sym(op), dst, retTy, args[0], args[1] };
+                return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
+            }
+            if(op=="not"){
+                if(args.size()!=1) return std::nullopt; // unary
+                // Lower to eq %dst i1 %arg 0 (boolean not)
+                // We need a zero const of type i1; synthesize inline before compare via block.
+                vector_t body;
+                auto z = make_sym(gensym("z"));
+                { list c; c.elems = { make_sym("const"), z, make_sym("i1"), make_i64(0) }; body.elems.push_back(std::make_shared<node>( node{ c, {} } )); }
+                { list cmp; cmp.elems = { make_sym("eq"), dst, make_sym("i1"), args[0], z }; body.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+                list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+                return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+            }
+        }
+        // Default: core call
+        list out; out.elems = { make_sym("call"), dst, retTy, callee };
+        for(auto &a : args){ out.elems.push_back(a); }
         return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
     });
 
@@ -782,7 +824,97 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
     });
 
-    return tx.expand(module_ast);
+    // First expand macros to Core-like EDN
+    edn::node_ptr expanded = tx.expand(module_ast);
+
+    // Post-pass: remap uses of initializer-const symbols back to their variable symbols.
+    // Rationale: frontends often synthesize a const (e.g., %__rl_c26 = 0) and then (assign %z %__rl_c26).
+    // Later expressions should reference %z, not the one-time const symbol, so that slot-backed loads reflect updates.
+    using edn::node_ptr; using edn::list; using edn::vector_t; using edn::symbol; using edn::keyword;
+
+    std::function<void(vector_t&, std::unordered_map<std::string,std::string>&)> rewrite_seq;
+    std::function<void(node_ptr&, std::unordered_map<std::string,std::string>&)> rewrite_node;
+
+    auto replace_sym_if_mapped = [](node_ptr& n, const std::unordered_map<std::string,std::string>& env){
+        if(!n) return;
+        if(std::holds_alternative<symbol>(n->data)){
+            const auto &s = std::get<symbol>(n->data).name;
+            auto it = env.find(s);
+            if(it != env.end()){
+                n->data = symbol{ it->second };
+            }
+        }
+    };
+
+    rewrite_node = [&](node_ptr& n, std::unordered_map<std::string,std::string>& env){
+        if(!n) return;
+        if(std::holds_alternative<vector_t>(n->data)){
+            auto &v = std::get<vector_t>(n->data);
+            // New sequential scope inherits env by value (copy) so sibling sequences don't affect each other
+            auto envCopy = env; rewrite_seq(v, envCopy);
+            return;
+        }
+        if(!std::holds_alternative<list>(n->data)){
+            // Simple atoms: apply symbol replacement if mapped
+            replace_sym_if_mapped(n, env);
+            return;
+        }
+        auto &l = std::get<list>(n->data);
+        if(l.elems.empty() || !std::holds_alternative<symbol>(l.elems[0]->data)){
+            // Recurse into children conservatively
+            for(auto &ch : l.elems){ rewrite_node(ch, env); }
+            return;
+        }
+        std::string op = std::get<symbol>(l.elems[0]->data).name;
+        // For structured ops that contain nested vectors (bodies), process those as sequences with a forked env
+        auto process_nested_vec = [&](size_t idx){ if(idx<l.elems.size() && l.elems[idx] && std::holds_alternative<vector_t>(l.elems[idx]->data)){ auto envCopy = env; rewrite_seq(std::get<vector_t>(l.elems[idx]->data), envCopy); } };
+
+        // Update env from declarations/assignments before replacing later uses in the same sequence step
+        if(op=="as" && l.elems.size()==4){
+            // (as %var <ty> %init)
+            if(std::holds_alternative<symbol>(l.elems[1]->data) && std::holds_alternative<symbol>(l.elems[3]->data)){
+                std::string var = std::get<symbol>(l.elems[1]->data).name;
+                std::string init = std::get<symbol>(l.elems[3]->data).name;
+                env[init] = var;
+            }
+            // Do not rewrite operands inside this same node; only future uses should see the alias
+            return;
+    }
+
+        // Replace symbol operands (skip head op and keywords)
+        for(size_t i=1; i<l.elems.size(); ++i){
+            if(l.elems[i] && std::holds_alternative<keyword>(l.elems[i]->data)){
+                // Process the value after a keyword; if it is a vector body, handle sequentially
+                if(i+1<l.elems.size() && l.elems[i+1]){
+                    // If body vector, process as sequence; otherwise recurse normally
+                    if(std::holds_alternative<vector_t>(l.elems[i+1]->data)){
+                        auto envCopy = env; rewrite_seq(std::get<vector_t>(l.elems[i+1]->data), envCopy);
+                    } else {
+                        rewrite_node(l.elems[i+1], env);
+                    }
+                    ++i; // skip value just processed
+                }
+                continue;
+            }
+            // Recurse into nested lists/vectors or replace plain symbol
+            if(l.elems[i] && (std::holds_alternative<list>(l.elems[i]->data) || std::holds_alternative<vector_t>(l.elems[i]->data))){
+                rewrite_node(l.elems[i], env);
+            } else {
+                replace_sym_if_mapped(l.elems[i], env);
+            }
+        }
+    };
+
+    rewrite_seq = [&](vector_t& seq, std::unordered_map<std::string,std::string>& env){
+        for(auto &inst : seq.elems){ rewrite_node(inst, env); }
+    };
+
+    // Kick off rewriting at module top-level if it’s a list: visit function bodies and nested vectors via generic recursion above.
+    if(expanded && std::holds_alternative<list>(expanded->data)){
+        auto env = std::unordered_map<std::string,std::string>{};
+        rewrite_node(expanded, env);
+    }
+    return expanded;
 }
 
 } // namespace rustlite

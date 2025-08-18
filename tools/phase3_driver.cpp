@@ -2,6 +2,11 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <chrono>
+#include <mutex>
 #include "edn/edn.hpp"
 #include "edn/ir_emitter.hpp"
 #include "edn/diagnostics_json.hpp"
@@ -38,5 +43,29 @@ int main(int argc, char** argv){
             jit->getDataLayout().getGlobalPrefix())));
     if(auto err = jit->addIRModule(emitter.toThreadSafeModule())){ std::cerr << "Failed to add module\n"; return 4; }
     auto sym = jit->lookup(entry); if(!sym){ std::cerr << "Entry function not found: " << entry << "\n"; return 5; }
-    using FnTy = int(*)(void); auto fn = reinterpret_cast<FnTy>(sym->toPtr<void*>()); int result = fn();
-    std::cout << "Result: " << result << "\n"; return 0; }
+    using FnTy = int(*)(void); auto fn = reinterpret_cast<FnTy>(sym->toPtr<void*>());
+    // Run with a 10-second timeout to guard against hangs/infinite loops
+    std::mutex mtx; std::condition_variable cv; bool done = false; int result = 0;
+    std::thread worker([&](){
+        int r = fn();
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            result = r;
+            done = true;
+        }
+        cv.notify_one();
+    });
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        if(cv.wait_for(lk, std::chrono::seconds(10), [&]{ return done; })){
+            // Completed
+            lk.unlock();
+            if(worker.joinable()) worker.join();
+            std::cout << "Result: " << result << "\n"; return 0;
+        }
+    }
+    std::cerr << "Hang detected: code example hung > 10s; aborting.\n";
+    // Best-effort: detach worker and exit with timeout code
+    if(worker.joinable()) worker.detach();
+    return 124;
+}

@@ -3,6 +3,7 @@
 #include <vector>
 #include <optional>
 #include <utility>
+#include "edn/edn.hpp"
 
 namespace rustlite {
 
@@ -21,8 +22,9 @@ struct Program {
 // Simple builder API that appends EDN forms. In a real impl we'd parse a surface language.
 class Builder {
 public:
-    Builder& begin_module(){ edn_ += "(module "; return *this; }
-    Builder& end_module(){ edn_ += ")"; return *this; }
+    Builder(){ root_ = edn::node_list({ edn::n_sym("module") }); }
+    Builder& begin_module(){ /* already started with (module ...); no-op for compatibility */ return *this; }
+    Builder& end_module(){ /* no-op; build() serializes the current AST */ return *this; }
 
     // Define a sum type (enum)
     Builder& sum_enum(const std::string& name, const std::vector<std::pair<std::string,std::vector<std::string>>>& variants);
@@ -33,9 +35,9 @@ public:
     // Define a function with a body of raw EDN instructions (already using macro shapes where needed)
     Builder& fn_raw(const std::string& name, const std::string& ret_type, const std::vector<std::pair<std::string,std::string>>& params, const std::string& body_ir_vec);
 
-    Program build() const { return Program{ edn_ }; }
+    Program build() const { return Program{ edn::to_string(root_) }; }
 private:
-    std::string edn_;
+    edn::node_ptr root_;
 };
 
 } // namespace rustlite

@@ -147,3 +147,39 @@ add_test(NAME rustlite.cli_else_if_chain COMMAND rustlitec ${CMAKE_CURRENT_SOURC
 add_test(NAME rustlite.cli_nested_blocks COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/nested_blocks.rl.rs)
 add_test(NAME rustlite.cli_assign_stmt COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/assign_stmt.rl.rs)
 add_test(NAME rustlite.cli_paren_exprs COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/paren_exprs.rl.rs)
+add_test(NAME rustlite.cli_logical_ops COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/logical_ops.rl.rs)
+add_test(NAME rustlite.cli_unary_not COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/unary_not.rl.rs)
+add_test(NAME rustlite.cli_mixed_precedence COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/mixed_precedence.rl.rs)
+add_test(NAME rustlite.cli_fn_params COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/fn_params.rl.rs)
+add_test(NAME rustlite.cli_compound_assign COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/compound_assign.rl.rs)
+add_test(NAME rustlite.cli_let_mut COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/let_mut.rl.rs)
+add_test(NAME rustlite.cli_complex_lowering COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/complex_lowering.rl.rs)
+
+# End-to-end driver: parse Rustlite source -> EDN -> expand -> typecheck -> emit IR
+add_executable(rustlite_e2e_driver tools/rustlite_e2e_driver.cpp $<TARGET_OBJECTS:rustlite_parser>)
+if(TARGET edn)
+  target_link_libraries(rustlite_e2e_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_e2e_driver PRIVATE cxx_std_20)
+
+# A few representative E2E samples
+add_test(NAME rustlite.e2e_return COMMAND rustlite_e2e_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/return.rl.rs)
+add_test(NAME rustlite.e2e_logical_ops COMMAND rustlite_e2e_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/logical_ops_e2e.rl.rs)
+add_test(NAME rustlite.e2e_fn_params COMMAND rustlite_e2e_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/fn_params.rl.rs)
+add_test(NAME rustlite.e2e_complex_lowering COMMAND rustlite_e2e_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/complex_lowering.rl.rs --dump)
+
+# JIT driver to execute Rustlite via LLVM ORC and capture a result
+add_executable(rustlite_jit_driver tools/rustlite_jit_driver.cpp $<TARGET_OBJECTS:rustlite_parser>)
+if(TARGET edn)
+  target_link_libraries(rustlite_jit_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_jit_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.jit_return COMMAND rustlite_jit_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/return.rl.rs)
+set_tests_properties(rustlite.jit_return PROPERTIES PASS_REGULAR_EXPRESSION "Result: 42")
+
+# Debug variant: verify --debug prints source, frontend EDN, lowered core EDN, and result
+add_test(NAME rustlite.jit_return_debug COMMAND rustlite_jit_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/return.rl.rs --debug)
+set_tests_properties(rustlite.jit_return_debug PROPERTIES PASS_REGULAR_EXPRESSION "=== Rust Source ===.*=== Frontend EDN ===.*=== Lowered Core EDN ===.*=== JIT Result ===.*Result: 42")
+
+add_test(NAME rustlite.jit_complex_debug COMMAND rustlite_jit_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/complex_lowering.rl.rs --debug)
+set_tests_properties(rustlite.jit_complex_debug PROPERTIES PASS_REGULAR_EXPRESSION "=== Rust Source ===.*=== Frontend EDN ===.*=== Lowered Core EDN ===.*=== JIT Result ===")

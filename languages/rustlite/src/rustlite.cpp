@@ -4,18 +4,38 @@
 namespace rustlite {
 
 Builder& Builder::sum_enum(const std::string& name, const std::vector<std::pair<std::string,std::vector<std::string>>>& variants){
-    std::ostringstream os; os << "(sum :name " << name << " :variants [ "; bool first=true; for(auto &v : variants){ if(!first) os << ' '; first=false; os << "(variant :name " << v.first << " :fields ["; bool firstf=true; for(auto &f : v.second){ if(!firstf) os << ' '; firstf=false; os << ' ' << f; } os << " ])"; } os << " ]) ";
-    edn_ += os.str(); return *this;
+    using namespace edn;
+    auto sum = edn::node_list({ edn::n_sym("sum"), edn::n_kw("name"), edn::n_str(name), edn::n_kw("variants") });
+    auto vvec = edn::node_vec();
+    for(const auto& v : variants){
+    auto var = edn::node_list({ edn::n_sym("variant"), edn::n_kw("name"), edn::n_str(v.first), edn::n_kw("fields") });
+    auto fvec = edn::node_vec();
+    for(const auto& f : v.second){ fvec << edn::n_sym(f); }
+        var << fvec; vvec << var;
+    }
+    sum << vvec; root_ << sum; return *this;
 }
 
 Builder& Builder::fn_raw(const std::string& name, const std::string& ret_type, const std::vector<std::pair<std::string,std::string>>& params, const std::string& body_ir_vec){
-    std::ostringstream os; os << "(fn :name \"" << name << "\" :ret " << ret_type << " :params [ "; bool first=true; for(auto &p : params){ if(!first) os << ' '; first=false; os << "(param " << p.second << " %" << p.first << ")"; } os << " ] :body " << body_ir_vec << ") ";
-    edn_ += os.str(); return *this;
+    using namespace edn;
+    auto fn = edn::node_list({ edn::n_sym("fn"), edn::n_kw("name"), edn::n_str(name), edn::n_kw("ret") });
+    // ret_type is EDN text; parse to node
+    auto ret = edn::parse(ret_type);
+    fn << ret; fn << edn::n_kw("params");
+    auto pvec = edn::node_vec();
+    for(const auto& p : params){ auto param = edn::node_list({ edn::n_sym("param"), edn::parse(p.second), edn::n_sym("%"+p.first) }); pvec << param; }
+    fn << pvec; fn << edn::n_kw("body");
+    // body_ir_vec is EDN vector text of IR instructions
+    auto body = edn::parse(body_ir_vec);
+    fn << body; root_ << fn; return *this;
 }
 
 Builder& Builder::rstruct(const std::string& name, const std::vector<std::pair<std::string,std::string>>& fields){
-    std::ostringstream os; os << "(rstruct :name \"" << name << "\" :fields [ "; bool first=true; for(auto &f : fields){ if(!first) os << ' '; first=false; os << "(" << f.first << ' ' << f.second << ")"; } os << " ]) ";
-    edn_ += os.str(); return *this;
+    using namespace edn;
+    auto st = edn::node_list({ edn::n_sym("rstruct"), edn::n_kw("name"), edn::n_str(name), edn::n_kw("fields") });
+    auto fvec = edn::node_vec();
+    for(const auto& f : fields){ auto pair = edn::node_list({ edn::n_sym(f.first), edn::parse(f.second) }); fvec << pair; }
+    st << fvec; root_ << st; return *this;
 }
 
 } // namespace rustlite

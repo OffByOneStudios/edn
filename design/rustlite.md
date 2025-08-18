@@ -1,6 +1,6 @@
 # Rustlite – a tiny Rust-like prototype on EDN (Phase 5)
 
-Status: In progress (2025-08-17)
+Status: In progress (2025-08-18)
 
 Rustlite is a minimal Rust-inspired surface that lowers to EDN IR using EDN’s macro/transform system. It validates Phase 4/5 platform features: sum types + match (including result-mode), simple locals, and core pass/verification toggles.
 
@@ -16,7 +16,7 @@ Locations
 - Samples: `languages/rustlite/samples/*.rl.rs`
 
 Implemented grammar subset
-- Items: `fn ident() { ... }` (empty parameter list)
+- Items: `fn ident(params) (-> RetTy)? { ... }`
 - Blocks: `{ ... }`, including nested blocks as standalone statements
 - Statements
   - let: `let x = 1;` and `let x: i32 = (1);` (RHS supports general expressions)
@@ -25,6 +25,7 @@ Implemented grammar subset
   - assignments: `x = <expr>;`
   - expression statements: signed ints, identifiers, calls (empty or with args)
 - Control flow: `if`/`else`/`else if`, `while`, `loop`
+- Booleans and comparisons yield `i1`; `&&`/`||` short-circuit via `rif` and temporaries
 - Parenthesized expressions as primaries: `(1)`, `(x)`, `(foo())` usable in conditions, RHS of let/assign, and call args
 
 CLI test coverage (all passing as of 2025-08-18)
@@ -45,6 +46,11 @@ CLI test coverage (all passing as of 2025-08-18)
 - rustlite.cli_nested_blocks → `nested_blocks.rl.rs`
 - rustlite.cli_assign_stmt → `assign_stmt.rl.rs`
 - rustlite.cli_paren_exprs → `paren_exprs.rl.rs`
+- rustlite.cli_logical_ops → `logical_ops.rl.rs`
+- rustlite.cli_unary_not → `unary_not.rl.rs`
+- rustlite.cli_mixed_precedence → `mixed_precedence.rl.rs`
+- rustlite.cli_fn_params → `fn_params.rl.rs`
+- rustlite.cli_let_mut → `let_mut.rl.rs`
 
 ## Phase 5 implementation placement rules
 - If it is a multi-language common macro function or intrinsic, implement it in the main EDN library (core), not in a specific language folder.
@@ -106,7 +112,7 @@ Files
 - Headers: `languages/rustlite/include/rustlite/*.hpp`
 
 Driver pipeline
-- Build EDN text via `rustlite::Builder`, parse to AST
+- Build EDN as nodes via `rustlite::Builder` (uses `edn::node_list` and operator<<), serialize to text
 - Run trait/generic expanders (if used), then rustlite expansion
 - Type check, emit LLVM IR, verify no PHI has `undef` incoming
 - `--dump` prints high-level EDN and lowered IR

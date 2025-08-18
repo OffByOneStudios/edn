@@ -324,6 +324,28 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		// If EH is enabled for either model, add uwtable to ease unwinder table emission
 		if(selectedPersonality){ F->addFnAttr("uwtable"); }
 		size_t ai=0; for(auto &arg: F->args()) arg.setName(params[ai++].first); auto *entry=llvm::BasicBlock::Create(*llctx_,"entry",F); llvm::IRBuilder<> builder(entry); std::unordered_map<std::string,llvm::Value*> vmap; std::unordered_map<std::string,TypeId> vtypes; for(auto &pr: params){ vtypes[pr.first]=pr.second; } for(auto &arg: F->args()){ vmap[std::string(arg.getName())]=&arg; }
+			// Stack slots for variables that are assigned/address-taken
+			std::unordered_map<std::string, llvm::AllocaInst*> varSlots;
+			// Map initializer SSA names to their owning mutable variable (from `(as %dst <ty> %init)`)
+			std::unordered_map<std::string, std::string> initAlias;
+			auto ensureSlot = [&](const std::string& name, TypeId ty, bool initFromCurrent)->llvm::AllocaInst*{
+				auto it = varSlots.find(name);
+				if(it != varSlots.end()) return it->second;
+				// Place allocas in the entry block for canonical form
+				llvm::IRBuilder<> eb(&*entry->getFirstInsertionPt());
+				auto *slot = eb.CreateAlloca(map_type(ty), nullptr, name+".slot");
+				varSlots[name] = slot;
+				// Record the value type of the slot's contents
+				vtypes[name] = ty;
+				// Optionally initialize the slot with any existing SSA value for this name
+				if(initFromCurrent){
+					auto itv = vmap.find(name);
+					if(itv != vmap.end() && itv->second){
+						builder.CreateStore(itv->second, slot);
+					}
+				}
+				return slot;
+			};
 			if(enableDebugInfo && F->getSubprogram()){
 				builder.SetCurrentDebugLocation(llvm::DILocation::get(*llctx_, F->getSubprogram()->getLine(), /*Col*/1, F->getSubprogram()));
 				// Emit parameter debug info at entry using dbg.value
@@ -342,6 +364,8 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		std::vector<llvm::BasicBlock*> loopEndStack; // for break targets (end blocks)
 		std::vector<llvm::BasicBlock*> loopContinueStack; // for continue targets (condition re-check or step blocks)
 		int cfCounter=0; bool functionDone=false;
+		// Track defining EDN nodes for values (used to recompute conditions each iteration)
+		std::unordered_map<std::string, node_ptr> defNode;
 		// Reusable Windows SEH cleanup funclet block (created on first use)
 		llvm::BasicBlock* sehCleanupBB = nullptr;
 		// Stack of active SEH exception targets (catch dispatch blocks)
@@ -351,9 +375,64 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 		// Defer phi creation until predecessors exist: collect specs in current block then create at end of block emission phase.
 		struct PendingPhi { std::string dst; TypeId ty; std::vector<std::pair<std::string,std::string>> incomings; llvm::BasicBlock* insertBlock; };
 		std::vector<PendingPhi> pendingPhis;
-		auto emit_list = [&](const std::vector<node_ptr>& insts, auto&& emit_ref) -> void {
+				auto emit_list = [&](const std::vector<node_ptr>& insts, auto&& emit_ref) -> void {
 			if(functionDone) return; for(auto &inst: insts){ if(functionDone) break; if(!inst||!std::holds_alternative<list>(inst->data)) continue; auto &il=std::get<list>(inst->data).elems; if(il.empty()) continue; if(!std::holds_alternative<symbol>(il[0]->data)) continue; std::string op=std::get<symbol>(il[0]->data).name;
-				auto getVal=[&](const node_ptr& n)->llvm::Value*{ std::string nm=trimPct(symName(n)); if(nm.empty()) return nullptr; auto it=vmap.find(nm); return (it!=vmap.end())?it->second:nullptr; };
+				auto getVal=[&](const node_ptr& n)->llvm::Value*{
+					std::string nm=trimPct(symName(n));
+					if(nm.empty()) return nullptr;
+					// If this name was an initializer to an `as`-declared variable, redirect to that variable
+					auto loadFromAliasedVar = [&](const std::string& key)->llvm::Value*{
+						auto aIt = initAlias.find(key);
+						if(aIt == initAlias.end()) return (llvm::Value*)nullptr;
+						const std::string &var = aIt->second;
+						// Prefer loading from the variable's slot
+						if(auto s2 = varSlots.find(var); s2 != varSlots.end()){
+							auto t2 = vtypes.find(var);
+							if(t2 == vtypes.end()) return (llvm::Value*)nullptr;
+							return builder.CreateLoad(map_type(t2->second), s2->second, var);
+						}
+						// Fallback to any SSA value registered for the variable
+						if(auto vv = vmap.find(var); vv != vmap.end()) return vv->second;
+						return (llvm::Value*)nullptr;
+					};
+					if(auto aliased = loadFromAliasedVar(nm)) return aliased;
+					// Try common synthesized suffixes used for constants/temps
+					auto normalized = nm;
+					auto stripSuffix = [&](const char* suf){ size_t L = strlen(suf); if(normalized.size()>=L && normalized.rfind(suf)==normalized.size()-L) normalized.resize(normalized.size()-L); };
+					stripSuffix(".cst.load"); stripSuffix(".load"); stripSuffix(".cst.tmp"); stripSuffix(".tmp");
+					if(normalized != nm){ if(auto aliased2 = loadFromAliasedVar(normalized)) return aliased2; }
+					// If this name has a stack slot, always load from it
+					auto sIt = varSlots.find(nm);
+					if(sIt != varSlots.end()){
+						auto tIt = vtypes.find(nm);
+						if(tIt == vtypes.end()) return nullptr;
+						return builder.CreateLoad(map_type(tIt->second), sIt->second, nm);
+					}
+					auto it=vmap.find(nm);
+					return (it!=vmap.end())?it->second:nullptr;
+				};
+						// Attempt to recompute value from its defining EDN node (limited set: eq/ne/lt/gt/le/ge, and/or/xor)
+						auto evalDefined = [&](const std::string& name)->llvm::Value*{
+							auto it = defNode.find(name);
+							if(it==defNode.end()) return nullptr;
+							auto dn = it->second; if(!dn || !std::holds_alternative<list>(dn->data)) return nullptr;
+							auto &dl = std::get<list>(dn->data).elems; if(dl.empty() || !std::holds_alternative<symbol>(dl[0]->data)) return nullptr;
+							std::string dop = std::get<symbol>(dl[0]->data).name;
+							auto valOf = [&](size_t idx)->llvm::Value*{ if(idx>=dl.size()) return nullptr; return getVal(dl[idx]); };
+							if((dop=="eq"||dop=="ne"||dop=="lt"||dop=="gt"||dop=="le"||dop=="ge") && dl.size()==5){
+								llvm::Value* va = valOf(3); llvm::Value* vb = valOf(4); if(!va||!vb) return nullptr;
+								llvm::CmpInst::Predicate P=llvm::CmpInst::ICMP_EQ;
+								if(dop=="eq") P=llvm::CmpInst::ICMP_EQ; else if(dop=="ne") P=llvm::CmpInst::ICMP_NE; else if(dop=="lt") P=llvm::CmpInst::ICMP_SLT; else if(dop=="gt") P=llvm::CmpInst::ICMP_SGT; else if(dop=="le") P=llvm::CmpInst::ICMP_SLE; else P=llvm::CmpInst::ICMP_SGE;
+								return builder.CreateICmp(P, va, vb, name+".re");
+							}
+							if((dop=="and"||dop=="or"||dop=="xor") && dl.size()==5){
+								llvm::Value* va = valOf(3); llvm::Value* vb = valOf(4); if(!va||!vb) return nullptr;
+								if(dop=="and") return builder.CreateAnd(va,vb,name+".re");
+								if(dop=="or") return builder.CreateOr(va,vb,name+".re");
+								return builder.CreateXor(va,vb,name+".re");
+							}
+							return nullptr;
+						};
 				if(op=="block"){ // (block :locals [ ... ] :body [ ... ])
 					node_ptr bodyNode=nullptr;
 					for(size_t i=1;i<il.size(); ++i){ if(!il[i]||!std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i]; if(kw=="body"){ if(val && std::holds_alternative<vector_t>(val->data)) bodyNode=val; } }
@@ -362,7 +441,39 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					}
 				}
 				if(op=="const" && il.size()==4){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } llvm::Type* lty=map_type(ty); llvm::Value* cv=nullptr; if(std::holds_alternative<int64_t>(il[3]->data)) cv=llvm::ConstantInt::get(lty,(uint64_t)std::get<int64_t>(il[3]->data),true); else if(std::holds_alternative<double>(il[3]->data)) cv=llvm::ConstantFP::get(lty,std::get<double>(il[3]->data)); if(!cv) cv=llvm::UndefValue::get(lty); vmap[dst]=cv; vtypes[dst]=ty; }
-				else if((op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem") && il.size()==5){ std::string dst=trimPct(symName(il[1])); TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb||dst.empty()) continue; llvm::Value* r=nullptr; if(op=="add") r=builder.CreateAdd(va,vb,dst); else if(op=="sub") r=builder.CreateSub(va,vb,dst); else if(op=="mul") r=builder.CreateMul(va,vb,dst); else if(op=="sdiv") r=builder.CreateSDiv(va,vb,dst); else if(op=="udiv") r=builder.CreateUDiv(va,vb,dst); else if(op=="srem") r=builder.CreateSRem(va,vb,dst); else r=builder.CreateURem(va,vb,dst); vmap[dst]=r; vtypes[dst]=ty; }
+				else if((op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem") && il.size()==5){
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; }
+					auto resolvePreferringSlots = [&](const node_ptr& n)->llvm::Value*{
+						std::string nm = trimPct(symName(n));
+						if(nm.empty()) return getVal(n);
+						// If this refers to an initializer symbol (possibly with synthesized suffixes), redirect to owning var slot
+						auto normalized = nm; auto stripSuffix = [&](const char* suf){ size_t L=strlen(suf); if(normalized.size()>=L && normalized.rfind(suf)==normalized.size()-L) normalized.resize(normalized.size()-L); };
+						stripSuffix(".cst.load"); stripSuffix(".load"); stripSuffix(".cst.tmp"); stripSuffix(".tmp");
+						auto pickSlotOf = [&](const std::string& var)->llvm::Value*{
+							auto sIt = varSlots.find(var);
+							if(sIt != varSlots.end()){
+								auto tIt = vtypes.find(var);
+								if(tIt == vtypes.end()) return (llvm::Value*)nullptr;
+								return builder.CreateLoad(map_type(tIt->second), sIt->second, var);
+							}
+							return (llvm::Value*)nullptr;
+						};
+						if(auto aIt = initAlias.find(nm); aIt != initAlias.end()){
+							if(auto *lv = pickSlotOf(aIt->second)) return lv;
+						}
+						if(normalized != nm){ if(auto aIt2 = initAlias.find(normalized); aIt2 != initAlias.end()){ if(auto *lv = pickSlotOf(aIt2->second)) return lv; } }
+						// If this name itself has a slot, load from it
+						if(auto *lv = pickSlotOf(nm)) return lv;
+						// Otherwise fall back to the general resolver
+						return getVal(n);
+					};
+					auto *va = resolvePreferringSlots(il[3]);
+					auto *vb = resolvePreferringSlots(il[4]);
+					if(!va||!vb) continue;
+					llvm::Value* r=nullptr; if(op=="add") r=builder.CreateAdd(va,vb,dst); else if(op=="sub") r=builder.CreateSub(va,vb,dst); else if(op=="mul") r=builder.CreateMul(va,vb,dst); else if(op=="sdiv") r=builder.CreateSDiv(va,vb,dst); else if(op=="udiv") r=builder.CreateUDiv(va,vb,dst); else if(op=="srem") r=builder.CreateSRem(va,vb,dst); else r=builder.CreateURem(va,vb,dst);
+					vmap[dst]=r; vtypes[dst]=ty;
+				}
 				else if((op=="ptr-add"||op=="ptr-sub") && il.size()==5){ // (ptr-add %dst (ptr <T>) %base %offset)
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId annot; try{ annot=tctx_.parse_type(il[2]); }catch(...){ continue; }
 					std::string baseName=trimPct(symName(il[3])); std::string offName=trimPct(symName(il[4])); if(baseName.empty()||offName.empty()) continue; auto bit=vmap.find(baseName); auto oit=vmap.find(offName); if(bit==vmap.end()||oit==vmap.end()) continue; if(!vtypes.count(baseName)||!vtypes.count(offName)) continue; TypeId bty=vtypes[baseName]; const Type& BT=tctx_.at(bty); const Type& AT=tctx_.at(annot); if(BT.kind!=Type::Kind::Pointer||AT.kind!=Type::Kind::Pointer||BT.pointee!=AT.pointee) continue; TypeId oty=vtypes[offName]; const Type& OT=tctx_.at(oty); if(!(OT.kind==Type::Kind::Base && is_integer_base(OT.base))) continue; llvm::Value* offsetVal=oit->second; if(op=="ptr-sub"){ // subtract integer -> negate offset
@@ -391,11 +502,12 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					vmap[dst]=finalV; vtypes[dst]=rty; }
 				else if(op=="addr" && il.size()==4){ // (addr %dst (ptr <T>) %src)
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId annot; try{ annot=tctx_.parse_type(il[2]); }catch(...){ continue; }
-					std::string srcName=trimPct(symName(il[3])); if(srcName.empty()) continue; if(!vtypes.count(srcName)) continue; auto *valV=vmap[srcName]; if(!valV) continue; const Type& AT=tctx_.at(annot); if(AT.kind!=Type::Kind::Pointer) continue; // allocate slot if first time taking address
-					// Heuristic: create (or reuse) a shadow alloca for the source by naming convention
-					std::string slotName = srcName+".addr.slot"; llvm::AllocaInst* slot=nullptr; // search existing mapping
-					if(vmap.count(slotName)) slot=llvm::dyn_cast<llvm::AllocaInst>(vmap[slotName]);
-					if(!slot){ slot=builder.CreateAlloca(map_type(AT.pointee), nullptr, slotName); vmap[slotName]=slot; vtypes[slotName]=tctx_.get_pointer(AT.pointee); builder.CreateStore(valV, slot); }
+					std::string srcName=trimPct(symName(il[3])); if(srcName.empty()) continue; const Type& AT=tctx_.at(annot); if(AT.kind!=Type::Kind::Pointer) continue;
+					// Ensure a slot for the source variable and initialize from its current value (if any)
+					TypeId valTy = AT.pointee;
+					// If we already have a tracked type for the source, prefer it
+					if(vtypes.count(srcName)) valTy = vtypes[srcName];
+					auto *slot = ensureSlot(srcName, valTy, /*initFromCurrent=*/true);
 					vmap[dst]=slot; vtypes[dst]=annot; }
 				else if(op=="deref" && il.size()==4){ // (deref %dst <T> %ptr)
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; }
@@ -549,9 +661,9 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					if(pred=="oeq") P=llvm::CmpInst::FCMP_OEQ; else if(pred=="one") P=llvm::CmpInst::FCMP_ONE; else if(pred=="olt") P=llvm::CmpInst::FCMP_OLT; else if(pred=="ogt") P=llvm::CmpInst::FCMP_OGT; else if(pred=="ole") P=llvm::CmpInst::FCMP_OLE; else if(pred=="oge") P=llvm::CmpInst::FCMP_OGE; else if(pred=="ord") P=llvm::CmpInst::FCMP_ORD; else if(pred=="uno") P=llvm::CmpInst::FCMP_UNO; else if(pred=="ueq") P=llvm::CmpInst::FCMP_UEQ; else if(pred=="une") P=llvm::CmpInst::FCMP_UNE; else if(pred=="ult") P=llvm::CmpInst::FCMP_ULT; else if(pred=="ugt") P=llvm::CmpInst::FCMP_UGT; else if(pred=="ule") P=llvm::CmpInst::FCMP_ULE; else if(pred=="uge") P=llvm::CmpInst::FCMP_UGE; else continue;
 					auto* res=builder.CreateFCmp(P,va,vb,dst); vmap[dst]=res; vtypes[dst]=tctx_.get_base(BaseType::I1);
 				}
-				else if((op=="eq"||op=="ne"||op=="lt"||op=="gt"||op=="le"||op=="ge") && il.size()==5){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb) continue; llvm::CmpInst::Predicate P=llvm::CmpInst::ICMP_EQ; if(op=="eq") P=llvm::CmpInst::ICMP_EQ; else if(op=="ne") P=llvm::CmpInst::ICMP_NE; else if(op=="lt") P=llvm::CmpInst::ICMP_SLT; else if(op=="gt") P=llvm::CmpInst::ICMP_SGT; else if(op=="le") P=llvm::CmpInst::ICMP_SLE; else P=llvm::CmpInst::ICMP_SGE; auto* res=builder.CreateICmp(P,va,vb,dst); vmap[dst]=res; vtypes[dst]=tctx_.get_base(BaseType::I1); }
+				else if((op=="eq"||op=="ne"||op=="lt"||op=="gt"||op=="le"||op=="ge") && il.size()==5){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb) continue; llvm::CmpInst::Predicate P=llvm::CmpInst::ICMP_EQ; if(op=="eq") P=llvm::CmpInst::ICMP_EQ; else if(op=="ne") P=llvm::CmpInst::ICMP_NE; else if(op=="lt") P=llvm::CmpInst::ICMP_SLT; else if(op=="gt") P=llvm::CmpInst::ICMP_SGT; else if(op=="le") P=llvm::CmpInst::ICMP_SLE; else P=llvm::CmpInst::ICMP_SGE; auto* res=builder.CreateICmp(P,va,vb,dst); vmap[dst]=res; vtypes[dst]=tctx_.get_base(BaseType::I1); defNode[dst]=inst; }
 				else if(op=="icmp" && il.size()==7){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; if(!std::holds_alternative<keyword>(il[3]->data)) continue; std::string pred=symName(il[4]); auto *va=getVal(il[5]); auto *vb=getVal(il[6]); if(!va||!vb) continue; llvm::CmpInst::Predicate P=llvm::CmpInst::ICMP_EQ; if(pred=="eq") P=llvm::CmpInst::ICMP_EQ; else if(pred=="ne") P=llvm::CmpInst::ICMP_NE; else if(pred=="slt") P=llvm::CmpInst::ICMP_SLT; else if(pred=="sgt") P=llvm::CmpInst::ICMP_SGT; else if(pred=="sle") P=llvm::CmpInst::ICMP_SLE; else if(pred=="sge") P=llvm::CmpInst::ICMP_SGE; else if(pred=="ult") P=llvm::CmpInst::ICMP_ULT; else if(pred=="ugt") P=llvm::CmpInst::ICMP_UGT; else if(pred=="ule") P=llvm::CmpInst::ICMP_ULE; else if(pred=="uge") P=llvm::CmpInst::ICMP_UGE; else continue; auto* res=builder.CreateICmp(P,va,vb,dst); vmap[dst]=res; vtypes[dst]=tctx_.get_base(BaseType::I1); }
-				else if((op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr") && il.size()==5){ std::string dst=trimPct(symName(il[1])); TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb||dst.empty()) continue; llvm::Value* r=nullptr; if(op=="and") r=builder.CreateAnd(va,vb,dst); else if(op=="or") r=builder.CreateOr(va,vb,dst); else if(op=="xor") r=builder.CreateXor(va,vb,dst); else if(op=="shl") r=builder.CreateShl(va,vb,dst); else if(op=="lshr") r=builder.CreateLShr(va,vb,dst); else r=builder.CreateAShr(va,vb,dst); vmap[dst]=r; vtypes[dst]=ty; }
+				else if((op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr") && il.size()==5){ std::string dst=trimPct(symName(il[1])); TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *va=getVal(il[3]); auto *vb=getVal(il[4]); if(!va||!vb||dst.empty()) continue; llvm::Value* r=nullptr; if(op=="and") r=builder.CreateAnd(va,vb,dst); else if(op=="or") r=builder.CreateOr(va,vb,dst); else if(op=="xor") r=builder.CreateXor(va,vb,dst); else if(op=="shl") r=builder.CreateShl(va,vb,dst); else if(op=="lshr") r=builder.CreateLShr(va,vb,dst); else r=builder.CreateAShr(va,vb,dst); vmap[dst]=r; vtypes[dst]=ty; if(op=="and"||op=="or"||op=="xor") defNode[dst]=inst; }
 				else if((op=="zext"||op=="sext"||op=="trunc"||op=="bitcast"||op=="sitofp"||op=="uitofp"||op=="fptosi"||op=="fptoui"||op=="ptrtoint"||op=="inttoptr") && il.size()==4){
 					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId toTy; try{ toTy=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *srcV=getVal(il[3]); if(!srcV) continue; llvm::Value* castV=nullptr; llvm::Type* llvmTo=map_type(toTy);
 					if(llvm::isa<llvm::Constant>(srcV)){
@@ -571,7 +683,66 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					else if(op=="inttoptr") castV=builder.CreateIntToPtr(srcV, llvmTo, dst);
 					if(castV){ vmap[dst]=castV; vtypes[dst]=toTy; }
 				}
-				else if(op=="assign" && il.size()==3){ std::string dst=trimPct(symName(il[1])); std::string src=trimPct(symName(il[2])); if(dst.empty()||src.empty()) continue; auto it=vmap.find(src); if(it!=vmap.end()){ vmap[dst]=it->second; if(vtypes.count(src)) vtypes[dst]=vtypes[src]; } }
+				else if(op=="assign" && il.size()==3){
+					std::string dst=trimPct(symName(il[1])); std::string src=trimPct(symName(il[2]));
+					if(dst.empty()||src.empty()) continue;
+					llvm::Value* sv = getVal(il[2]);
+					if(!sv) continue;
+					TypeId sty = vtypes.count(src)? vtypes[src] : 0;
+					if(!sty) continue;
+					auto *slot = ensureSlot(dst, sty, /*initFromCurrent=*/false);
+					builder.CreateStore(sv, slot);
+					vtypes[dst]=sty;
+					// Keep SSA view in sync for consumers that read vmap directly
+					auto *cur = builder.CreateLoad(map_type(sty), slot, dst);
+					vmap[dst] = cur;
+				}
+				else if(op=="as" && il.size()==4){ // (as %dst <type> %initOrLiteral)
+					std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue;
+					TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; }
+					llvm::Value* initV = nullptr; llvm::Type* lty = map_type(ty);
+					// initializer can be a symbol or a literal
+					if(std::holds_alternative<symbol>(il[3]->data)){
+						// Resolve directly from current SSA map to avoid alias recursion during initialization
+						std::string initName = trimPct(symName(il[3]));
+						if(!initName.empty()){
+							if(auto itInit = vmap.find(initName); itInit != vmap.end()){
+								initV = itInit->second;
+							}
+						}
+					}else if(std::holds_alternative<int64_t>(il[3]->data)){
+						initV = llvm::ConstantInt::get(lty, (uint64_t)std::get<int64_t>(il[3]->data), true);
+					}else if(std::holds_alternative<double>(il[3]->data)){
+						initV = llvm::ConstantFP::get(lty, std::get<double>(il[3]->data));
+					}
+					if(!initV){
+						// Fallback to undef/null of the declared type if initializer isn't resolvable
+						initV = llvm::UndefValue::get(lty);
+					}
+					auto *slot = ensureSlot(dst, ty, /*initFromCurrent=*/false);
+					builder.CreateStore(initV, slot);
+					vtypes[dst]=ty;
+					// Also expose a loaded SSA value for %dst so paths that consult vmap directly see the current value.
+					// getVal will prefer the slot, but a few ops read vmap directly (e.g., some legacy paths).
+					auto *loaded = builder.CreateLoad(map_type(ty), slot, dst);
+					vmap[dst] = loaded;
+					// Now register alias so future reads of the initializer symbol go through this variable's slot
+					if(std::holds_alternative<symbol>(il[3]->data)){
+						std::string initName = trimPct(symName(il[3]));
+						if(!initName.empty()){
+							initAlias[initName] = dst;
+							// Also redirect the initializer symbol's SSA to the current loaded value
+							vmap[initName] = loaded;
+							vtypes[initName] = ty;
+						}
+					}
+					// Optionally emit debug info for the local variable
+					if(enableDebugInfo && F->getSubprogram()){
+						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(ty));
+						auto *expr = DIB->createExpression();
+						(void)DIB->insertDeclare(slot, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+					}
+				}
 				else if(op=="alloca" && il.size()==3){ std::string dst=trimPct(symName(il[1])); if(dst.empty()) continue; TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; } auto *av=builder.CreateAlloca(map_type(ty), nullptr, dst); vmap[dst]=av; vtypes[dst]=tctx_.get_pointer(ty);
 					if(enableDebugInfo && F->getSubprogram()){
 						auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(ty));
@@ -965,7 +1136,38 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					TypeId ty; try{ ty=tctx_.parse_type(il[2]); }catch(...){ continue; }
 					llvm::Type* lty=map_type(ty); llvm::Value* uv=llvm::UndefValue::get(lty); vmap[dst]=uv; vtypes[dst]=ty; }
 				else if(op=="va-end" && il.size()==2){ /* no-op */ }
-				else if(op=="if"){ if(il.size()>=3){ std::string cond=trimPct(symName(il[1])); auto itc=vmap.find(cond); if(itc==vmap.end()) continue; auto *thenBB=llvm::BasicBlock::Create(*llctx_,"if.then."+std::to_string(cfCounter++),F); llvm::BasicBlock* elseBB=nullptr; auto *mergeBB=llvm::BasicBlock::Create(*llctx_,"if.end."+std::to_string(cfCounter++),F); bool hasElse=il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data); if(hasElse) elseBB=llvm::BasicBlock::Create(*llctx_,"if.else."+std::to_string(cfCounter++),F); if(!builder.GetInsertBlock()->getTerminator()) builder.CreateCondBr(itc->second, thenBB, hasElse?elseBB:mergeBB); builder.SetInsertPoint(thenBB); if(std::holds_alternative<vector_t>(il[2]->data)) emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref); if(!thenBB->getTerminator()) builder.CreateBr(mergeBB); if(hasElse){ builder.SetInsertPoint(elseBB); emit_ref(std::get<vector_t>(il[3]->data).elems, emit_ref); if(!elseBB->getTerminator()) builder.CreateBr(mergeBB);} builder.SetInsertPoint(mergeBB);} }
+				else if(op=="if"){ if(il.size()>=3){
+					// Evaluate condition with slot-awareness; if SSA temp, try to recompute from definition
+					std::string cName = trimPct(symName(il[1]));
+					llvm::Value* condV = nullptr;
+					auto sIt = varSlots.find(cName);
+					if(sIt != varSlots.end()){
+						auto tIt = vtypes.find(cName);
+						if(tIt != vtypes.end()) condV = builder.CreateLoad(map_type(tIt->second), sIt->second, cName);
+					} else {
+						condV = evalDefined(cName);
+						if(!condV) condV = getVal(il[1]);
+					}
+					if(!condV) continue;
+					auto *thenBB=llvm::BasicBlock::Create(*llctx_,"if.then."+std::to_string(cfCounter++),F);
+					llvm::BasicBlock* elseBB=nullptr;
+					auto *mergeBB=llvm::BasicBlock::Create(*llctx_,"if.end."+std::to_string(cfCounter++),F);
+					bool hasElse=il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data);
+					if(hasElse) elseBB=llvm::BasicBlock::Create(*llctx_,"if.else."+std::to_string(cfCounter++),F);
+					if(!builder.GetInsertBlock()->getTerminator()) builder.CreateCondBr(condV, thenBB, hasElse?elseBB:mergeBB);
+					// Then block
+					builder.SetInsertPoint(thenBB);
+					if(std::holds_alternative<vector_t>(il[2]->data)) emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref);
+					// If nested control flow changed the insertion point, ensure the current block is terminated
+					if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(mergeBB);
+					// Else block (optional)
+					if(hasElse){
+						builder.SetInsertPoint(elseBB);
+						emit_ref(std::get<vector_t>(il[3]->data).elems, emit_ref);
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(mergeBB);
+					}
+					builder.SetInsertPoint(mergeBB);
+				} }
 				else if(op=="try"){ // (try :body [ ... ] :catch [ ... ])  -- Itanium & SEH (catch-all minimal)
 					// Parse sections
 					node_ptr bodyNode=nullptr, catchNode=nullptr;
@@ -1042,7 +1244,39 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 						builder.SetInsertPoint(contBB);
 					}
 				}
-				else if(op=="while"){ if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)){ std::string cond=trimPct(symName(il[1])); auto itc=vmap.find(cond); if(itc==vmap.end()) continue; auto *condBB=llvm::BasicBlock::Create(*llctx_,"while.cond."+std::to_string(cfCounter++),F); auto *bodyBB=llvm::BasicBlock::Create(*llctx_,"while.body."+std::to_string(cfCounter++),F); auto *endBB=llvm::BasicBlock::Create(*llctx_,"while.end."+std::to_string(cfCounter++),F); if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(condBB); builder.SetInsertPoint(condBB); builder.CreateCondBr(itc->second, bodyBB, endBB); builder.SetInsertPoint(bodyBB); loopEndStack.push_back(endBB); loopContinueStack.push_back(condBB); emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref); loopContinueStack.pop_back(); loopEndStack.pop_back(); if(!bodyBB->getTerminator()) builder.CreateBr(condBB); builder.SetInsertPoint(endBB);} }
+				else if(op=="while"){ if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)){
+					auto *condBB=llvm::BasicBlock::Create(*llctx_,"while.cond."+std::to_string(cfCounter++),F);
+					auto *bodyBB=llvm::BasicBlock::Create(*llctx_,"while.body."+std::to_string(cfCounter++),F);
+					auto *endBB=llvm::BasicBlock::Create(*llctx_,"while.end."+std::to_string(cfCounter++),F);
+					if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(condBB);
+					builder.SetInsertPoint(condBB);
+					// Re-evaluate condition each iteration; load from slot if assigned or recompute from def
+					std::string wName = trimPct(symName(il[1]));
+					llvm::Value* condV = nullptr;
+					auto sItW = varSlots.find(wName);
+					if(sItW != varSlots.end()){
+						auto tIt = vtypes.find(wName);
+						if(tIt != vtypes.end()) condV = builder.CreateLoad(map_type(tIt->second), sItW->second, wName);
+					} else {
+						condV = evalDefined(wName);
+						if(!condV) condV = getVal(il[1]);
+					}
+					if(!condV){ builder.CreateBr(endBB); builder.SetInsertPoint(endBB); }
+					else {
+						builder.CreateCondBr(condV, bodyBB, endBB);
+						builder.SetInsertPoint(bodyBB);
+						loopEndStack.push_back(endBB);
+						loopContinueStack.push_back(condBB);
+						emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref);
+						loopContinueStack.pop_back();
+						loopEndStack.pop_back();
+						// If the current insertion block (which may be a nested merge inside the loop body)
+						// is not terminated, branch back to the loop condition. This is more robust than
+						// checking only the original bodyBB.
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(condBB);
+						builder.SetInsertPoint(endBB);
+					}
+				} }
 				else if(op=="for"){ // (for :init [..] :cond %c :step [..] :body [..])
 					// Parse keyword sections
 					std::vector<node_ptr> initVec, condSymNode, stepVec, bodyVec; std::string condVar;
@@ -1056,8 +1290,34 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 					auto *endBB=llvm::BasicBlock::Create(*llctx_,"for.end."+std::to_string(cfCounter++),F);
 					if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(condBB);
 					builder.SetInsertPoint(condBB);
-					auto itc=vmap.find(trimPct(condVar)); if(itc==vmap.end()) { builder.CreateBr(endBB); builder.SetInsertPoint(endBB); }
-					else { builder.CreateCondBr(itc->second, bodyBB, endBB); builder.SetInsertPoint(bodyBB); loopEndStack.push_back(endBB); loopContinueStack.push_back(stepBB); if(!bodyVec.empty()) emit_ref(bodyVec, emit_ref); loopContinueStack.pop_back(); if(!bodyBB->getTerminator()) builder.CreateBr(stepBB); builder.SetInsertPoint(stepBB); if(!stepVec.empty()) emit_ref(stepVec, emit_ref); loopEndStack.pop_back(); if(!stepBB->getTerminator()) builder.CreateBr(condBB); builder.SetInsertPoint(endBB); }
+					// Evaluate condition, loading from var slot if present or recomputing from def if necessary
+					std::string cName = trimPct(condVar);
+					llvm::Value* condV = nullptr;
+					auto sIt = varSlots.find(cName);
+					if(sIt != varSlots.end()){
+						auto tIt = vtypes.find(cName);
+						if(tIt != vtypes.end()) condV = builder.CreateLoad(map_type(tIt->second), sIt->second, cName);
+					} else {
+						condV = evalDefined(cName);
+						if(!condV){ auto itc=vmap.find(cName); if(itc!=vmap.end()) condV = itc->second; }
+					}
+					if(!condV){ builder.CreateBr(endBB); builder.SetInsertPoint(endBB); }
+					else {
+						builder.CreateCondBr(condV, bodyBB, endBB);
+						builder.SetInsertPoint(bodyBB);
+						loopEndStack.push_back(endBB);
+						loopContinueStack.push_back(stepBB);
+						if(!bodyVec.empty()) emit_ref(bodyVec, emit_ref);
+						loopContinueStack.pop_back();
+						// Ensure we branch from the current insertion block (which may be a nested merge)
+						// to the step block if it's not already terminated.
+						if(!builder.GetInsertBlock()->getTerminator()) builder.CreateBr(stepBB);
+						builder.SetInsertPoint(stepBB);
+						if(!stepVec.empty()) emit_ref(stepVec, emit_ref);
+						loopEndStack.pop_back();
+						if(!stepBB->getTerminator()) builder.CreateBr(condBB);
+						builder.SetInsertPoint(endBB);
+					}
 				}
 				else if(op=="switch"){ // (switch %expr :cases [ (case <int> [ ... ])* ] :default [ ... ])
 					if(il.size()<2) continue; std::string expr=trimPct(symName(il[1])); if(expr.empty()||!vmap.count(expr)) continue; llvm::Value* exprV=vmap[expr];
@@ -1245,7 +1505,23 @@ llvm::Module* IREmitter::emit(const node_ptr& module_ast, TypeCheckResult& tc_re
 				}
 				else if(op=="break"){ if(!loopEndStack.empty() && !builder.GetInsertBlock()->getTerminator()) builder.CreateBr(loopEndStack.back()); return; }
 				else if(op=="continue"){ if(!loopContinueStack.empty() && !builder.GetInsertBlock()->getTerminator()){ builder.CreateBr(loopContinueStack.back()); return; } }
-				else if(op=="ret" && il.size()==3){ std::string rv=trimPct(symName(il[2])); if(!rv.empty() && vmap.count(rv)) builder.CreateRet(vmap[rv]); else if(fty->getReturnType()->isVoidTy()) builder.CreateRetVoid(); else builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType())); functionDone=true; return; }
+				else if(op=="ret" && il.size()==3){
+					std::string rv=trimPct(symName(il[2]));
+					if(!rv.empty()){
+						// If value is slot-backed, load from slot for return
+						auto sIt = varSlots.find(rv);
+						if(sIt != varSlots.end()){
+							auto tIt = vtypes.find(rv);
+							if(tIt != vtypes.end()){
+								auto *lv = builder.CreateLoad(map_type(tIt->second), sIt->second, rv+".ret");
+								builder.CreateRet(lv);
+								functionDone=true; return;
+							}
+						}
+						if(vmap.count(rv)){ builder.CreateRet(vmap[rv]); functionDone=true; return; }
+					}
+					if(fty->getReturnType()->isVoidTy()) builder.CreateRetVoid(); else builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType())); functionDone=true; return;
+				}
 			}
 		};
 		emit_list(std::get<vector_t>(body->data).elems, emit_list);

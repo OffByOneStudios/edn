@@ -1,6 +1,6 @@
 # edn
 
-Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3/4/5 features).
+Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnostics, and Phase 3/4/5 features). Includes a tiny Rust-like frontend (Rustlite) to drive end-to-end demos.
 
 ## Features (current)
 - Header-only: single include `#include <edn/edn.hpp>`
@@ -206,6 +206,8 @@ Docs:
  - docs/EXTERNALS.md
  - docs/EH.md
  - docs/COROUTINES.md
+ - docs/RUSTLITE.md
+ - docs/EDN_BUILDER.md
 
 Note on IR printing: LLVM quotes symbol names that contain special characters. For example, generic instances are mangled like `id@i32`, which will appear in IR as `@"id@i32"`. Tests and string matches should account for the quotes.
 
@@ -303,4 +305,4 @@ Phase 5 focuses on tiny language prototypes and opt/pipeline controls. A Rust-li
 - Simple `let`/`mut` sugar via macros lowering to EDN `block` bodies.
 - Driver-level PHI validation to ensure result-mode lowering never yields `undef` incoming values.
 
-Docs: see `design/phase5_plan.md` and `design/rustlite.md`.
+Docs: see `design/phase5_plan.md`, `design/rustlite.md`, and the quickstart in `docs/RUSTLITE.md`.

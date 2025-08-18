@@ -12,6 +12,7 @@
 #include <optional>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 
 namespace edn {
 
@@ -82,7 +83,72 @@ inline bool env_flag_enabled(const char* name) {
 inline node_ptr parse(std::string_view input){ detail::reader r(input); r.skip_ws(); auto v=detail::parse_value(r); r.skip_ws(); if(!r.eof()) throw parse_error("unexpected trailing characters"); return v; }
 
 inline std::string to_string(const node& n); inline std::string to_string(const node_ptr& p){ return to_string(*p); }
+// Pretty printer with newlines and indentation for readability
+inline std::string to_pretty_string(const node& n, int indentWidth = 2);
+inline std::string to_pretty_string(const node_ptr& p, int indentWidth = 2){ return to_pretty_string(*p, indentWidth); }
 inline std::string to_string(const node& n){ struct V { std::string operator()(std::monostate)const{return "nil";} std::string operator()(bool b)const{return b?"true":"false";} std::string operator()(int64_t i)const{return std::to_string(i);} std::string operator()(double d)const{ std::ostringstream oss; oss<<d; return oss.str(); } std::string operator()(const std::string& s)const{ return '"'+s+'"'; } std::string operator()(const keyword& k)const{ return ':'+k.name; } std::string operator()(const symbol& s)const{ return s.name; } std::string operator()(const list& l)const{ std::string out="("; bool first=true; for(auto& ch:l.elems){ if(!first) out+=' '; first=false; out+=to_string(ch); } out+=')'; return out;} std::string operator()(const vector_t& v)const{ std::string out="["; bool first=true; for(auto& ch:v.elems){ if(!first) out+=' '; first=false; out+=to_string(ch);} out+=']'; return out;} std::string operator()(const set& s)const{ std::string out="#{"; bool first=true; for(auto& ch:s.elems){ if(!first) out+=' '; first=false; out+=to_string(ch);} out+='}'; return out;} std::string operator()(const map& m)const{ std::string out="{"; bool first=true; for(auto& kv:m.entries){ if(!first) out+=' '; first=false; out+=to_string(kv.first)+' '+to_string(kv.second);} out+='}'; return out;} std::string operator()(const tagged_value& tv)const{ return '#'+tv.tag.name+' '+to_string(tv.inner); } }; return std::visit(V{}, n.data); }
+
+inline std::string to_pretty_string(const node& n, int indentWidth){
+    // helper lambdas
+    auto indentStr = [](int n){ return std::string(n, ' '); };
+    std::function<std::string(const node&, int)> pp = [&](const node& x, int indent){
+        if(std::holds_alternative<std::monostate>(x.data)) return std::string("nil");
+        if(std::holds_alternative<bool>(x.data)) return std::get<bool>(x.data)?std::string("true"):std::string("false");
+        if(std::holds_alternative<int64_t>(x.data)) return std::to_string(std::get<int64_t>(x.data));
+        if(std::holds_alternative<double>(x.data)){ std::ostringstream oss; oss<<std::get<double>(x.data); return oss.str(); }
+        if(std::holds_alternative<std::string>(x.data)) return '"'+std::get<std::string>(x.data)+'"';
+        if(std::holds_alternative<keyword>(x.data)) return std::string(":")+std::get<keyword>(x.data).name;
+        if(std::holds_alternative<symbol>(x.data)) return std::get<symbol>(x.data).name;
+        if(std::holds_alternative<list>(x.data)){
+            const auto &elems = std::get<list>(x.data).elems;
+            if(elems.empty()) return std::string("()");
+            std::string out = "(\n";
+            for(size_t i=0;i<elems.size();++i){
+                out += indentStr(indent+indentWidth) + pp(*elems[i], indent+indentWidth);
+                out += "\n";
+            }
+            out += indentStr(indent) + ")";
+            return out;
+        }
+        if(std::holds_alternative<vector_t>(x.data)){
+            const auto &elems = std::get<vector_t>(x.data).elems;
+            if(elems.empty()) return std::string("[]");
+            std::string out = "[\n";
+            for(size_t i=0;i<elems.size();++i){
+                out += indentStr(indent+indentWidth) + pp(*elems[i], indent+indentWidth);
+                out += "\n";
+            }
+            out += indentStr(indent) + "]";
+            return out;
+        }
+        if(std::holds_alternative<set>(x.data)){
+            const auto &elems = std::get<set>(x.data).elems;
+            if(elems.empty()) return std::string("#{}");
+            std::string out = "#{\n";
+            for(size_t i=0;i<elems.size();++i){
+                out += indentStr(indent+indentWidth) + pp(*elems[i], indent+indentWidth) + "\n";
+            }
+            out += indentStr(indent) + "}";
+            return out;
+        }
+        if(std::holds_alternative<map>(x.data)){
+            const auto &entries = std::get<map>(x.data).entries;
+            if(entries.empty()) return std::string("{}");
+            std::string out = "{\n";
+            for(size_t i=0;i<entries.size(); ++i){
+                out += indentStr(indent+indentWidth) + pp(*entries[i].first, indent+indentWidth) + " " + pp(*entries[i].second, indent+indentWidth) + "\n";
+            }
+            out += indentStr(indent) + "}";
+            return out;
+        }
+        if(std::holds_alternative<tagged_value>(x.data)){
+            const auto &tv = std::get<tagged_value>(x.data);
+            return std::string("#") + tv.tag.name + " " + pp(*tv.inner, indent);
+        }
+        return std::string("<unknown>");
+    };
+    return pp(n, 0);
+}
 
 inline bool is_symbol(const node& n){ return std::holds_alternative<symbol>(n.data); }
 inline bool is_keyword(const node& n){ return std::holds_alternative<keyword>(n.data); }
@@ -94,5 +160,49 @@ inline int line(const node& n){ return meta_int(n,"line"); }
 inline int col(const node& n){ return meta_int(n,"col"); }
 inline int end_line(const node& n){ return meta_int(n,"end-line"); }
 inline int end_col(const node& n){ return meta_int(n,"end-col"); }
+
+// ------ Ergonomic helpers and insertion operators ------
+
+// Factory helpers (prefixed to avoid colliding with existing helpers in tests/expanders)
+inline node_ptr n_sym(std::string name){ return detail::make_node(symbol{ std::move(name) }); }
+inline node_ptr n_kw(std::string name){ return detail::make_node(keyword{ std::move(name) }); }
+inline node_ptr n_str(std::string s){ return detail::make_node(std::move(s)); }
+inline node_ptr n_i64(int64_t v){ return detail::make_node(v); }
+inline node_ptr n_f64(double v){ return detail::make_node(v); }
+inline node_ptr n_bool(bool b){ return detail::make_node(b); }
+
+inline node_ptr node_list(){ return detail::make_node(list{}); }
+inline node_ptr node_vec(){ return detail::make_node(vector_t{}); }
+inline node_ptr node_set(){ return detail::make_node(set{}); }
+inline node_ptr node_map(){ return detail::make_node(map{}); }
+
+inline node_ptr node_list(std::initializer_list<node_ptr> xs){ list l; l.elems.assign(xs.begin(), xs.end()); return detail::make_node(std::move(l)); }
+inline node_ptr node_vec(std::initializer_list<node_ptr> xs){ vector_t v; v.elems.assign(xs.begin(), xs.end()); return detail::make_node(std::move(v)); }
+inline node_ptr node_set(std::initializer_list<node_ptr> xs){ set s; s.elems.assign(xs.begin(), xs.end()); return detail::make_node(std::move(s)); }
+inline node_ptr node_map(std::initializer_list<std::pair<node_ptr,node_ptr>> xs){ map m; m.entries.assign(xs.begin(), xs.end()); return detail::make_node(std::move(m)); }
+
+inline std::pair<node_ptr,node_ptr> kvp(node_ptr k, node_ptr v){ return { std::move(k), std::move(v) }; }
+
+// Append operators for collection types
+inline list& operator<<(list& l, const node_ptr& n){ l.elems.push_back(n); return l; }
+inline vector_t& operator<<(vector_t& v, const node_ptr& n){ v.elems.push_back(n); return v; }
+inline set& operator<<(set& s, const node_ptr& n){ s.elems.push_back(n); return s; }
+inline map& operator<<(map& m, const std::pair<node_ptr,node_ptr>& kv){ m.entries.push_back(kv); return m; }
+
+// Generic appender for node_ptr collections
+inline node_ptr& operator<<(node_ptr& c, const node_ptr& n){
+    if(!c) throw std::invalid_argument("operator<<: null container node");
+    if(std::holds_alternative<list>(c->data)) { std::get<list>(c->data).elems.push_back(n); }
+    else if(std::holds_alternative<vector_t>(c->data)) { std::get<vector_t>(c->data).elems.push_back(n); }
+    else if(std::holds_alternative<set>(c->data)) { std::get<set>(c->data).elems.push_back(n); }
+    else { throw std::invalid_argument("operator<<: container is not list/vector/set"); }
+    return c;
+}
+inline node_ptr& operator<<(node_ptr& c, const std::pair<node_ptr,node_ptr>& kv){
+    if(!c) throw std::invalid_argument("operator<<: null container node");
+    if(std::holds_alternative<map>(c->data)) { std::get<map>(c->data).entries.push_back(kv); }
+    else { throw std::invalid_argument("operator<<: container is not a map"); }
+    return c;
+}
 
 } // namespace edn
