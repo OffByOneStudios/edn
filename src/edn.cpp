@@ -28,6 +28,8 @@
 // Centralized DataLayout helpers
 #include "edn/ir/types.hpp"
 #include "edn/ir/layout.hpp"
+#include "edn/ir/debug.hpp"
+#include "edn/ir/collect.hpp"
 
 namespace edn
 {
@@ -63,178 +65,12 @@ namespace edn
 		module_ = std::make_unique<llvm::Module>("edn.module", *llctx_);
 		// Optional: enable LLVM Debug Info (DWARF/CodeView agnostic in IR)
 		bool enableDebugInfo = false;
-		if (const char *dbg = std::getenv("EDN_ENABLE_DEBUG"); dbg && std::string(dbg) == "1")
-		{
-			enableDebugInfo = true;
-		}
-		std::unique_ptr<llvm::DIBuilder> DIB;
-		// Create a compile unit for DWARF info (result unused)
-		llvm::DIFile *DI_File = nullptr;
-		if (enableDebugInfo)
-		{
-			// Minimal, backend-agnostic setup
-			module_->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
-			module_->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 5u);
-			DIB = std::make_unique<llvm::DIBuilder>(*module_);
-			// Use synthetic file info (tests often embed strings). Allow override via env.
-			std::string srcFile = "inline.edn";
-			std::string srcDir = ".";
-			if (const char *sf = std::getenv("EDN_DEBUG_FILE"))
-			{
-				srcFile = sf;
-			}
-			if (const char *sd = std::getenv("EDN_DEBUG_DIR"))
-			{
-				srcDir = sd;
-			}
-			DI_File = DIB->createFile(srcFile, srcDir);
-			(void)DIB->createCompileUnit(llvm::dwarf::DW_LANG_C, DI_File, "edn", /*isOptimized*/ false, "", 0);
-		}
-		// Minimal DI type mapper with a small cache
-		std::unordered_map<TypeId, llvm::DIType *> DITypeCache;
-		std::function<llvm::DIType *(TypeId)> diTypeOf;
-		diTypeOf = [&](TypeId id) -> llvm::DIType *
-		{
-			if (!enableDebugInfo || !DIB)
-				return nullptr;
-			if (auto it = DITypeCache.find(id); it != DITypeCache.end())
-				return it->second;
-			llvm::DIType *out = nullptr;
-			const Type &T = tctx_.at(id);
-			switch (T.kind)
-			{
-			case Type::Kind::Base:
-			{
-				if (T.base == BaseType::Void)
-				{
-					out = nullptr;
-					break;
-				}
-				unsigned bits = base_type_bit_width(T.base);
-				unsigned enc = 0;
-				switch (T.base)
-				{
-				case BaseType::F32:
-				case BaseType::F64:
-					enc = llvm::dwarf::DW_ATE_float;
-					break;
-				case BaseType::U8:
-				case BaseType::U16:
-				case BaseType::U32:
-				case BaseType::U64:
-					enc = llvm::dwarf::DW_ATE_unsigned;
-					break;
-				default:
-					enc = llvm::dwarf::DW_ATE_signed;
-					break;
-				}
-				out = DIB->createBasicType(tctx_.to_string(id), bits, enc);
-				break;
-			}
-			case Type::Kind::Pointer:
-			{
-				auto *pointee = diTypeOf(T.pointee);
-				uint64_t psz = edn::ir::pointer_size_in_bits(*module_);
-				uint32_t palignBits = edn::ir::pointer_abi_alignment_in_bits(*module_);
-				out = DIB->createPointerType(pointee, psz, palignBits);
-				break;
-			}
-			case Type::Kind::Struct:
-			{
-				// Build member list with offsets/sizes from DataLayout
-				auto ftIt = struct_field_types_.find(T.struct_name);
-				llvm::StructType *ST = llvm::StructType::getTypeByName(*llctx_, "struct." + T.struct_name);
-				if (!ST && ftIt != struct_field_types_.end())
-				{
-					std::vector<llvm::Type *> elemLL;
-					for (auto tid : ftIt->second)
-						elemLL.push_back(map_type(tid));
-					ST = llvm::StructType::create(*llctx_, elemLL, "struct." + T.struct_name);
-				}
-				uint64_t szBits = 0;
-				uint32_t aBits = 0;
-				if (ST)
-				{
-					szBits = edn::ir::layout::alloc_size_bytes(*module_, ST) * 8;
-					aBits = edn::ir::layout::abi_align_bits(*module_, ST);
-				}
-				std::vector<llvm::Metadata *> membersMD;
-				if (ftIt != struct_field_types_.end() && ST)
-				{
-					std::cout << "[di] building struct DI for '" << T.struct_name << "' with " << ftIt->second.size() << " fields\n";
-					auto idxIt = struct_field_index_.find(T.struct_name);
-					// Rebuild ordered field name list by index
-					std::vector<std::string> fieldNames(ftIt->second.size());
-					if (idxIt != struct_field_index_.end())
-					{
-						for (const auto &p : idxIt->second)
-						{
-							if (p.second < fieldNames.size())
-								fieldNames[p.second] = p.first;
-						}
-					}
-					auto *SL = edn::ir::layout::struct_layout(*module_, ST);
-					for (size_t i = 0; i < ftIt->second.size(); ++i)
-					{
-						TypeId fid = ftIt->second[i];
-						auto *fDI = diTypeOf(fid);
-						llvm::Type *fLL = map_type(fid);
-						uint64_t fSizeBits = edn::ir::layout::alloc_size_bytes(*module_, fLL) * 8;
-						uint32_t fAlignBits = edn::ir::layout::abi_align_bits(*module_, fLL);
-						uint64_t offBits = SL ? SL->getElementOffsetInBits((unsigned)i) : 0;
-						std::string fname = (i < fieldNames.size() && !fieldNames[i].empty()) ? fieldNames[i] : ("field" + std::to_string(i));
-						unsigned fLine = 1;
-						{
-							auto flIt = struct_field_lines_.find(T.struct_name);
-							if (flIt != struct_field_lines_.end() && i < flIt->second.size() && flIt->second[i] > 0)
-							{
-								fLine = flIt->second[i];
-							}
-						}
-						auto *mem = DIB->createMemberType(/*Scope*/ DI_File, fname, DI_File, /*Line*/ fLine, fSizeBits, fAlignBits, offBits, llvm::DINode::FlagZero, fDI);
-						membersMD.push_back(mem);
-					}
-				}
-				std::cout << "[di] built " << membersMD.size() << " member DI entries for struct '" << T.struct_name << "'\n";
-				out = DIB->createStructType(DI_File, T.struct_name, DI_File, /*Line*/ 1, /*SizeInBits*/ szBits, /*AlignInBits*/ aBits, llvm::DINode::FlagZero, nullptr, DIB->getOrCreateArray(membersMD));
-				break;
-			}
-			case Type::Kind::Array:
-			{
-				auto *elemTy = diTypeOf(T.elem);
-				uint64_t ebits = 0;
-				const Type &ET = tctx_.at(T.elem);
-				if (ET.kind == Type::Kind::Base)
-					ebits = base_type_bit_width(ET.base);
-				uint64_t sizeBits = ebits * T.array_size;
-				auto subrange = DIB->getOrCreateSubrange(0, (int64_t)T.array_size);
-				// Compute ABI alignment for the full array type
-				uint32_t aalignBits = 0;
-				{
-					llvm::Type *arrLL = llvm::ArrayType::get(map_type(T.elem), (uint64_t)T.array_size);
-					aalignBits = edn::ir::layout::abi_align_bits(*module_, arrLL);
-				}
-				out = DIB->createArrayType(sizeBits, aalignBits, elemTy, DIB->getOrCreateArray({subrange}));
-				break;
-			}
-			case Type::Kind::Function:
-			{
-				auto *retTy = diTypeOf(T.ret);
-				std::vector<llvm::Metadata *> all;
-				all.push_back(retTy ? static_cast<llvm::Metadata *>(retTy) : nullptr);
-				for (auto pid : T.params)
-				{
-					auto *pti = diTypeOf(pid);
-					all.push_back(static_cast<llvm::Metadata *>(pti));
-				}
-				auto arr = DIB->getOrCreateTypeArray(all);
-				out = DIB->createSubroutineType(arr);
-				break;
-			}
-			}
-			DITypeCache[id] = out;
-			return out;
-		};
+
+		// Build Debug Manager
+		auto debug_manager_ = std::make_shared<edn::ir::debug::DebugManager>(enableDebugInfo, module_, this);
+		debug_manager_->initialize();
+		
+
 		// Centralized env
 		const auto env = edn::detectEnv();
 		edn::applyEnvToModule(*module_, env);
@@ -252,147 +88,9 @@ namespace edn
 		bool panicUnwind = env.panicUnwind;
 		bool enableCoro = env.enableCoro;
 
-		auto collect_structs = [&](const std::vector<node_ptr> &elems)
-		{ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data)|| std::get<symbol>(l[0]->data).name!="struct") continue; std::string sname; std::vector<TypeId> ftypes; std::vector<std::string> fnames; std::vector<unsigned> flines; for(size_t i=1;i<l.size();++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") sname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) continue; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty){ fnames.push_back(fname); ftypes.push_back(fty); unsigned ln = (unsigned)edn::line(*f); if(ln==0) ln=1; flines.push_back(ln);} } } } if(!sname.empty()&& !ftypes.empty()){ get_or_create_struct(sname,ftypes); struct_field_types_[sname]=ftypes; auto &m=struct_field_index_[sname]; for(size_t ix=0; ix<fnames.size(); ++ix) m[fnames[ix]]=ix; struct_field_lines_[sname]=flines; } } };
-		// Collect sums: represent as { i32 tag, [N x i8] payload }
-		auto collect_sums = [&](const std::vector<node_ptr> &elems)
-		{
-			for (auto &n : elems)
-			{
-				if (!n || !std::holds_alternative<list>(n->data))
-					continue;
-				auto &l = std::get<list>(n->data).elems;
-				if (l.empty())
-					continue;
-				if (!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name != "sum")
-					continue;
-				std::string sname;
-				node_ptr variantsNode;
-				for (size_t i = 1; i < l.size(); ++i)
-				{
-					if (!std::holds_alternative<keyword>(l[i]->data))
-						continue;
-					std::string kw = std::get<keyword>(l[i]->data).name;
-					if (++i >= l.size())
-						break;
-					auto val = l[i];
-					if (kw == "name")
-						sname = symName(val);
-					else if (kw == "variants")
-						variantsNode = val;
-				}
-				if (sname.empty() || !variantsNode || !std::holds_alternative<vector_t>(variantsNode->data))
-					continue;
-				std::vector<std::vector<TypeId>> variants;
-				std::unordered_map<std::string, int> vtags;
-				uint64_t maxPayload = 0;
-				int tag = 0;
-				for (auto &vn : std::get<vector_t>(variantsNode->data).elems)
-				{
-					if (!vn || !std::holds_alternative<list>(vn->data))
-						continue;
-					auto &vl = std::get<list>(vn->data).elems;
-					if (vl.empty() || !std::holds_alternative<symbol>(vl[0]->data) || std::get<symbol>(vl[0]->data).name != "variant")
-						continue;
-					std::string vname;
-					node_ptr fieldsNode;
-					for (size_t k = 1; k < vl.size(); ++k)
-					{
-						if (!std::holds_alternative<keyword>(vl[k]->data))
-							break;
-						std::string kw = std::get<keyword>(vl[k]->data).name;
-						if (++k >= vl.size())
-							break;
-						auto val = vl[k];
-						if (kw == "name")
-							vname = symName(val);
-						else if (kw == "fields")
-							fieldsNode = val;
-					}
-					std::vector<TypeId> ftys;
-					if (fieldsNode && std::holds_alternative<vector_t>(fieldsNode->data))
-					{
-						for (auto &tf : std::get<vector_t>(fieldsNode->data).elems)
-						{
-							try
-							{
-								ftys.push_back(tctx_.parse_type(tf));
-							}
-							catch (...)
-							{
-							}
-						}
-					}
-					variants.push_back(ftys);
-					if (!vname.empty())
-						vtags[vname] = tag; // compute payload size
-					uint64_t sz = 0;
-					for (auto &tid : ftys)
-					{
-						llvm::Type *ll = map_type(tid);
-						sz += edn::ir::size_in_bytes(*module_, ll);
-					}
-					if (sz > maxPayload)
-						maxPayload = sz;
-					++tag;
-				}
-				// create struct type if absent
-				auto *tagTy = llvm::Type::getInt32Ty(*llctx_);
-				uint64_t payloadBytes = maxPayload ? maxPayload : 1;
-				auto *payloadArr = llvm::ArrayType::get(llvm::Type::getInt8Ty(*llctx_), payloadBytes);
-				auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct." + sname);
-				if (!ST)
-					ST = llvm::StructType::create(*llctx_, {tagTy, payloadArr}, "struct." + sname);
-				else if (ST->isOpaque())
-					ST->setBody({tagTy, payloadArr}, false);
-				struct_field_types_[sname] = {tctx_.get_base(BaseType::I32), tctx_.get_array(tctx_.get_base(BaseType::I8), payloadBytes)};
-				struct_field_index_[sname]["tag"] = 0;
-				struct_field_index_[sname]["payload"] = 1;
-				sum_variant_field_types_[sname] = variants;
-				sum_variant_tag_[sname] = vtags;
-				sum_payload_size_[sname] = payloadBytes;
-			}
-		};
-		// Represent unions as single-field struct of byte array big enough to hold largest field (simplified); for loads we bitcast
-		auto collect_unions = [&](const std::vector<node_ptr> &elems)
-		{ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="union") continue; std::string uname; std::vector<std::pair<std::string,TypeId>> fields; for(size_t i=1;i<l.size(); ++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name") uname=symName(val); else if(kw=="fields" && std::holds_alternative<vector_t>(val->data)){ for(auto &f: std::get<vector_t>(val->data).elems){ if(!f||!std::holds_alternative<list>(f->data)) continue; auto &fl=std::get<list>(f->data).elems; if(fl.empty()||!std::holds_alternative<symbol>(fl[0]->data) || std::get<symbol>(fl[0]->data).name!="ufield") continue; std::string fname; TypeId fty=0; for(size_t k=1;k<fl.size(); ++k){ if(!std::holds_alternative<keyword>(fl[k]->data)) break; std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name") fname=symName(v); else if(fkw=="type") try{ fty=tctx_.parse_type(v);}catch(...){} } if(!fname.empty()&&fty) fields.emplace_back(fname,fty); } }
-		}
-		if(uname.empty()||fields.empty()) continue; // size calc
-	uint64_t maxSize=0; std::unordered_map<std::string,TypeId> ftypes; for(auto &p: fields){ llvm::Type* llT=map_type(p.second); uint64_t sz = edn::ir::size_in_bytes(*module_, llT); if(sz>maxSize) maxSize=sz; ftypes[p.first]=p.second; }
-		// create [maxSize x i8] array wrapper struct: { [N x i8] }
-		llvm::ArrayType* storageArr = llvm::ArrayType::get(llvm::Type::getInt8Ty(*llctx_), maxSize?maxSize:1);
-		auto *ST=llvm::StructType::create(*llctx_, {storageArr}, "struct."+uname); (void)ST; // suppress unused warning (layout captured via name)
-		struct_field_types_[uname] = { tctx_.get_array(tctx_.get_base(BaseType::I8), maxSize?maxSize:1) };
-		struct_field_index_[uname]["__storage"] = 0; // pseudo field
-		union_field_types_[uname] = ftypes; // remember logical fields
-	} };
-		auto emit_globals = [&](const std::vector<node_ptr> &elems)
-		{ for(auto &n: elems){ if(!n||!std::holds_alternative<list>(n->data)) continue; auto &l=std::get<list>(n->data).elems; if(l.empty()) continue; if(!std::holds_alternative<symbol>(l[0]->data)||std::get<symbol>(l[0]->data).name!="global") continue; std::string gname; TypeId gty=0; node_ptr init; bool isConst=false; for(size_t i=1;i<l.size(); ++i){ if(!std::holds_alternative<keyword>(l[i]->data)) continue; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto v=l[i]; if(kw=="name") gname=symName(v); else if(kw=="type") try{ gty=tctx_.parse_type(v);}catch(...){} else if(kw=="init") init=v; else if(kw=="const" && std::holds_alternative<bool>(v->data)) isConst=std::get<bool>(v->data); }
-		if(gname.empty()||!gty) continue; llvm::Type* lty=map_type(gty); llvm::Constant* c=nullptr; if(init){
-			// scalar init
-			if(std::holds_alternative<int64_t>(init->data)) c=llvm::ConstantInt::get(lty,(uint64_t)std::get<int64_t>(init->data),true);
-			else if(std::holds_alternative<double>(init->data)) c=llvm::ConstantFP::get(lty,std::get<double>(init->data));
-			// aggregate vector init for arrays or structs
-			else if(std::holds_alternative<vector_t>(init->data)){
-				const Type& T = tctx_.at(gty);
-				if(T.kind==Type::Kind::Array){ auto &elemsV = std::get<vector_t>(init->data).elems; if(elemsV.size()==T.array_size){ std::vector<llvm::Constant*> elemsC; elemsC.reserve(elemsV.size()); llvm::Type* eltTy = map_type(T.elem); bool ok=true; for(auto &e: elemsV){ if(!e){ ok=false; break;} if(std::holds_alternative<int64_t>(e->data)) elemsC.push_back(llvm::ConstantInt::get(eltTy,(uint64_t)std::get<int64_t>(e->data),true)); else if(std::holds_alternative<double>(e->data)) elemsC.push_back(llvm::ConstantFP::get(eltTy,std::get<double>(e->data))); else { ok=false; break;} } if(ok) c=llvm::ConstantArray::get(llvm::cast<llvm::ArrayType>(lty), elemsC); }
-				} else if(T.kind==Type::Kind::Struct){ auto &elemsV = std::get<vector_t>(init->data).elems; // expect one literal per base field in declared order
-					// Reconstruct struct field types from previously registered struct_types_ info if possible
-					// We rely on struct_field_types_ captured during earlier pass (collect_structs).
-					auto ftIt = struct_field_types_.find(T.struct_name);
-					if(ftIt!=struct_field_types_.end() && elemsV.size()==ftIt->second.size()){
-						std::vector<llvm::Constant*> fieldConsts; fieldConsts.reserve(elemsV.size()); bool ok=true; for(size_t fi=0; fi<elemsV.size(); ++fi){ auto &e=elemsV[fi]; if(!e){ ok=false; break; } const Type& FT=tctx_.at(ftIt->second[fi]); if(FT.kind!=Type::Kind::Base){ ok=false; break; } llvm::Type* flty=map_type(ftIt->second[fi]); if(std::holds_alternative<int64_t>(e->data) && is_integer_base(FT.base)) fieldConsts.push_back(llvm::ConstantInt::get(flty,(uint64_t)std::get<int64_t>(e->data),true)); else if(std::holds_alternative<double>(e->data) && is_float_base(FT.base)) fieldConsts.push_back(llvm::ConstantFP::get(flty,std::get<double>(e->data))); else if(std::holds_alternative<int64_t>(e->data) && is_float_base(FT.base)) fieldConsts.push_back(llvm::ConstantFP::get(flty,(double)std::get<int64_t>(e->data))); else { ok=false; break; } }
-						if(ok){ auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct."+T.struct_name); if(!ST) { std::vector<llvm::Type*> lt; for(auto tid: ftIt->second) lt.push_back(map_type(tid)); ST=llvm::StructType::create(*llctx_, lt, "struct."+T.struct_name); } c=llvm::ConstantStruct::get(ST, fieldConsts); }
-					}
-				}
-			}
-		}
-		if(!c) c=llvm::Constant::getNullValue(lty); auto *gv = new llvm::GlobalVariable(*module_, lty, isConst, llvm::GlobalValue::ExternalLinkage, c, gname); (void)gv;
-	} };
-		collect_structs(top);
-		collect_unions(top);
-		collect_sums(top);
-		emit_globals(top);
+		// Collect Structs, Sums, Unions, Globals
+		//TODO Fill in the call to run
+		edn::ir::collect::run(top, this);
 
 		for (size_t i = 1; i < top.size(); ++i)
 		{
@@ -486,26 +184,26 @@ namespace edn
 			auto *F = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
 			// Attach a DISubprogram to the function if debug is enabled
 			llvm::DISubprogram *DI_SP = nullptr;
-			if (enableDebugInfo && DIB && DI_File)
+			if (enableDebugInfo && debug_manager_->DIB && debug_manager_->DI_File)
 			{
 				// Build a real subroutine type for the function signature
 				std::vector<llvm::Metadata *> sigTys;
 				// Return type first
-				sigTys.push_back(static_cast<llvm::Metadata *>(diTypeOf(retTy)));
+				sigTys.push_back(static_cast<llvm::Metadata *>(debug_manager_->diTypeOf(retTy)));
 				// Param types
 				for (auto &pr : params)
 				{
-					sigTys.push_back(static_cast<llvm::Metadata *>(diTypeOf(pr.second)));
+					sigTys.push_back(static_cast<llvm::Metadata *>(debug_manager_->diTypeOf(pr.second)));
 				}
-				auto *subTy = DIB->createSubroutineType(DIB->getOrCreateTypeArray(sigTys));
+				auto *subTy = debug_manager_->DIB->createSubroutineType(debug_manager_->DIB->getOrCreateTypeArray(sigTys));
 				unsigned lineNo = edn::line(*fl[0]); // best-effort: use the "fn" token start line
 				if (lineNo == 0)
 					lineNo = 1;
-				DI_SP = DIB->createFunction(
-					/*Scope=*/DI_File,
+				DI_SP = debug_manager_->DIB->createFunction(
+					/*Scope=*/debug_manager_->DI_File,
 					/*Name=*/fname,
 					/*LinkageName=*/fname,
-					/*File=*/DI_File,
+					/*File=*/debug_manager_->DI_File,
 					/*LineNo=*/lineNo,
 					/*Type=*/subTy,
 					/*ScopeLine=*/lineNo,
@@ -580,10 +278,10 @@ namespace edn
 					std::string an = std::string(arg.getName());
 					llvm::DIType *diTy = nullptr;
 					if (auto it = vtypes.find(an); it != vtypes.end())
-						diTy = diTypeOf(it->second);
-					auto *pvar = DIB->createParameterVariable(F->getSubprogram(), an, argIndex, DI_File, F->getSubprogram()->getLine(), diTy, true);
-					auto *expr = DIB->createExpression();
-					(void)DIB->insertDbgValueIntrinsic(&arg, pvar, expr, builder.getCurrentDebugLocation(), entry);
+						diTy = debug_manager_->diTypeOf(it->second);
+					auto *pvar = debug_manager_->DIB->createParameterVariable(F->getSubprogram(), an, argIndex, debug_manager_->DI_File, F->getSubprogram()->getLine(), diTy, true);
+					auto *expr = debug_manager_->DIB->createExpression();
+					(void)debug_manager_->DIB->insertDbgValueIntrinsic(&arg, pvar, expr, builder.getCurrentDebugLocation(), entry);
 					++argIndex;
 				}
 			}
@@ -1736,9 +1434,9 @@ namespace edn
 						// Optionally emit debug info for the local variable
 						if (enableDebugInfo && F->getSubprogram())
 						{
-							auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(ty));
-							auto *expr = DIB->createExpression();
-							(void)DIB->insertDeclare(slot, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(ty));
+							auto *expr = debug_manager_->DIB->createExpression();
+							(void)debug_manager_->DIB->insertDeclare(slot, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
 					else if (op == "alloca" && il.size() == 3)
@@ -1760,9 +1458,9 @@ namespace edn
 						vtypes[dst] = tctx_.get_pointer(ty);
 						if (enableDebugInfo && F->getSubprogram())
 						{
-							auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(ty));
-							auto *expr = DIB->createExpression();
-							(void)DIB->insertDeclare(av, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(ty));
+							auto *expr = debug_manager_->DIB->createExpression();
+							(void)debug_manager_->DIB->insertDeclare(av, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
 					else if (op == "struct-lit" && il.size() == 4)
@@ -1811,9 +1509,9 @@ namespace edn
 						vtypes[dst] = tctx_.get_pointer(tctx_.get_struct(sname));
 						if (enableDebugInfo && F->getSubprogram())
 						{
-							auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(tctx_.get_struct(sname)));
-							auto *expr = DIB->createExpression();
-							(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(tctx_.get_struct(sname)));
+							auto *expr = debug_manager_->DIB->createExpression();
+							(void)debug_manager_->DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
 					else if (op == "sum-new" && (il.size() == 4 || il.size() == 5))
@@ -1880,9 +1578,9 @@ namespace edn
 						vtypes[dst] = tctx_.get_pointer(tctx_.get_struct(sname));
 						if (enableDebugInfo && F->getSubprogram())
 						{
-							auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(tctx_.get_struct(sname)));
-							auto *expr = DIB->createExpression();
-							(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(tctx_.get_struct(sname)));
+							auto *expr = debug_manager_->DIB->createExpression();
+							(void)debug_manager_->DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
 					else if (op == "sum-is" && il.size() == 5)
@@ -2016,9 +1714,9 @@ namespace edn
 						vtypes[dst] = tctx_.get_pointer(arrTy);
 						if (enableDebugInfo && F->getSubprogram())
 						{
-							auto *lv = DIB->createAutoVariable(F->getSubprogram(), dst, DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), diTypeOf(arrTy));
-							auto *expr = DIB->createExpression();
-							(void)DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(arrTy));
+							auto *expr = debug_manager_->DIB->createExpression();
+							(void)debug_manager_->DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
 					else if (op == "phi" && il.size() == 4)
@@ -3612,9 +3310,9 @@ namespace edn
 			}
 		}
 		// Finalize DI after all functions are emitted
-		if (enableDebugInfo && DIB)
+		if (enableDebugInfo && debug_manager_->DIB)
 		{
-			DIB->finalize();
+			debug_manager_->DIB->finalize();
 		}
 		// Optional: run an optimization pipeline if enabled. EDN_PASS_PIPELINE overrides presets.
 		if (const char *enable = std::getenv("EDN_ENABLE_PASSES"); enable && std::string(enable) == "1")
@@ -3631,74 +3329,7 @@ namespace edn
 			PB.registerLoopAnalyses(LAM);
 			PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-			// If a textual pipeline is provided, try to parse and run it.
-			if (const char *pipeline = std::getenv("EDN_PASS_PIPELINE"); pipeline && *pipeline)
-			{
-				llvm::ModulePassManager MPM;
-				// parsePassPipeline returns llvm::Error in recent LLVM; consume on failure and fall back.
-				if (auto Err = PB.parsePassPipeline(MPM, pipeline))
-				{
-					llvm::consumeError(std::move(Err));
-				}
-				else
-				{
-					// Optional IR verification before running pipeline (for debugging)
-					if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
-					{
-						if (llvm::verifyModule(*module_, &llvm::errs()))
-						{
-							llvm::errs() << "[edn] IR verify failed before custom pipeline\n";
-						}
-					}
-					MPM.run(*module_, MAM);
-					if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
-					{
-						if (llvm::verifyModule(*module_, &llvm::errs()))
-						{
-							llvm::errs() << "[edn] IR verify failed after custom pipeline\n";
-						}
-					}
-					return module_.get();
-				}
-			}
-
-			// No custom pipeline or parse failed: use presets via EDN_OPT_LEVEL (0/1/2/3)
-			llvm::OptimizationLevel optLevel = llvm::OptimizationLevel::O1; // default
-			if (const char *lvl = std::getenv("EDN_OPT_LEVEL"); lvl && *lvl)
-			{
-				std::string s = lvl;
-				for (char &c : s)
-					c = (char)tolower((unsigned char)c);
-				if (s == "0" || s == "o0")
-					optLevel = llvm::OptimizationLevel::O0;
-				else if (s == "2" || s == "o2")
-					optLevel = llvm::OptimizationLevel::O2;
-				else if (s == "3" || s == "o3")
-					optLevel = llvm::OptimizationLevel::O3;
-				else
-					optLevel = llvm::OptimizationLevel::O1;
-			}
-			if (optLevel != llvm::OptimizationLevel::O0)
-			{
-				llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel);
-				if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
-				{
-					if (llvm::verifyModule(*module_, &llvm::errs()))
-					{
-						llvm::errs() << "[edn] IR verify failed before preset pipeline\n";
-					}
-				}
-				MPM.run(*module_, MAM);
-				if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
-				{
-					if (llvm::verifyModule(*module_, &llvm::errs()))
-					{
-						llvm::errs() << "[edn] IR verify failed after preset pipeline\n";
-					}
-				}
-			}
-			// For O0, do nothing (preserve IR for debugging)
-		}
+			
 		return module_.get();
 	}
 

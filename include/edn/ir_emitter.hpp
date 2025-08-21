@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "edn/ir/debug.hpp"
+
 // Always have LLVM available
 #include <llvm/IR/Module.h>
 #include <llvm/IR/LLVMContext.h>
@@ -29,6 +31,9 @@ public:
     // Expose struct creation for helper utilities
     llvm::StructType* get_or_create_struct(const std::string& name, const std::vector<TypeId>& field_types);
 private:
+    // Friend the emit helper functions to split up work 
+
+public:
     TypeContext& tctx_;
     std::unique_ptr<llvm::LLVMContext> llctx_;
     std::unique_ptr<llvm::Module> module_;
@@ -45,7 +50,7 @@ private:
     std::unordered_map<std::string, uint64_t> sum_payload_size_; // sum name -> max payload bytes
 
     llvm::Type* map_type(TypeId id);
-    
+
 };
 
 } // namespace edn
