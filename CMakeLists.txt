@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.20)
-project(edn LANGUAGES CXX VERSION 0.0.1)
+project(edn LANGUAGES C CXX VERSION 0.0.1)
 
 # Options
 option(EDN_BUILD_TESTS "Build tests" ON)
+# Bring-up knob: when ON on Apple, we can selectively disable later-phase tests by default
+option(EDN_PORT_DARWIN "Enable Darwin (macOS arm64) bring-up defaults" OFF)
+
+# On Apple, silence linker warnings about duplicate libraries that can occur
+# when LLVM components are mapped to libnames for multiple targets.
+if(APPLE)
+    # Apply to all targets in this directory and below
+    add_link_options(-Wl,-no_warn_duplicate_libraries)
+endif()
 
 # MSVC: ensure exception handling (unwind semantics) is enabled to avoid C4530 warnings
 if(MSVC)
@@ -21,13 +30,29 @@ add_library(edn STATIC
     src/edn.cpp
     src/type_check.cpp
     src/diagnostics_json.cpp
+    # Modular IR emitter (planned split; see src/edn/ir/README.md)
+    src/edn/ir/context.cpp
+    src/edn/ir/types.cpp
+    src/edn/ir/bridge.cpp
+    src/edn/ir/env.cpp
+    src/edn/ir/exceptions.cpp
 )
 add_library(edn::edn ALIAS edn)
 
 include(GNUInstallDirs)
 
+# Position independent for static lib consumers (JIT, shared linking on Apple/Linux)
+set_property(TARGET edn PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Match LLVM's default policy: build without RTTI to avoid unresolved typeinfo from LLVM classes
+# Keep exceptions ON; only disable RTTI for Clang/GCC toolchains
+if(NOT MSVC)
+    target_compile_options(edn PRIVATE $<$<COMPILE_LANGUAGE:CXX>:$<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-fno-rtti>>)
+endif()
+
 target_compile_features(edn PUBLIC cxx_std_20)
 
+# Public headers (include new ir directory)
 target_include_directories(edn
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -66,6 +91,20 @@ endif()
 
 message(STATUS "Found LLVM 18: ${LLVM_PACKAGE_VERSION}")
 list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
+
+# When doing Darwin bring-up, default to building earlier phase tests only (user can override)
+if(EDN_PORT_DARWIN AND APPLE)
+    foreach(var EDN_BUILD_TESTS_PHASE3 EDN_BUILD_TESTS_PHASE4 EDN_BUILD_TESTS_PHASE4_FULL EDN_BUILD_TESTS_PHASE5)
+        if(NOT DEFINED ${var})
+            set(${var} OFF CACHE BOOL "Darwin bring-up: disable ${var} by default" )
+        endif()
+    endforeach()
+    foreach(var EDN_BUILD_TESTS_CORE EDN_BUILD_TESTS_PHASE2)
+        if(NOT DEFINED ${var})
+            set(${var} ON CACHE BOOL "Darwin bring-up: enable ${var} by default" )
+        endif()
+    endforeach()
+endif()
 
 # Provide version header generation (simple) into build tree
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/edn)

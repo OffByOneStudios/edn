@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 
 void run_phase3_pointer_arith_tests();
 void run_phase3_addr_deref_tests();

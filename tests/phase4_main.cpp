@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 
 void run_phase4_sum_types_tests();
 void run_phase4_sum_ir_golden_tests();

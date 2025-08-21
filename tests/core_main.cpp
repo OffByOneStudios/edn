@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 
 // Core/unit test entry points
 void run_type_tests();

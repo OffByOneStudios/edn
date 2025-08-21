@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 #include <cstdlib>
 
 static bool env_enabled(const char* name){

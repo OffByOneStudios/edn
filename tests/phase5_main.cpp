@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 #include <exception>
 
 void run_phase5_opt_presets_test();

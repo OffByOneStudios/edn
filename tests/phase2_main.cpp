@@ -1,4 +1,5 @@
 #include <iostream>
+#include "test_env.hpp"
 
 void run_phase2_feature_tests();
 

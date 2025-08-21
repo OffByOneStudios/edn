@@ -477,7 +477,6 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         // Intrinsic mapping
         if(std::holds_alternative<symbol>(callee->data)){
             std::string op = std::get<symbol>(callee->data).name;
-            auto is_bin = [&](const char* n){ return op==n; };
             if(op=="add"||op=="sub"||op=="mul"||op=="div"||op=="eq"||op=="ne"||op=="lt"||op=="le"||op=="gt"||op=="ge"){
                 if(args.size()!=2) return std::nullopt; // arity mismatch
                 list out; out.elems = { make_sym(op), dst, retTy, args[0], args[1] };
@@ -867,7 +866,8 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         }
         std::string op = std::get<symbol>(l.elems[0]->data).name;
         // For structured ops that contain nested vectors (bodies), process those as sequences with a forked env
-        auto process_nested_vec = [&](size_t idx){ if(idx<l.elems.size() && l.elems[idx] && std::holds_alternative<vector_t>(l.elems[idx]->data)){ auto envCopy = env; rewrite_seq(std::get<vector_t>(l.elems[idx]->data), envCopy); } };
+    auto process_nested_vec = [&](size_t idx){ if(idx<l.elems.size() && l.elems[idx] && std::holds_alternative<vector_t>(l.elems[idx]->data)){ auto envCopy = env; rewrite_seq(std::get<vector_t>(l.elems[idx]->data), envCopy); } };
+    (void)process_nested_vec;
 
         // Update env from declarations/assignments before replacing later uses in the same sequence step
         if(op=="as" && l.elems.size()==4){
