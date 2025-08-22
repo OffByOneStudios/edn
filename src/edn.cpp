@@ -30,6 +30,10 @@
 #include "edn/ir/layout.hpp"
 #include "edn/ir/debug.hpp"
 #include "edn/ir/collect.hpp"
+#include "edn/ir/core_ops.hpp"
+#include "edn/ir/memory_ops.hpp"
+#include "edn/ir/sum_ops.hpp"
+#include "edn/ir/control_ops.hpp"
 
 namespace edn
 {
@@ -69,7 +73,6 @@ namespace edn
 		// Build Debug Manager
 		auto debug_manager_ = std::make_shared<edn::ir::debug::DebugManager>(enableDebugInfo, module_, this);
 		debug_manager_->initialize();
-		
 
 		// Centralized env
 		const auto env = edn::detectEnv();
@@ -89,7 +92,7 @@ namespace edn
 		bool enableCoro = env.enableCoro;
 
 		// Collect Structs, Sums, Unions, Globals
-		//TODO Fill in the call to run
+		// TODO Fill in the call to run
 		edn::ir::collect::run(top, this);
 
 		for (size_t i = 1; i < top.size(); ++i)
@@ -425,6 +428,59 @@ namespace edn
 						}
 						return nullptr;
 					};
+
+					// --- Dispatch extracted core ops (integer/float arith, bitwise, shifts, ptr math) ---
+					{
+						edn::ir::builder::State S{builder, *llctx_, *module_, tctx_,
+												  [&](TypeId id)
+												  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode};
+						if (edn::ir::core_ops::handle_integer_arith(S, il) ||
+							edn::ir::core_ops::handle_float_arith(S, il) ||
+							edn::ir::core_ops::handle_bitwise_shift(S, il, inst) ||
+							edn::ir::core_ops::handle_ptr_add_sub(S, il) ||
+							edn::ir::core_ops::handle_ptr_diff(S, il))
+						{
+							continue; // handled by modular core_ops
+						}
+						// --- Dispatch extracted memory ops (assign/alloca/load/store/gload/gstore) ---
+						if (edn::ir::memory_ops::handle_assign(S, il) ||
+							edn::ir::memory_ops::handle_alloca(S, il) ||
+							edn::ir::memory_ops::handle_store(S, il) ||
+							edn::ir::memory_ops::handle_gload(S, il) ||
+							edn::ir::memory_ops::handle_gstore(S, il) ||
+							edn::ir::memory_ops::handle_load(S, il) ||
+							edn::ir::memory_ops::handle_index(S, il) ||
+							edn::ir::memory_ops::handle_array_lit(S, il) ||
+							edn::ir::memory_ops::handle_struct_lit(S, il, struct_field_index_, struct_field_types_) ||
+							edn::ir::memory_ops::handle_member(S, il, struct_types_, struct_field_index_, struct_field_types_) ||
+							edn::ir::memory_ops::handle_member_addr(S, il, struct_types_, struct_field_index_, struct_field_types_) ||
+							edn::ir::memory_ops::handle_union_member(S, il, struct_types_, union_field_types_) ||
+							edn::ir::sum_ops::handle_sum_new(S, il, sum_variant_tag_, sum_variant_field_types_) ||
+							edn::ir::sum_ops::handle_sum_is(S, il, sum_variant_tag_) ||
+							edn::ir::sum_ops::handle_sum_get(S, il, sum_variant_tag_, sum_variant_field_types_))
+						{
+							continue; // handled by modular memory_ops
+						}
+						// Control-flow ops (if/while/for/switch/match/break/continue)
+						{
+							edn::ir::control_ops::Context CF{
+								S,
+								cfCounter,
+								F,
+								[&](const std::vector<edn::node_ptr> &nodes)
+								{ emit_ref(nodes, emit_ref); },
+								[&](const std::string &nm)
+								{ return evalDefined(nm); },
+								[&](const edn::node_ptr &n)
+								{ return getVal(n); },
+								loopEndStack,
+								loopContinueStack,
+								sum_variant_tag_,
+								sum_variant_field_types_};
+							if (edn::ir::control_ops::handle(CF, il))
+								continue;
+						}
+					}
 					if (op == "block")
 					{ // (block :locals [ ... ] :body [ ... ])
 						node_ptr bodyNode = nullptr;
@@ -889,11 +945,11 @@ namespace edn
 										pls.push_back(map_type(pid));
 									auto *fty = llvm::FunctionType::get(map_type(retHeader), pls, varargFlag);
 									TargetF = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, callee, module_.get());
-										break;
+									break;
 								}
 							}
-								if (!TargetF)
-									continue; // bail if we cannot resolve
+							if (!TargetF)
+								continue; // bail if we cannot resolve
 						}
 						// Create a unique private global to hold env pointer for this closure site
 						auto *envVal = vmap[envVar];
@@ -2516,51 +2572,8 @@ namespace edn
 					}
 					else if (op == "if")
 					{
-						if (il.size() >= 3)
-						{
-							// Evaluate condition with slot-awareness; if SSA temp, try to recompute from definition
-							std::string cName = trimPct(symName(il[1]));
-							llvm::Value *condV = nullptr;
-							auto sIt = varSlots.find(cName);
-							if (sIt != varSlots.end())
-							{
-								auto tIt = vtypes.find(cName);
-								if (tIt != vtypes.end())
-									condV = builder.CreateLoad(map_type(tIt->second), sIt->second, cName);
-							}
-							else
-							{
-								condV = evalDefined(cName);
-								if (!condV)
-									condV = getVal(il[1]);
-							}
-							if (!condV)
-								continue;
-							auto *thenBB = llvm::BasicBlock::Create(*llctx_, "if.then." + std::to_string(cfCounter++), F);
-							llvm::BasicBlock *elseBB = nullptr;
-							auto *mergeBB = llvm::BasicBlock::Create(*llctx_, "if.end." + std::to_string(cfCounter++), F);
-							bool hasElse = il.size() >= 4 && std::holds_alternative<vector_t>(il[3]->data);
-							if (hasElse)
-								elseBB = llvm::BasicBlock::Create(*llctx_, "if.else." + std::to_string(cfCounter++), F);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateCondBr(condV, thenBB, hasElse ? elseBB : mergeBB);
-							// Then block
-							builder.SetInsertPoint(thenBB);
-							if (std::holds_alternative<vector_t>(il[2]->data))
-								emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref);
-							// If nested control flow changed the insertion point, ensure the current block is terminated
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(mergeBB);
-							// Else block (optional)
-							if (hasElse)
-							{
-								builder.SetInsertPoint(elseBB);
-								emit_ref(std::get<vector_t>(il[3]->data).elems, emit_ref);
-								if (!builder.GetInsertBlock()->getTerminator())
-									builder.CreateBr(mergeBB);
-							}
-							builder.SetInsertPoint(mergeBB);
-						}
+						// Legacy inline 'if' removed; handled earlier by control_ops module.
+						continue;
 					}
 					else if (op == "try")
 					{ // (try :body [ ... ] :catch [ ... ])  -- Itanium & SEH (catch-all minimal)
@@ -2644,600 +2657,7 @@ namespace edn
 							builder.SetInsertPoint(contBB);
 						}
 					}
-					else if (op == "while")
-					{
-						if (il.size() >= 3 && std::holds_alternative<vector_t>(il[2]->data))
-						{
-							auto *condBB = llvm::BasicBlock::Create(*llctx_, "while.cond." + std::to_string(cfCounter++), F);
-							auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "while.body." + std::to_string(cfCounter++), F);
-							auto *endBB = llvm::BasicBlock::Create(*llctx_, "while.end." + std::to_string(cfCounter++), F);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(condBB);
-							builder.SetInsertPoint(condBB);
-							// Re-evaluate condition each iteration; load from slot if assigned or recompute from def
-							std::string wName = trimPct(symName(il[1]));
-							llvm::Value *condV = nullptr;
-							auto sItW = varSlots.find(wName);
-							if (sItW != varSlots.end())
-							{
-								auto tIt = vtypes.find(wName);
-								if (tIt != vtypes.end())
-									condV = builder.CreateLoad(map_type(tIt->second), sItW->second, wName);
-							}
-							else
-							{
-								condV = evalDefined(wName);
-								if (!condV)
-									condV = getVal(il[1]);
-							}
-							if (!condV)
-							{
-								builder.CreateBr(endBB);
-								builder.SetInsertPoint(endBB);
-							}
-							else
-							{
-								builder.CreateCondBr(condV, bodyBB, endBB);
-								builder.SetInsertPoint(bodyBB);
-								loopEndStack.push_back(endBB);
-								loopContinueStack.push_back(condBB);
-								emit_ref(std::get<vector_t>(il[2]->data).elems, emit_ref);
-								loopContinueStack.pop_back();
-								loopEndStack.pop_back();
-								// If the current insertion block (which may be a nested merge inside the loop body)
-								// is not terminated, branch back to the loop condition. This is more robust than
-								// checking only the original bodyBB.
-								if (!builder.GetInsertBlock()->getTerminator())
-									builder.CreateBr(condBB);
-								builder.SetInsertPoint(endBB);
-							}
-						}
-					}
-					else if (op == "for")
-					{ // (for :init [..] :cond %c :step [..] :body [..])
-						// Parse keyword sections
-						std::vector<node_ptr> initVec, condSymNode, stepVec, bodyVec;
-						std::string condVar;
-						for (size_t i = 1; i < il.size(); ++i)
-						{
-							if (!il[i] || !std::holds_alternative<keyword>(il[i]->data))
-								break;
-							std::string kw = std::get<keyword>(il[i]->data).name;
-							if (++i >= il.size())
-								break;
-							auto val = il[i];
-							if (kw == "init" && val && std::holds_alternative<vector_t>(val->data))
-								initVec = std::get<vector_t>(val->data).elems;
-							else if (kw == "cond" && val && std::holds_alternative<symbol>(val->data))
-								condVar = symName(val);
-							else if (kw == "step" && val && std::holds_alternative<vector_t>(val->data))
-								stepVec = std::get<vector_t>(val->data).elems;
-							else if (kw == "body" && val && std::holds_alternative<vector_t>(val->data))
-								bodyVec = std::get<vector_t>(val->data).elems;
-						}
-						// emit init
-						if (!initVec.empty())
-							emit_ref(initVec, emit_ref);
-						// blocks
-						auto *condBB = llvm::BasicBlock::Create(*llctx_, "for.cond." + std::to_string(cfCounter++), F);
-						auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "for.body." + std::to_string(cfCounter++), F);
-						auto *stepBB = llvm::BasicBlock::Create(*llctx_, "for.step." + std::to_string(cfCounter++), F);
-						auto *endBB = llvm::BasicBlock::Create(*llctx_, "for.end." + std::to_string(cfCounter++), F);
-						if (!builder.GetInsertBlock()->getTerminator())
-							builder.CreateBr(condBB);
-						builder.SetInsertPoint(condBB);
-						// Evaluate condition, loading from var slot if present or recomputing from def if necessary
-						std::string cName = trimPct(condVar);
-						llvm::Value *condV = nullptr;
-						auto sIt = varSlots.find(cName);
-						if (sIt != varSlots.end())
-						{
-							auto tIt = vtypes.find(cName);
-							if (tIt != vtypes.end())
-								condV = builder.CreateLoad(map_type(tIt->second), sIt->second, cName);
-						}
-						else
-						{
-							condV = evalDefined(cName);
-							if (!condV)
-							{
-								auto itc = vmap.find(cName);
-								if (itc != vmap.end())
-									condV = itc->second;
-							}
-						}
-						if (!condV)
-						{
-							builder.CreateBr(endBB);
-							builder.SetInsertPoint(endBB);
-						}
-						else
-						{
-							builder.CreateCondBr(condV, bodyBB, endBB);
-							builder.SetInsertPoint(bodyBB);
-							loopEndStack.push_back(endBB);
-							loopContinueStack.push_back(stepBB);
-							if (!bodyVec.empty())
-								emit_ref(bodyVec, emit_ref);
-							loopContinueStack.pop_back();
-							// Ensure we branch from the current insertion block (which may be a nested merge)
-							// to the step block if it's not already terminated.
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(stepBB);
-							builder.SetInsertPoint(stepBB);
-							if (!stepVec.empty())
-								emit_ref(stepVec, emit_ref);
-							loopEndStack.pop_back();
-							if (!stepBB->getTerminator())
-								builder.CreateBr(condBB);
-							builder.SetInsertPoint(endBB);
-						}
-					}
-					else if (op == "switch")
-					{ // (switch %expr :cases [ (case <int> [ ... ])* ] :default [ ... ])
-						if (il.size() < 2)
-							continue;
-						std::string expr = trimPct(symName(il[1]));
-						if (expr.empty() || !vmap.count(expr))
-							continue;
-						llvm::Value *exprV = vmap[expr];
-						// Parse sections
-						std::vector<std::pair<int64_t, std::vector<node_ptr>>> cases;
-						std::vector<node_ptr> defaultBody;
-						bool haveDefault = false;
-						node_ptr casesNode = nullptr, defaultNode = nullptr;
-						for (size_t i = 2; i < il.size(); ++i)
-						{
-							if (!il[i] || !std::holds_alternative<keyword>(il[i]->data))
-								break;
-							std::string kw = std::get<keyword>(il[i]->data).name;
-							if (++i >= il.size())
-								break;
-							auto val = il[i];
-							if (kw == "cases" && val && std::holds_alternative<vector_t>(val->data))
-								casesNode = val;
-							else if (kw == "default" && val && std::holds_alternative<vector_t>(val->data))
-							{
-								defaultNode = val;
-								haveDefault = true;
-							}
-						}
-						if (casesNode)
-						{
-							for (auto &cv : std::get<vector_t>(casesNode->data).elems)
-							{
-								if (!cv || !std::holds_alternative<list>(cv->data))
-									continue;
-								auto &cl = std::get<list>(cv->data).elems;
-								if (cl.size() < 3)
-									continue;
-								if (!std::holds_alternative<symbol>(cl[0]->data) || std::get<symbol>(cl[0]->data).name != "case")
-									continue;
-								if (!std::holds_alternative<int64_t>(cl[1]->data))
-									continue;
-								if (!std::holds_alternative<vector_t>(cl[2]->data))
-									continue;
-								int64_t cval = std::get<int64_t>(cl[1]->data);
-								cases.emplace_back(cval, std::get<vector_t>(cl[2]->data).elems);
-							}
-						}
-						if (haveDefault && defaultNode)
-							defaultBody = std::get<vector_t>(defaultNode->data).elems;
-						// Build blocks: chain compares; create merge block
-						auto *mergeBB = llvm::BasicBlock::Create(*llctx_, "switch.end." + std::to_string(cfCounter++), F);
-						std::vector<llvm::BasicBlock *> caseBlocks;
-						caseBlocks.reserve(cases.size());
-						for (size_t ci = 0; ci < cases.size(); ++ci)
-							caseBlocks.push_back(llvm::BasicBlock::Create(*llctx_, "switch.case." + std::to_string(cases[ci].first) + "." + std::to_string(cfCounter++), F));
-						llvm::BasicBlock *defaultBB = haveDefault ? llvm::BasicBlock::Create(*llctx_, "switch.default." + std::to_string(cfCounter++), F) : mergeBB;
-						// Initial jump: we'll linearize comparisons
-						auto *curBB = builder.GetInsertBlock();
-						if (!curBB->getTerminator())
-							builder.CreateBr(caseBlocks.empty() ? defaultBB : caseBlocks[0]);
-						for (size_t ci = 0; ci < cases.size(); ++ci)
-						{
-							builder.SetInsertPoint(caseBlocks[ci]);
-							int64_t cval = cases[ci].first;
-							llvm::Value *constVal = nullptr;
-							if (exprV->getType()->isIntegerTy())
-								constVal = llvm::ConstantInt::get(exprV->getType(), (uint64_t)cval, true);
-							else
-							{ // fallback treat as i64 compare then cast
-								// unsupported type (non-integer) already rejected by type checker; just branch to default
-								builder.CreateBr(defaultBB);
-								continue;
-							}
-							llvm::Value *cmp = builder.CreateICmpEQ(exprV, constVal, "swcmp");
-							// Body block for matched case
-							auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "switch.case.body." + std::to_string(cval) + "." + std::to_string(cfCounter++), F);
-							auto *nextCmpBB = (ci + 1 < cases.size()) ? caseBlocks[ci + 1] : defaultBB;
-							builder.CreateCondBr(cmp, bodyBB, nextCmpBB);
-							builder.SetInsertPoint(bodyBB);
-							emit_ref(cases[ci].second, emit_ref);
-							if (!bodyBB->getTerminator())
-								builder.CreateBr(mergeBB);
-						}
-						if (haveDefault)
-						{
-							builder.SetInsertPoint(defaultBB);
-							emit_ref(defaultBody, emit_ref);
-							if (!defaultBB->getTerminator())
-								builder.CreateBr(mergeBB);
-						}
-						builder.SetInsertPoint(mergeBB);
-					}
-					else if (op == "match")
-					{ // (match SumName %val ...) or result form: (match %dst <type> SumName %val ...)
-						if (il.size() < 3)
-							continue;
-						bool resultMode = false;
-						std::string dstName;
-						TypeId resultTy = 0;
-						size_t argBase = 1;
-						if (std::holds_alternative<symbol>(il[1]->data))
-						{
-							std::string maybeDst = symName(il[1]);
-							if (!maybeDst.empty() && maybeDst[0] == '%')
-							{
-								resultMode = true;
-								dstName = trimPct(maybeDst);
-								if (il.size() < 5)
-									continue;
-								try
-								{
-									resultTy = tctx_.parse_type(il[2]);
-								}
-								catch (...)
-								{
-									continue;
-								}
-								argBase = 3; // Sum at 3, %val at 4
-							}
-						}
-						std::string sname = symName(il[argBase]);
-						std::string val = trimPct(symName(il[argBase + 1]));
-						if (sname.empty() || val.empty() || !vmap.count(val))
-							continue;
-						auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct." + sname);
-						if (!ST)
-							continue;
-						// Load tag
-						llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						llvm::Value *tagIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						auto *tagPtr = builder.CreateInBoundsGEP(ST, vmap[val], {zero, tagIdx}, "match.tag.addr");
-						auto *tagVal = builder.CreateLoad(llvm::Type::getInt32Ty(*llctx_), tagPtr, "match.tag");
-						// Parse :cases and :default
-						node_ptr casesNode = nullptr, defaultNode = nullptr;
-						bool haveDefault = false;
-						for (size_t i = argBase + 2; i < il.size(); ++i)
-						{
-							if (!il[i] || !std::holds_alternative<keyword>(il[i]->data))
-								break;
-							std::string kw = std::get<keyword>(il[i]->data).name;
-							if (++i >= il.size())
-								break;
-							auto v = il[i];
-							if (kw == "cases" && v && std::holds_alternative<vector_t>(v->data))
-								casesNode = v;
-							else if (kw == "default" && v)
-							{
-								defaultNode = v;
-								haveDefault = true;
-							}
-						}
-						if (!casesNode)
-							continue;
-						auto tagMapIt = sum_variant_tag_.find(sname);
-						if (tagMapIt == sum_variant_tag_.end())
-							continue;
-						auto &tagMap = tagMapIt->second;
-						// Create blocks
-						auto *mergeBB = llvm::BasicBlock::Create(*llctx_, "match.end." + std::to_string(cfCounter++), F);
-						struct CaseInfo
-						{
-							int tag;
-							std::string vname;
-							std::vector<node_ptr> body;
-							std::vector<std::pair<std::string, size_t>> binds;
-							std::string valueVar;
-						};
-						std::vector<CaseInfo> cases;
-						cases.reserve(std::get<vector_t>(casesNode->data).elems.size());
-						for (auto &cv : std::get<vector_t>(casesNode->data).elems)
-						{
-							if (!cv || !std::holds_alternative<list>(cv->data))
-								continue;
-							auto &cl = std::get<list>(cv->data).elems;
-							if (cl.size() < 3)
-								continue;
-							if (!std::holds_alternative<symbol>(cl[0]->data) || std::get<symbol>(cl[0]->data).name != "case")
-								continue;
-							std::string vname = symName(cl[1]);
-							if (vname.empty())
-								continue;
-							auto tIt = tagMap.find(vname);
-							if (tIt == tagMap.end())
-								continue; // parse either simple vector body or :binds/:body form
-							std::vector<node_ptr> bodyElems;
-							std::vector<std::pair<std::string, size_t>> binds;
-							std::string valueVar;
-							if (std::holds_alternative<vector_t>(cl[2]->data))
-							{
-								// Vector form: body may contain inline ":value %var" marker; extract it
-								auto &ve = std::get<vector_t>(cl[2]->data).elems;
-								bodyElems.reserve(ve.size());
-								for (size_t bi = 0; bi < ve.size(); ++bi)
-								{
-									auto &bn = ve[bi];
-									if (bn && std::holds_alternative<keyword>(bn->data))
-									{
-										std::string kw = std::get<keyword>(bn->data).name;
-										if (kw == "value" && bi + 1 < ve.size() && ve[bi + 1] && std::holds_alternative<symbol>(ve[bi + 1]->data))
-										{
-											valueVar = trimPct(symName(ve[bi + 1]));
-											++bi;	  // skip the symbol as well
-											continue; // don't add to body
-										}
-									}
-									bodyElems.push_back(bn);
-								}
-							}
-							else if (std::holds_alternative<keyword>(cl[2]->data))
-							{
-								node_ptr bindsNode = nullptr, bodyNode = nullptr, valueNode = nullptr;
-								for (size_t ci = 2; ci < cl.size(); ++ci)
-								{
-									if (!cl[ci] || !std::holds_alternative<keyword>(cl[ci]->data))
-										break;
-									std::string kw = std::get<keyword>(cl[ci]->data).name;
-									if (++ci >= cl.size())
-										break;
-									auto valn = cl[ci];
-									if (kw == "binds")
-										bindsNode = valn;
-									else if (kw == "body")
-										bodyNode = valn;
-									else if (kw == "value")
-										valueNode = valn;
-								}
-								if (bodyNode && std::holds_alternative<vector_t>(bodyNode->data))
-								{
-									auto &ve = std::get<vector_t>(bodyNode->data).elems;
-									bodyElems.reserve(ve.size());
-									for (size_t bi = 0; bi < ve.size(); ++bi)
-									{
-										auto &bn2 = ve[bi];
-										if (bn2 && std::holds_alternative<keyword>(bn2->data))
-										{
-											std::string kw2 = std::get<keyword>(bn2->data).name;
-											if (kw2 == "value" && bi + 1 < ve.size() && ve[bi + 1] && std::holds_alternative<symbol>(ve[bi + 1]->data))
-											{
-												valueVar = trimPct(symName(ve[bi + 1]));
-												++bi;	  // consume symbol
-												continue; // skip adding marker to body
-											}
-										}
-										bodyElems.push_back(bn2);
-									}
-								}
-								else
-									bodyElems.clear();
-								if (bindsNode && std::holds_alternative<vector_t>(bindsNode->data))
-								{
-									for (auto &bn : std::get<vector_t>(bindsNode->data).elems)
-									{
-										if (!bn || !std::holds_alternative<list>(bn->data))
-											continue;
-										auto &bl = std::get<list>(bn->data).elems;
-										if (bl.size() != 3)
-											continue;
-										if (!std::holds_alternative<symbol>(bl[0]->data) || std::get<symbol>(bl[0]->data).name != "bind")
-											continue;
-										if (!std::holds_alternative<symbol>(bl[1]->data))
-											continue;
-										std::string bname = trimPct(symName(bl[1]));
-										if (bname.empty())
-											continue;
-										if (!std::holds_alternative<int64_t>(bl[2]->data))
-											continue;
-										int64_t idx = (int64_t)std::get<int64_t>(bl[2]->data);
-										if (idx < 0)
-											continue;
-										binds.emplace_back(bname, (size_t)idx);
-									}
-								}
-								if (valueNode && std::holds_alternative<symbol>(valueNode->data))
-									valueVar = trimPct(symName(valueNode));
-							}
-							else
-								continue;
-							cases.push_back(CaseInfo{tIt->second, vname, std::move(bodyElems), std::move(binds), valueVar});
-						}
-						std::vector<llvm::BasicBlock *> cmpBlocks;
-						cmpBlocks.reserve(cases.size());
-						for (size_t i = 0; i < cases.size(); ++i)
-							cmpBlocks.push_back(llvm::BasicBlock::Create(*llctx_, "match.case." + std::to_string(i) + "." + std::to_string(cfCounter++), F));
-						llvm::BasicBlock *defaultBB = haveDefault ? llvm::BasicBlock::Create(*llctx_, "match.default." + std::to_string(cfCounter++), F) : mergeBB;
-						// For result mode, capture incoming values per predecessor
-						struct IncomingVal
-						{
-							llvm::Value *val;
-							llvm::BasicBlock *pred;
-						};
-						std::vector<IncomingVal> incomings;
-						// Start chain
-						auto *curBB = builder.GetInsertBlock();
-						if (!curBB->getTerminator())
-							builder.CreateBr(cmpBlocks.empty() ? defaultBB : cmpBlocks[0]);
-						for (size_t ci = 0; ci < cases.size(); ++ci)
-						{
-							builder.SetInsertPoint(cmpBlocks[ci]);
-							llvm::Value *cval = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint64_t)cases[ci].tag, true);
-							auto *cmp = builder.CreateICmpEQ(tagVal, cval, "match.cmp");
-							auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "match.body." + std::to_string(ci) + "." + std::to_string(cfCounter++), F);
-							auto *next = (ci + 1 < cases.size()) ? cmpBlocks[ci + 1] : defaultBB;
-							builder.CreateCondBr(cmp, bodyBB, next);
-							builder.SetInsertPoint(bodyBB);
-							// If binds requested, extract payload fields into variables before body
-							if (!cases[ci].binds.empty())
-							{
-								// Compute payload base pointer
-								llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-								llvm::Value *payIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 1);
-								auto *payloadPtr = builder.CreateInBoundsGEP(ST, vmap[val], {zero, payIdx}, "match.payload.addr");
-								auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_));
-								auto *rawPayloadPtr = builder.CreateBitCast(payloadPtr, i8PtrTy, "match.raw");
-								// Need field types to compute offsets
-								auto vfieldsIt = sum_variant_field_types_.find(sname);
-								if (vfieldsIt != sum_variant_field_types_.end())
-								{
-									auto &variants = vfieldsIt->second;
-									int tag = cases[ci].tag;
-									if (tag >= 0 && (size_t)tag < variants.size())
-									{
-										auto &fields = variants[tag];
-										for (auto &bp : cases[ci].binds)
-										{
-											size_t idx = bp.second;
-											if (idx >= fields.size())
-												continue; // checked by TC
-											uint64_t offset = 0;
-											for (size_t fi = 0; fi < idx; ++fi)
-											{
-												llvm::Type *fl = map_type(fields[fi]);
-												offset += edn::ir::size_in_bytes(*module_, fl);
-											}
-											llvm::Value *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), offset);
-											llvm::Value *fieldRaw = builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(*llctx_), rawPayloadPtr, offVal, bp.first + ".raw");
-											llvm::Type *fieldLL = map_type(fields[idx]);
-											auto *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL);
-											auto *typedPtr = builder.CreateBitCast(fieldRaw, fieldPtrTy, bp.first + ".ptr");
-											auto *lv = builder.CreateLoad(fieldLL, typedPtr, bp.first);
-											vmap[bp.first] = lv;
-											vtypes[bp.first] = fields[idx];
-										}
-									}
-								}
-							}
-							emit_ref(cases[ci].body, emit_ref);
-							if (resultMode)
-							{
-								std::string vnm = cases[ci].valueVar;
-								if (!vnm.empty() && vmap.count(vnm))
-									incomings.push_back({vmap[vnm], bodyBB});
-								else if (resultTy)
-								{ // fallback undef to keep IR well-formed
-									incomings.push_back({llvm::UndefValue::get(map_type(resultTy)), bodyBB});
-								}
-							}
-							if (!bodyBB->getTerminator())
-								builder.CreateBr(mergeBB);
-						}
-						// Default body can be a vector [ ... ] or a list with :body and :value
-						if (haveDefault)
-						{
-							builder.SetInsertPoint(defaultBB);
-							std::vector<node_ptr> defaultBody;
-							std::string defaultValueVar;
-							if (std::holds_alternative<vector_t>(defaultNode->data))
-							{
-								auto &ve = std::get<vector_t>(defaultNode->data).elems;
-								defaultBody.reserve(ve.size());
-								for (size_t di = 0; di < ve.size(); ++di)
-								{
-									auto &dn = ve[di];
-									if (dn && std::holds_alternative<keyword>(dn->data))
-									{
-										std::string kw = std::get<keyword>(dn->data).name;
-										if (kw == "value" && di + 1 < ve.size() && ve[di + 1] && std::holds_alternative<symbol>(ve[di + 1]->data))
-										{
-											defaultValueVar = trimPct(symName(ve[di + 1]));
-											++di; // skip symbol
-											continue;
-										}
-									}
-									defaultBody.push_back(dn);
-								}
-							}
-							else if (std::holds_alternative<list>(defaultNode->data))
-							{
-								auto &dl = std::get<list>(defaultNode->data).elems;
-								// Some producers wrap default as (default :body [...]) - skip the leading symbol
-								size_t diStart = 0;
-								if (!dl.empty() && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name == "default")
-									diStart = 1;
-								for (size_t di = diStart; di < dl.size(); ++di)
-								{
-									if (!dl[di] || !std::holds_alternative<keyword>(dl[di]->data))
-										break;
-									std::string kw = std::get<keyword>(dl[di]->data).name;
-									if (++di >= dl.size())
-										break;
-									auto valn = dl[di];
-									if (kw == "body" && valn && std::holds_alternative<vector_t>(valn->data))
-									{
-										// Extract optional ":value %var" from within the :body vector and filter it out
-										auto &ve = std::get<vector_t>(valn->data).elems;
-										defaultBody.reserve(ve.size());
-										for (size_t bj = 0; bj < ve.size(); ++bj)
-										{
-											auto &bn = ve[bj];
-											if (bn && std::holds_alternative<keyword>(bn->data))
-											{
-												std::string kw2 = std::get<keyword>(bn->data).name;
-												if (kw2 == "value" && bj + 1 < ve.size() && ve[bj + 1] && std::holds_alternative<symbol>(ve[bj + 1]->data))
-												{
-													defaultValueVar = trimPct(symName(ve[bj + 1]));
-													++bj;	  // consume symbol
-													continue; // skip marker from body
-												}
-											}
-											defaultBody.push_back(bn);
-										}
-									}
-									else if (kw == "value" && valn && std::holds_alternative<symbol>(valn->data))
-									{
-										defaultValueVar = trimPct(symName(valn));
-									}
-								}
-							}
-							emit_ref(defaultBody, emit_ref);
-							if (resultMode)
-							{
-								if (!defaultValueVar.empty() && vmap.count(defaultValueVar))
-									incomings.push_back({vmap[defaultValueVar], defaultBB});
-								else if (resultTy)
-								{
-									incomings.push_back({llvm::UndefValue::get(map_type(resultTy)), defaultBB});
-								}
-							}
-							if (!defaultBB->getTerminator())
-								builder.CreateBr(mergeBB);
-						}
-						builder.SetInsertPoint(mergeBB);
-						if (resultMode && resultTy)
-						{
-							llvm::PHINode *phi = builder.CreatePHI(map_type(resultTy), (unsigned)incomings.size(), dstName);
-							for (auto &inc : incomings)
-								phi->addIncoming(inc.val, inc.pred);
-							vmap[dstName] = phi;
-							vtypes[dstName] = resultTy;
-						}
-					}
-					else if (op == "break")
-					{
-						if (!loopEndStack.empty() && !builder.GetInsertBlock()->getTerminator())
-							builder.CreateBr(loopEndStack.back());
-						return;
-					}
-					else if (op == "continue")
-					{
-						if (!loopContinueStack.empty() && !builder.GetInsertBlock()->getTerminator())
-						{
-							builder.CreateBr(loopContinueStack.back());
-							return;
-						}
-					}
+					
 					else if (op == "ret" && il.size() == 3)
 					{
 						std::string rv = trimPct(symName(il[2]));
@@ -3329,7 +2749,74 @@ namespace edn
 			PB.registerLoopAnalyses(LAM);
 			PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-			
+			// If a textual pipeline is provided, try to parse and run it.
+			if (const char *pipeline = std::getenv("EDN_PASS_PIPELINE"); pipeline && *pipeline)
+			{
+				llvm::ModulePassManager MPM;
+				// parsePassPipeline returns llvm::Error in recent LLVM; consume on failure and fall back.
+				if (auto Err = PB.parsePassPipeline(MPM, pipeline))
+				{
+					llvm::consumeError(std::move(Err));
+				}
+				else
+				{
+					// Optional IR verification before running pipeline (for debugging)
+					if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
+					{
+						if (llvm::verifyModule(*module_, &llvm::errs()))
+						{
+							llvm::errs() << "[edn] IR verify failed before custom pipeline\n";
+						}
+					}
+					MPM.run(*module_, MAM);
+					if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
+					{
+						if (llvm::verifyModule(*module_, &llvm::errs()))
+						{
+							llvm::errs() << "[edn] IR verify failed after custom pipeline\n";
+						}
+					}
+					return module_.get();
+				}
+			}
+
+			// No custom pipeline or parse failed: use presets via EDN_OPT_LEVEL (0/1/2/3)
+			llvm::OptimizationLevel optLevel = llvm::OptimizationLevel::O1; // default
+			if (const char *lvl = std::getenv("EDN_OPT_LEVEL"); lvl && *lvl)
+			{
+				std::string s = lvl;
+				for (char &c : s)
+					c = (char)tolower((unsigned char)c);
+				if (s == "0" || s == "o0")
+					optLevel = llvm::OptimizationLevel::O0;
+				else if (s == "2" || s == "o2")
+					optLevel = llvm::OptimizationLevel::O2;
+				else if (s == "3" || s == "o3")
+					optLevel = llvm::OptimizationLevel::O3;
+				else
+					optLevel = llvm::OptimizationLevel::O1;
+			}
+			if (optLevel != llvm::OptimizationLevel::O0)
+			{
+				llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel);
+				if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
+				{
+					if (llvm::verifyModule(*module_, &llvm::errs()))
+					{
+						llvm::errs() << "[edn] IR verify failed before preset pipeline\n";
+					}
+				}
+				MPM.run(*module_, MAM);
+				if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
+				{
+					if (llvm::verifyModule(*module_, &llvm::errs()))
+					{
+						llvm::errs() << "[edn] IR verify failed after preset pipeline\n";
+					}
+				}
+			}
+			// For O0, do nothing (preserve IR for debugging)
+		}
 		return module_.get();
 	}
 

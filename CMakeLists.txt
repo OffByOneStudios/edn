@@ -40,6 +40,9 @@ add_library(edn STATIC
     src/edn/ir/collect.cpp
     src/edn/ir/builder.cpp
     src/edn/ir/core_ops.cpp
+    src/edn/ir/memory_ops.cpp
+    src/edn/ir/sum_ops.cpp
+    src/edn/ir/control_ops.cpp
     src/edn/ir/debug.cpp
 )
 add_library(edn::edn ALIAS edn)

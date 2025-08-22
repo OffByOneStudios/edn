@@ -69,6 +69,9 @@ inline llvm::StructType* get_or_create_struct(
 inline uint64_t size_in_bytes(llvm::Module& M, llvm::Type* T){
     return edn::ir::layout::alloc_size_bytes(M, T);
 }
+#ifndef EDN_IR_HAVE_SIZE_IN_BYTES
+#define EDN_IR_HAVE_SIZE_IN_BYTES 1
+#endif
 
 inline uint64_t pointer_size_in_bits(llvm::Module& M){
     return edn::ir::layout::pointer_size_bits(M);
