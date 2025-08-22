@@ -46,6 +46,11 @@ add_library(edn STATIC
     src/edn/ir/phi_ops.cpp
     src/edn/ir/coro_ops.cpp
     src/edn/ir/exception_ops.cpp
+    # Newly extracted call / return operation handlers
+    src/edn/ir/call_ops.cpp
+    src/edn/ir/return_ops.cpp
+    # Newly extracted simple flow constructs (block locals/body)
+    src/edn/ir/flow_ops.cpp
     src/edn/ir/debug_pipeline.cpp
     src/edn/ir/di.cpp)
 

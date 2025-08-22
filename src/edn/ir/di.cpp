@@ -34,6 +34,9 @@ llvm::DISubprogram* attach_function_debug(debug::DebugManager& dbg,
         /*SPFlags*/ llvm::DISubprogram::SPFlagDefinition);
     F.setSubprogram(SP);
     dbg.pushFunctionScope(SP);
+    if(!F.getSubprogram()) {
+        fprintf(stderr, "[dbg] attach_function_debug: failed to set subprogram for %s\n", fname.c_str());
+    }
     return SP;
 }
 

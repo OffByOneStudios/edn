@@ -45,6 +45,9 @@
 #include "edn/ir/exception_ops.hpp"
 #include "edn/ir/debug_pipeline.hpp"
 #include "edn/ir/di.hpp"
+#include "edn/ir/call_ops.hpp"
+#include "edn/ir/return_ops.hpp"
+#include "edn/ir/flow_ops.hpp"
 
 namespace edn
 {
@@ -80,10 +83,10 @@ namespace edn
 		module_ = std::make_unique<llvm::Module>("edn.module", *llctx_);
 		// Optional: enable LLVM Debug Info (DWARF/CodeView agnostic in IR)
 		bool enableDebugInfo = false;
-
-		// Build Debug Manager
+		if (const char *dbg = std::getenv("EDN_ENABLE_DEBUG"); dbg && std::string(dbg) == "1") enableDebugInfo = true;
+		// Build Debug Manager (initialized after reading env so local flag matches)
 		auto debug_manager_ = std::make_shared<edn::ir::debug::DebugManager>(enableDebugInfo, module_, this);
-		debug_manager_->initialize();
+		debug_manager_->initialize(); // also re-reads env; fine
 
 		// Centralized env
 		const auto env = edn::detectEnv();
@@ -189,18 +192,31 @@ namespace edn
 				for (auto &pr : params)
 					paramIds.push_back(pr.second);
 				auto ftyId = tctx_.get_function(paramIds, retTy, isVariadic);
-				auto *fty = llvm::cast<llvm::FunctionType>(map_type(ftyId));
-				(void)llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
-				continue;
+				{
+					llvm::Type* rawTy = map_type(ftyId);
+					if(!llvm::isa<llvm::FunctionType>(rawTy)) {
+						fprintf(stderr, "[dbg][emit] expected function type for %s but got kind=%u\n", fname.c_str(), (unsigned)rawTy->getTypeID());
+					}
+					auto *fty = llvm::cast<llvm::FunctionType>(rawTy);
+					(void)llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
+					continue;
+				}
+				continue; // handled above
 			}
 			auto ftyId = tctx_.get_function(paramIds, retTy, isVariadic);
-			auto *fty = llvm::cast<llvm::FunctionType>(map_type(ftyId));
+			llvm::Type* rawFty = map_type(ftyId);
+			if(!llvm::isa<llvm::FunctionType>(rawFty)) {
+				fprintf(stderr, "[dbg][emit] non-function type when defining %s kind=%u\n", fname.c_str(), (unsigned)rawFty->getTypeID());
+			}
+			auto *fty = llvm::cast<llvm::FunctionType>(rawFty);
 			auto *F = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
 			// Function-level debug info (skeleton via di module)
 			if (enableDebugInfo)
 			{
 				unsigned fnLine = edn::line(*fl[0]);
-				edn::ir::di::attach_function_debug(*debug_manager_, *F, fname, retTy, params, fnLine);
+				auto *SP = edn::ir::di::attach_function_debug(*debug_manager_, *F, fname, retTy, params, fnLine);
+				if(!SP) { fprintf(stderr, "[dbg] attach_function_debug returned null for %s (enable=%d, DIB=%p, File=%p)\n", fname.c_str(), (int)debug_manager_->enableDebugInfo, debug_manager_->DIB.get(), debug_manager_->DI_File); }
+				else { fprintf(stderr, "[dbg] attached DISubprogram for %s line=%u\n", fname.c_str(), fnLine); }
 			}
 			// If coroutines are enabled, mark functions as pre-split coroutine to use the Switch-Resumed ABI
 			if (enableCoro)
@@ -261,6 +277,11 @@ namespace edn
 			};
 			if (enableDebugInfo)
 			{
+				if (auto *SP = F->getSubprogram()) {
+					builder.SetCurrentDebugLocation(llvm::DILocation::get(F->getContext(), SP->getLine(), 1, SP));
+				} else {
+					fprintf(stderr, "[dbg] no subprogram at param emission for %s\n", fname.c_str());
+				}
 				edn::ir::di::emit_parameter_debug(*debug_manager_, *F, builder, vtypes);
 			}
 			llvm::Value *lastCoroIdTok = nullptr;			   // holds last coro.id token for ops that need it
@@ -397,11 +418,11 @@ namespace edn
 						return nullptr;
 					};
 
-					// --- Dispatch extracted core ops (integer/float arith, bitwise, shifts, ptr math) ---
-					{
-						edn::ir::builder::State S{builder, *llctx_, *module_, tctx_,
-												  [&](TypeId id)
-												  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+						// Create a shared builder::State reused across most dispatch handlers to reduce duplication
+						edn::ir::builder::State sharedState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+						// --- Dispatch extracted core ops (integer/float arith, bitwise, shifts, ptr math) ---
+						{
+							edn::ir::builder::State &S = sharedState;
 						if (edn::ir::core_ops::handle_integer_arith(S, il) ||
 							edn::ir::core_ops::handle_float_arith(S, il) ||
 							edn::ir::core_ops::handle_bitwise_shift(S, il, inst) ||
@@ -473,350 +494,50 @@ namespace edn
 								continue;
 						}
 					}
-					if (op == "block")
-					{ // (block :locals [ ... ] :body [ ... ])
-						node_ptr bodyNode = nullptr;
-						for (size_t i = 1; i < il.size(); ++i)
-						{
-							if (!il[i] || !std::holds_alternative<keyword>(il[i]->data))
-								break;
-							std::string kw = std::get<keyword>(il[i]->data).name;
-							if (++i >= il.size())
-								break;
-							auto val = il[i];
-							if (kw == "body")
-							{
-								if (val && std::holds_alternative<vector_t>(val->data))
-									bodyNode = val;
-							}
-						}
-						if (bodyNode && std::holds_alternative<vector_t>(bodyNode->data))
-						{
-							emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
-						}
+					// Flow ops: block (with locals)
+					{
+						static thread_local std::vector<std::pair<llvm::AllocaInst*, edn::TypeId>> tmp_block_locals; tmp_block_locals.clear();
+						ir::flow_ops::Context FC{sharedState, F, [&](const std::vector<edn::node_ptr>& nodes){ emit_ref(nodes, emit_ref); }};
+						if(ir::flow_ops::handle_block(FC, il, tmp_block_locals)) { continue; }
 					}
-					// Lightweight state wrapper for standalone simple ops (const)
-					edn::ir::builder::State S_local_for_dispatch{builder, *llctx_, *module_, tctx_,
-																 [&](TypeId id)
-																 { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
-					if (edn::ir::const_ops::handle(S_local_for_dispatch, il))
+						// Use shared state for standalone simple ops (const)
+						if (edn::ir::const_ops::handle(sharedState, il))
 					{
 						continue;
 					}
 
-					else if ((op == "fadd" || op == "fsub" || op == "fmul" || op == "fdiv") && il.size() == 5)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						auto *va = getVal(il[3]);
-						auto *vb = getVal(il[4]);
-						if (!va || !vb || dst.empty())
-							continue;
-						llvm::Value *r = nullptr;
-						if (op == "fadd")
-							r = builder.CreateFAdd(va, vb, dst);
-						else if (op == "fsub")
-							r = builder.CreateFSub(va, vb, dst);
-						else if (op == "fmul")
-							r = builder.CreateFMul(va, vb, dst);
-						else
-							r = builder.CreateFDiv(va, vb, dst);
-						vmap[dst] = r;
-						vtypes[dst] = ty;
-					}
-					else if (op == "fcmp" && il.size() == 7)
-					{
-						// Legacy fcmp path removed (handled by ir::compare_ops)
-					}
-					else if ((op == "eq" || op == "ne" || op == "lt" || op == "gt" || op == "le" || op == "ge") && il.size() == 5)
-					{
-						// Legacy simple integer compare path removed (handled by ir::compare_ops)
-					}
-					else if (op == "icmp" && il.size() == 7)
-					{
-						// Legacy icmp path removed (handled by ir::compare_ops)
-					}
-					else if ((op == "and" || op == "or" || op == "xor" || op == "shl" || op == "lshr" || op == "ashr") && il.size() == 5)
-					{
-						// Legacy bitwise/shift path removed (handled earlier by ir::core_ops)
-					}
-					else if ((op == "zext" || op == "sext" || op == "trunc" || op == "bitcast" || op == "sitofp" || op == "uitofp" || op == "fptosi" || op == "fptoui" || op == "ptrtoint" || op == "inttoptr") && il.size() == 4)
-					{
-						// Legacy cast path removed (handled by ir::cast_ops)
-					}
-					else if (op == "as" && il.size() == 4)
-					{ // (as %dst <type> %initOrLiteral)
-					  // Legacy 'as' variable init path removed (handled by ir::variable_ops)
-					}
+					// Removed obsolete legacy emission branches (now handled by modular op handlers)
 
-					else if (edn::ir::phi_ops::collect(S_local_for_dispatch, il, pendingPhis))
+						else if (edn::ir::phi_ops::collect(sharedState, il, pendingPhis))
 					{
 						continue; // handled by phi_ops (collection phase)
 					}
 
-					else if (op == "panic" && il.size() == 1)
-					{
-						edn::ir::builder::State S_exc{builder, *llctx_, *module_, tctx_, [&](TypeId id)
-													  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
-						edn::ir::exception_ops::Context EC{S_exc, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes) { /* unused here */ }};
-						if (edn::ir::exception_ops::handle_panic(EC, il))
-							continue;
-					}
+						else if (op == "panic" && il.size() == 1)
+						{
+							edn::ir::exception_ops::Context EC{sharedState, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes) { /* unused here */ }};
+							if (edn::ir::exception_ops::handle_panic(EC, il))
+								continue;
+						}
 					// --- M4.6 Coroutines (minimal) ---
-					else if (edn::ir::coro_ops::handle(S_local_for_dispatch, il, enableCoro, lastCoroIdTok))
+						else if (edn::ir::coro_ops::handle(sharedState, il, enableCoro, lastCoroIdTok))
 					{
 						continue; // handled by coro_ops
 					}
-					else if (op == "call" && il.size() >= 4)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						TypeId retTy;
-						try
+						else if (op == "try")
 						{
-							retTy = tctx_.parse_type(il[2]);
+							edn::ir::exception_ops::Context EC{sharedState, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes)
+									   { emit_ref(nodes, emit_ref); }};
+							if (edn::ir::exception_ops::handle_try(EC, il))
+								continue;
 						}
-						catch (...)
-						{
-							continue;
+						else {
+							// Fallback group: call / varargs / return
+							ir::call_ops::Context callCtx{sharedState, F, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, enableEHItanium, enableEHSEH, panicUnwind, selectedPersonality, cfCounter, top, [&](const edn::node_ptr &n){ return getVal(n); }};
+							if (ir::call_ops::handle_call(callCtx, il) || ir::call_ops::handle_varargs(callCtx, il)) { continue; }
+							ir::return_ops::Context retCtx{sharedState, F, fty, functionDone};
+							if (ir::return_ops::handle(retCtx, il)) { if(functionDone) return; }
 						}
-						std::string callee = symName(il[3]);
-						if (callee.empty())
-							continue;
-						llvm::Function *CF = module_->getFunction(callee);
-						if (!CF)
-						{ // create forward decl; attempt to detect variadic via type cache by matching existing function type if any
-							// Scan original module AST for function header to recover signature & variadic flag
-							bool foundHeader = false;
-							std::vector<llvm::Type *> headerParamLL;
-							bool headerVariadic = false; // fallback param list from current call if header parse fails
-							for (size_t ti = 1; ti < top.size() && !foundHeader; ++ti)
-							{
-								auto &fnNode = top[ti];
-								if (!fnNode || !std::holds_alternative<list>(fnNode->data))
-									continue;
-								auto &fl2 = std::get<list>(fnNode->data).elems;
-								if (fl2.empty() || !std::holds_alternative<symbol>(fl2[0]->data) || std::get<symbol>(fl2[0]->data).name != "fn")
-									continue;
-								std::string fname2;
-								TypeId retHeader = tctx_.get_base(BaseType::Void);
-								std::vector<TypeId> paramTypeIds;
-								bool varargFlag = false;
-								for (size_t j = 1; j < fl2.size(); ++j)
-								{
-									if (!fl2[j] || !std::holds_alternative<keyword>(fl2[j]->data))
-										break;
-									std::string kw = std::get<keyword>(fl2[j]->data).name;
-									if (++j >= fl2.size())
-										break;
-									auto val = fl2[j];
-									if (kw == "name")
-									{
-										fname2 = symName(val);
-									}
-									else if (kw == "ret")
-									{
-										try
-										{
-											retHeader = tctx_.parse_type(val);
-										}
-										catch (...)
-										{
-											retHeader = tctx_.get_base(BaseType::Void);
-										}
-									}
-									else if (kw == "params" && val && std::holds_alternative<vector_t>(val->data))
-									{
-										for (auto &p : std::get<vector_t>(val->data).elems)
-										{
-											if (!p || !std::holds_alternative<list>(p->data))
-												continue;
-											auto &pl = std::get<list>(p->data).elems;
-											if (pl.size() == 3 && std::holds_alternative<symbol>(pl[0]->data) && std::get<symbol>(pl[0]->data).name == "param")
-											{
-												try
-												{
-													TypeId pty = tctx_.parse_type(pl[1]);
-													paramTypeIds.push_back(pty);
-												}
-												catch (...)
-												{
-												}
-											}
-										}
-									}
-									else if (kw == "vararg")
-									{
-										if (val && std::holds_alternative<bool>(val->data))
-											varargFlag = std::get<bool>(val->data);
-									}
-								}
-								if (fname2 == callee)
-								{ // build FunctionType using header info
-									for (auto pid : paramTypeIds)
-										headerParamLL.push_back(map_type(pid));
-									headerVariadic = varargFlag; // override return type from header (compiler may mismatch annotation; rely on checker)
-									CF = llvm::Function::Create(llvm::FunctionType::get(map_type(retHeader), headerParamLL, headerVariadic), llvm::Function::ExternalLinkage, callee, module_.get());
-									foundHeader = true;
-									break;
-								}
-							}
-							if (!foundHeader)
-							{ // fallback: use current arg variable types (best effort, assume non-variadic)
-								std::vector<llvm::Type *> argLTys;
-								argLTys.reserve(il.size() - 4);
-								for (size_t ai = 4; ai < il.size(); ++ai)
-								{
-									std::string av = trimPct(symName(il[ai]));
-									if (av.empty() || !vtypes.count(av))
-									{
-										argLTys.clear();
-										break;
-									}
-									argLTys.push_back(map_type(vtypes[av]));
-								}
-								CF = llvm::Function::Create(llvm::FunctionType::get(map_type(retTy), argLTys, false), llvm::Function::ExternalLinkage, callee, module_.get());
-							}
-						}
-						std::vector<llvm::Value *> args;
-						for (size_t ai = 4; ai < il.size(); ++ai)
-						{
-							auto *v = getVal(il[ai]);
-							if (!v)
-							{
-								args.clear();
-								break;
-							}
-							args.push_back(v);
-						}
-						if (args.size() + 4 != il.size())
-							continue;
-						if (enableEHItanium && selectedPersonality)
-						{
-							// Emit invoke with landingpad on exceptional edge; use shared try-target if present.
-							auto *contBB = llvm::BasicBlock::Create(*llctx_, "invoke.cont." + std::to_string(cfCounter++), F);
-							llvm::BasicBlock *exTarget = nullptr;
-							if (!itnExceptTargetStack.empty())
-							{
-								exTarget = itnExceptTargetStack.back();
-							}
-							else
-							{
-								exTarget = edn::ir::exceptions::create_panic_cleanup_landingpad(F, builder);
-							}
-							llvm::InvokeInst *inv = builder.CreateInvoke(CF, contBB, exTarget, args, CF->getReturnType()->isVoidTy() ? "" : dst);
-							// Normal continuation
-							builder.SetInsertPoint(contBB);
-							if (!CF->getReturnType()->isVoidTy())
-							{
-								vmap[dst] = inv;
-								vtypes[dst] = retTy;
-							}
-						}
-						else if (enableEHSEH && selectedPersonality)
-						{
-							// Windows SEH: emit invoke with a single shared cleanup funclet per function.
-							auto *contBB = llvm::BasicBlock::Create(*llctx_, "invoke.cont." + std::to_string(cfCounter++), F);
-							sehCleanupBB = edn::ir::exceptions::ensure_seh_cleanup(F, builder, sehCleanupBB);
-							llvm::BasicBlock *exTarget = sehExceptTargetStack.empty() ? sehCleanupBB : sehExceptTargetStack.back();
-							llvm::InvokeInst *inv = builder.CreateInvoke(CF, contBB, exTarget, args, CF->getReturnType()->isVoidTy() ? "" : dst);
-							// Normal continuation
-							builder.SetInsertPoint(contBB);
-							if (!CF->getReturnType()->isVoidTy())
-							{
-								vmap[dst] = inv;
-								vtypes[dst] = retTy;
-							}
-						}
-						else
-						{
-							auto *callInst = builder.CreateCall(CF, args, CF->getReturnType()->isVoidTy() ? "" : dst);
-							if (!CF->getReturnType()->isVoidTy())
-							{
-								vmap[dst] = callInst;
-								vtypes[dst] = retTy;
-							}
-						}
-					}
-					else if (op == "va-start" && il.size() == 2)
-					{ // allocate simple i8* zero for va_list handle
-						std::string ap = trimPct(symName(il[1]));
-						if (ap.empty())
-							continue; // represent va_list as i8* pointer to first extra arg placeholder (not implemented)
-						llvm::Value *nullp = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
-						vmap[ap] = nullp; // already attached type by checker
-					}
-					else if (op == "va-arg" && il.size() == 4)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue; // produce undef of requested type (checker ensured types)
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						llvm::Type *lty = map_type(ty);
-						llvm::Value *uv = llvm::UndefValue::get(lty);
-						vmap[dst] = uv;
-						vtypes[dst] = ty;
-					}
-					else if (op == "va-end" && il.size() == 2)
-					{ /* no-op */
-					}
-					else if (op == "try")
-					{
-						edn::ir::builder::State S_exc{builder, *llctx_, *module_, tctx_, [&](TypeId id)
-													  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
-						edn::ir::exception_ops::Context EC{S_exc, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes)
-														   { emit_ref(nodes, emit_ref); }};
-						if (edn::ir::exception_ops::handle_try(EC, il))
-							continue;
-					}
-
-					else if (op == "ret" && il.size() == 3)
-					{
-						std::string rv = trimPct(symName(il[2]));
-						if (!rv.empty())
-						{
-							// If value is slot-backed, load from slot for return
-							auto sIt = varSlots.find(rv);
-							if (sIt != varSlots.end())
-							{
-								auto tIt = vtypes.find(rv);
-								if (tIt != vtypes.end())
-								{
-									auto *lv = builder.CreateLoad(map_type(tIt->second), sIt->second, rv + ".ret");
-									builder.CreateRet(lv);
-									functionDone = true;
-									return;
-								}
-							}
-							if (vmap.count(rv))
-							{
-								builder.CreateRet(vmap[rv]);
-								functionDone = true;
-								return;
-							}
-						}
-						if (fty->getReturnType()->isVoidTy())
-							builder.CreateRetVoid();
-						else
-							builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType()));
-						functionDone = true;
-						return;
-					}
 				}
 			};
 			emit_list(std::get<vector_t>(body->data).elems, emit_list);

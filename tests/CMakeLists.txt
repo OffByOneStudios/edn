@@ -85,8 +85,6 @@ if(NOT WIN32)
 	target_compile_options(edn_tests_phase4_full PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/test_env.hpp)
 endif()
 add_test(NAME edn.phase4.full COMMAND edn_tests_phase4_full)
-# Temporarily disable while refactoring
-set_tests_properties(edn.phase4.full PROPERTIES DISABLED TRUE)
 endif()
 
 # Phase 5 tests

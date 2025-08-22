@@ -70,7 +70,11 @@ bool handle_call_indirect(builder::State& S, const std::vector<edn::node_ptr>& i
         args.push_back(S.vmap[an]);
     }
     if(bad) return false;
-    llvm::FunctionType *fty = llvm::cast<llvm::FunctionType>(S.map_type(FPT.pointee));
+    llvm::Type *rawFty = S.map_type(FPT.pointee);
+    if(!llvm::isa<llvm::FunctionType>(rawFty)) {
+        fprintf(stderr, "[dbg][cast] expected FunctionType in call-indirect but got kind=%u for pointee type id=%llu\n", (unsigned)rawFty->getTypeID(), (unsigned long long)FPT.pointee);
+    }
+    llvm::FunctionType *fty = llvm::cast<llvm::FunctionType>(rawFty);
     auto *ci = S.builder.CreateCall(fty, calleeV, args, fty->getReturnType()->isVoidTy()?"":dst);
     if(!fty->getReturnType()->isVoidTy()){
         S.vmap[dst]=ci; S.vtypes[dst]=retTy;

@@ -134,6 +134,8 @@ llvm::DIType* DebugManager::diTypeOf(edn::TypeId id)
                     edn::TypeId fid = ftIt->second[i];
                     auto *fDI = diTypeOf(fid);
                     llvm::Type *fLL = edn::ir::map_type(emitter->tctx_, *emitter->llctx_, fid);
+                    std::cout << "[di][member] struct=" << T.struct_name << " i=" << i << " fid=" << fid
+                              << " fLL.kind=" << (unsigned)fLL->getTypeID() << " fDI=" << (void*)fDI << "\n";
                     uint64_t fSizeBits = edn::ir::layout::alloc_size_bytes(*module, fLL) * 8;
                     uint32_t fAlignBits = edn::ir::layout::abi_align_bits(*module, fLL);
                     uint64_t offBits = SL ? SL->getElementOffsetInBits((unsigned)i) : 0;

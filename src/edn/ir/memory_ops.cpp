@@ -120,7 +120,11 @@ bool handle_array_lit(builder::State& S, const std::vector<edn::node_ptr>& il){
     edn::TypeId elemTy; try { elemTy = S.tctx.parse_type(il[2]); } catch(...) { return false; }
     if(!std::holds_alternative<int64_t>(il[3]->data)) return false; uint64_t asz = (uint64_t)std::get<int64_t>(il[3]->data); if(asz==0) return false;
     if(!std::holds_alternative<edn::vector_t>(il[4]->data)) return false; auto &elems = std::get<edn::vector_t>(il[4]->data).elems; if(elems.size()!=asz) return false;
-    edn::TypeId arrTy = S.tctx.get_array(elemTy, asz); auto *AT = llvm::cast<llvm::ArrayType>(S.map_type(arrTy));
+    edn::TypeId arrTy = S.tctx.get_array(elemTy, asz); llvm::Type *rawArrTy = S.map_type(arrTy);
+    if(!llvm::isa<llvm::ArrayType>(rawArrTy)) {
+        fprintf(stderr, "[dbg][cast] expected ArrayType in array-lit but got kind=%u size=%llu elemTyId=%llu asz=%llu\n", (unsigned)rawArrTy->getTypeID(), (unsigned long long)S.module.getDataLayout().getTypeAllocSize(rawArrTy), (unsigned long long)elemTy, (unsigned long long)asz);
+    }
+    auto *AT = llvm::cast<llvm::ArrayType>(rawArrTy);
     auto *allocaPtr = S.builder.CreateAlloca(AT, nullptr, dst);
     for(size_t i=0;i<elems.size();++i){ if(!std::holds_alternative<edn::symbol>(elems[i]->data)) continue; std::string val = trimPct(symName(elems[i])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; llvm::Value *zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value *idx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint32_t)i); auto *gep = S.builder.CreateInBoundsGEP(AT, allocaPtr, {zero, idx}, dst+".elem"+std::to_string(i)+".addr"); S.builder.CreateStore(vit->second, gep);}    
     S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(arrTy); return true;
@@ -139,6 +143,19 @@ bool handle_struct_lit(builder::State& S, const std::vector<edn::node_ptr>& il,
     auto *ST = llvm::StructType::getTypeByName(S.llctx, "struct."+sname);
     if(!ST){ std::vector<llvm::Type*> ftys; for(auto tid: ftIt->second) ftys.push_back(S.map_type(tid)); ST = llvm::StructType::create(S.llctx, ftys, "struct."+sname); }
     auto *allocaPtr = S.builder.CreateAlloca(ST, nullptr, dst);
+    if(S.debug_manager && S.debug_manager->enableDebugInfo && S.debug_manager->DIB){
+        if(auto *F = S.builder.GetInsertBlock()->getParent(); F && F->getSubprogram()){
+            unsigned line = S.builder.getCurrentDebugLocation() ? S.builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine();
+            auto *scope = S.debug_manager->currentScope();
+            auto *diTy = S.debug_manager->diTypeOf(S.tctx.get_struct(sname));
+            if(auto *sp = F->getSubprogram()){
+                auto *lv = S.debug_manager->DIB->createAutoVariable(scope ? scope : sp, dst, S.debug_manager->DI_File, line, diTy, true);
+                auto *expr = S.debug_manager->DIB->createExpression();
+                // Use dbg.declare (not dbg.value) so tests can find a DbgDeclareInst
+                S.debug_manager->DIB->insertDeclare(allocaPtr, lv, expr, S.builder.getCurrentDebugLocation(), S.builder.GetInsertBlock());
+            }
+        }
+    }
     auto &vec = std::get<edn::vector_t>(il[3]->data).elems;
     for(size_t i=0, fi=0; i+1<vec.size(); i+=2, ++fi){ if(!std::holds_alternative<edn::symbol>(vec[i]->data) || !std::holds_alternative<edn::symbol>(vec[i+1]->data)) continue; std::string fname = symName(vec[i]); std::string val=trimPct(symName(vec[i+1])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; auto idxMapIt = idxIt->second.find(fname); if(idxMapIt==idxIt->second.end()) continue; uint32_t fidx = idxMapIt->second; llvm::Value* zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value* fIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx), fidx); auto *gep = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, fIndex}, dst+"."+fname+".addr"); S.builder.CreateStore(vit->second, gep);}    
     S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname)); return true;
