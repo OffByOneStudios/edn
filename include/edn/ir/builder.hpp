@@ -11,6 +11,7 @@
 
 #include "edn/edn.hpp"
 #include "edn/types.hpp"
+#include "edn/ir/debug.hpp"
 
 namespace edn::ir::builder {
 
@@ -27,6 +28,8 @@ struct State {
     std::unordered_map<std::string, llvm::AllocaInst*>& varSlots;
     std::unordered_map<std::string, std::string>& initAlias;
     std::unordered_map<std::string, edn::node_ptr>& defNode;
+
+    std::shared_ptr<edn::ir::debug::DebugManager> debug_manager;
 };
 
 // Resolve a node to an LLVM Value*, respecting variable slots and initializer aliases.

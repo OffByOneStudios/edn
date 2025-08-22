@@ -433,7 +433,7 @@ namespace edn
 					{
 						edn::ir::builder::State S{builder, *llctx_, *module_, tctx_,
 												  [&](TypeId id)
-												  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode};
+												  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
 						if (edn::ir::core_ops::handle_integer_arith(S, il) ||
 							edn::ir::core_ops::handle_float_arith(S, il) ||
 							edn::ir::core_ops::handle_bitwise_shift(S, il, inst) ||
@@ -1407,25 +1407,6 @@ namespace edn
 							vtypes[dst] = toTy;
 						}
 					}
-					else if (op == "assign" && il.size() == 3)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						std::string src = trimPct(symName(il[2]));
-						if (dst.empty() || src.empty())
-							continue;
-						llvm::Value *sv = getVal(il[2]);
-						if (!sv)
-							continue;
-						TypeId sty = vtypes.count(src) ? vtypes[src] : 0;
-						if (!sty)
-							continue;
-						auto *slot = ensureSlot(dst, sty, /*initFromCurrent=*/false);
-						builder.CreateStore(sv, slot);
-						vtypes[dst] = sty;
-						// Keep SSA view in sync for consumers that read vmap directly
-						auto *cur = builder.CreateLoad(map_type(sty), slot, dst);
-						vmap[dst] = cur;
-					}
 					else if (op == "as" && il.size() == 4)
 					{ // (as %dst <type> %initOrLiteral)
 						std::string dst = trimPct(symName(il[1]));
@@ -1495,81 +1476,7 @@ namespace edn
 							(void)debug_manager_->DIB->insertDeclare(slot, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
 						}
 					}
-					else if (op == "alloca" && il.size() == 3)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						auto *av = builder.CreateAlloca(map_type(ty), nullptr, dst);
-						vmap[dst] = av;
-						vtypes[dst] = tctx_.get_pointer(ty);
-						if (enableDebugInfo && F->getSubprogram())
-						{
-							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(ty));
-							auto *expr = debug_manager_->DIB->createExpression();
-							(void)debug_manager_->DIB->insertDeclare(av, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
-						}
-					}
-					else if (op == "struct-lit" && il.size() == 4)
-					{ // (struct-lit %dst StructName [ field1 %v1 ... ]) produce pointer to struct alloca
-						std::string dst = trimPct(symName(il[1]));
-						std::string sname = symName(il[2]);
-						if (dst.empty() || sname.empty())
-							continue;
-						if (!std::holds_alternative<vector_t>(il[3]->data))
-							continue;
-						auto idxIt = struct_field_index_.find(sname);
-						auto ftIt = struct_field_types_.find(sname);
-						if (idxIt == struct_field_index_.end() || ftIt == struct_field_types_.end())
-							continue;
-						auto *ST = llvm::StructType::getTypeByName(*llctx_, "struct." + sname);
-						if (!ST)
-						{ // create body if missed
-							std::vector<llvm::Type *> ftys;
-							for (auto tid : ftIt->second)
-								ftys.push_back(map_type(tid));
-							ST = llvm::StructType::create(*llctx_, ftys, "struct." + sname);
-						}
-						auto *allocaPtr = builder.CreateAlloca(ST, nullptr, dst);
-						auto &vec = std::get<vector_t>(il[3]->data).elems; // expect name/value pairs in order
-						for (size_t i = 0, fi = 0; i + 1 < vec.size(); i += 2, ++fi)
-						{
-							if (!std::holds_alternative<symbol>(vec[i]->data) || !std::holds_alternative<symbol>(vec[i + 1]->data))
-								continue;
-							std::string fname = symName(vec[i]);
-							std::string val = trimPct(symName(vec[i + 1]));
-							if (val.empty())
-								continue;
-							auto vit = vmap.find(val);
-							if (vit == vmap.end())
-								continue;
-							auto idxMapIt = idxIt->second.find(fname);
-							if (idxMapIt == idxIt->second.end())
-								continue;
-							uint32_t fidx = idxMapIt->second;
-							llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-							llvm::Value *fIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), fidx);
-							auto *gep = builder.CreateInBoundsGEP(ST, allocaPtr, {zero, fIndex}, dst + "." + fname + ".addr");
-							builder.CreateStore(vit->second, gep);
-						}
-						vmap[dst] = allocaPtr;
-						vtypes[dst] = tctx_.get_pointer(tctx_.get_struct(sname));
-						if (enableDebugInfo && F->getSubprogram())
-						{
-							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(tctx_.get_struct(sname)));
-							auto *expr = debug_manager_->DIB->createExpression();
-							(void)debug_manager_->DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
-						}
-					}
+					
 					else if (op == "sum-new" && (il.size() == 4 || il.size() == 5))
 					{
 						// (sum-new %dst SumName Variant [ %v* ]) -> allocate struct, store tag, memcpy payload fields into byte array
@@ -1724,57 +1631,6 @@ namespace edn
 						vmap[dst] = lv;
 						vtypes[dst] = fieldTyId;
 					}
-					else if (op == "array-lit" && il.size() == 5)
-					{ // (array-lit %dst <elem-type> <size> [ %e0 ... ])
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId elemTy;
-						try
-						{
-							elemTy = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						if (!std::holds_alternative<int64_t>(il[3]->data))
-							continue;
-						uint64_t asz = (uint64_t)std::get<int64_t>(il[3]->data);
-						if (asz == 0)
-							continue;
-						if (!std::holds_alternative<vector_t>(il[4]->data))
-							continue;
-						auto &elems = std::get<vector_t>(il[4]->data).elems;
-						if (elems.size() != asz)
-							continue;
-						TypeId arrTy = tctx_.get_array(elemTy, asz);
-						auto *AT = llvm::cast<llvm::ArrayType>(map_type(arrTy));
-						auto *allocaPtr = builder.CreateAlloca(AT, nullptr, dst);
-						for (size_t i = 0; i < elems.size(); ++i)
-						{
-							if (!std::holds_alternative<symbol>(elems[i]->data))
-								continue;
-							std::string val = trimPct(symName(elems[i]));
-							if (val.empty())
-								continue;
-							auto vit = vmap.find(val);
-							if (vit == vmap.end())
-								continue;
-							llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-							llvm::Value *idx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint32_t)i);
-							auto *gep = builder.CreateInBoundsGEP(AT, allocaPtr, {zero, idx}, dst + ".elem" + std::to_string(i) + ".addr");
-							builder.CreateStore(vit->second, gep);
-						}
-						vmap[dst] = allocaPtr;
-						vtypes[dst] = tctx_.get_pointer(arrTy);
-						if (enableDebugInfo && F->getSubprogram())
-						{
-							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(arrTy));
-							auto *expr = debug_manager_->DIB->createExpression();
-							(void)debug_manager_->DIB->insertDeclare(allocaPtr, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
-						}
-					}
 					else if (op == "phi" && il.size() == 4)
 					{
 						std::string dst = trimPct(symName(il[1]));
@@ -1806,203 +1662,7 @@ namespace edn
 						}
 						pendingPhis.push_back(PendingPhi{dst, ty, std::move(incomings), builder.GetInsertBlock()});
 					}
-					else if (op == "store" && il.size() == 4)
-					{
-						std::string ptrn = trimPct(symName(il[2]));
-						std::string valn = trimPct(symName(il[3]));
-						if (ptrn.empty() || valn.empty())
-							continue;
-						auto pit = vmap.find(ptrn);
-						auto vit = vmap.find(valn);
-						if (pit == vmap.end() || vit == vmap.end())
-							continue;
-						builder.CreateStore(vit->second, pit->second);
-					}
-					else if (op == "gload" && il.size() == 4)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string gname = symName(il[3]);
-						if (gname.empty())
-							continue;
-						auto *gv = module_->getGlobalVariable(gname);
-						if (!gv)
-							continue;
-						auto *lv = builder.CreateLoad(map_type(ty), gv, dst);
-						vmap[dst] = lv;
-						vtypes[dst] = ty;
-					}
-					else if (op == "gstore" && il.size() == 4)
-					{
-						std::string gname = symName(il[2]);
-						std::string valn = trimPct(symName(il[3]));
-						if (gname.empty() || valn.empty())
-							continue;
-						auto *gv = module_->getGlobalVariable(gname);
-						if (!gv)
-							continue;
-						auto vit = vmap.find(valn);
-						if (vit == vmap.end())
-							continue;
-						builder.CreateStore(vit->second, gv);
-					}
-					else if (op == "load" && il.size() == 4)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string ptrn = trimPct(symName(il[3]));
-						auto it = vmap.find(ptrn);
-						if (it == vmap.end() || !vtypes.count(ptrn))
-							continue;
-						TypeId pty = vtypes[ptrn];
-						const Type &PT = tctx_.at(pty);
-						if (PT.kind != Type::Kind::Pointer || PT.pointee != ty)
-							continue;
-						auto *lv = builder.CreateLoad(map_type(ty), it->second, dst);
-						vmap[dst] = lv;
-						vtypes[dst] = ty;
-					}
-					else if (op == "index" && il.size() == 5)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId elemTy;
-						try
-						{
-							elemTy = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						auto *baseV = getVal(il[3]);
-						auto *idxV = getVal(il[4]);
-						if (!baseV || !idxV)
-							continue;
-						std::string baseName = trimPct(symName(il[3]));
-						if (!vtypes.count(baseName))
-							continue;
-						TypeId baseTyId = vtypes[baseName];
-						const Type *baseTy = &tctx_.at(baseTyId);
-						if (baseTy->kind != Type::Kind::Pointer)
-							continue;
-						const Type *arrTy = &tctx_.at(baseTy->pointee);
-						if (arrTy->kind != Type::Kind::Array || arrTy->elem != elemTy)
-							continue;
-						llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						auto *gep = builder.CreateInBoundsGEP(map_type(baseTy->pointee), baseV, {zero, idxV}, dst);
-						vmap[dst] = gep;
-						vtypes[dst] = tctx_.get_pointer(elemTy);
-					}
-					else if (op == "member" && il.size() == 5)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						std::string sname = symName(il[2]);
-						std::string base = trimPct(symName(il[3]));
-						std::string fname = symName(il[4]);
-						if (dst.empty() || sname.empty() || base.empty() || fname.empty())
-							continue;
-						auto bit = vmap.find(base);
-						if (bit == vmap.end() || !vtypes.count(base))
-							continue;
-						TypeId bty = vtypes[base];
-						const Type &BT = tctx_.at(bty);
-						TypeId structId = 0;
-						bool baseIsPtr = false;
-						if (BT.kind == Type::Kind::Pointer)
-						{
-							baseIsPtr = true;
-							if (tctx_.at(BT.pointee).kind == Type::Kind::Struct)
-								structId = BT.pointee;
-						}
-						else if (BT.kind == Type::Kind::Struct)
-							structId = bty;
-						if (structId == 0 || !baseIsPtr)
-							continue;
-						const Type &ST = tctx_.at(structId);
-						if (ST.kind != Type::Kind::Struct || ST.struct_name != sname)
-							continue;
-						auto stIt = struct_types_.find(sname);
-						if (stIt == struct_types_.end())
-							continue;
-						auto idxIt = struct_field_index_.find(sname);
-						if (idxIt == struct_field_index_.end())
-							continue;
-						auto fIt = idxIt->second.find(fname);
-						if (fIt == idxIt->second.end())
-							continue;
-						size_t fidx = fIt->second;
-						auto ftIt = struct_field_types_.find(sname);
-						if (ftIt == struct_field_types_.end() || fidx >= ftIt->second.size())
-							continue;
-						llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						llvm::Value *fieldIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint32_t)fidx);
-						auto *gep = builder.CreateInBoundsGEP(stIt->second, bit->second, {zero, fieldIndex}, dst + ".addr");
-						auto *lv = builder.CreateLoad(map_type(ftIt->second[fidx]), gep, dst);
-						vmap[dst] = lv;
-						vtypes[dst] = ftIt->second[fidx];
-					}
-					else if (op == "union-member" && il.size() == 5)
-					{ // (union-member %dst Union %ptr field)
-						std::string dst = trimPct(symName(il[1]));
-						std::string uname = symName(il[2]);
-						std::string base = trimPct(symName(il[3]));
-						std::string fname = symName(il[4]);
-						if (dst.empty() || uname.empty() || base.empty() || fname.empty())
-							continue;
-						auto bit = vmap.find(base);
-						if (bit == vmap.end() || !vtypes.count(base))
-							continue;
-						TypeId bty = vtypes[base];
-						const Type &BT = tctx_.at(bty);
-						if (BT.kind != Type::Kind::Pointer)
-							continue;
-						TypeId pointee = BT.pointee;
-						const Type &PT = tctx_.at(pointee);
-						if (PT.kind != Type::Kind::Struct || PT.struct_name != uname)
-							continue;
-						auto stIt = struct_types_.find(uname);
-						if (stIt == struct_types_.end())
-							continue;
-						auto uftIt = union_field_types_.find(uname);
-						if (uftIt == union_field_types_.end())
-							continue;
-						auto fTyIt = uftIt->second.find(fname);
-						if (fTyIt == uftIt->second.end())
-							continue;
-						TypeId fieldTy = fTyIt->second; // compute pointer to storage start
-						llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						llvm::Value *storageIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						auto *storagePtr = builder.CreateInBoundsGEP(stIt->second, bit->second, {zero, storageIndex}, dst + ".ustorage.addr"); // [N x i8]*
-						// Bitcast storage to pointer to field type and load
-						llvm::Type *fieldLL = map_type(fieldTy);
-						llvm::PointerType *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL);
-						auto *rawPtr = builder.CreateBitCast(storagePtr, fieldPtrTy, dst + ".cast");
-						auto *lv = builder.CreateLoad(fieldLL, rawPtr, dst);
-						vmap[dst] = lv;
-						vtypes[dst] = fieldTy;
-					}
+
 					else if (op == "panic" && il.size() == 1)
 					{ // (panic) -> abort or unwind depending on EDN_PANIC
 						if (panicUnwind && enableEHItanium && selectedPersonality)
@@ -2066,53 +1726,6 @@ namespace edn
 							builder.CreateUnreachable();
 						}
 						continue;
-					}
-					else if (op == "member-addr" && il.size() == 5)
-					{
-						std::string dst = trimPct(symName(il[1]));
-						std::string sname = symName(il[2]);
-						std::string base = trimPct(symName(il[3]));
-						std::string fname = symName(il[4]);
-						if (dst.empty() || sname.empty() || base.empty() || fname.empty())
-							continue;
-						auto bit = vmap.find(base);
-						if (bit == vmap.end() || !vtypes.count(base))
-							continue;
-						TypeId bty = vtypes[base];
-						const Type &BT = tctx_.at(bty);
-						TypeId structId = 0;
-						bool baseIsPtr = false;
-						if (BT.kind == Type::Kind::Pointer)
-						{
-							baseIsPtr = true;
-							if (tctx_.at(BT.pointee).kind == Type::Kind::Struct)
-								structId = BT.pointee;
-						}
-						else if (BT.kind == Type::Kind::Struct)
-							structId = bty;
-						if (structId == 0 || !baseIsPtr)
-							continue;
-						const Type &ST = tctx_.at(structId);
-						if (ST.kind != Type::Kind::Struct || ST.struct_name != sname)
-							continue;
-						auto stIt = struct_types_.find(sname);
-						if (stIt == struct_types_.end())
-							continue;
-						auto idxIt = struct_field_index_.find(sname);
-						if (idxIt == struct_field_index_.end())
-							continue;
-						auto fIt = idxIt->second.find(fname);
-						if (fIt == idxIt->second.end())
-							continue;
-						size_t fidx = fIt->second;
-						auto ftIt = struct_field_types_.find(sname);
-						if (ftIt == struct_field_types_.end() || fidx >= ftIt->second.size())
-							continue;
-						llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), 0);
-						llvm::Value *fieldIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(*llctx_), (uint32_t)fidx);
-						auto *gep = builder.CreateInBoundsGEP(stIt->second, bit->second, {zero, fieldIndex}, dst);
-						vmap[dst] = gep;
-						vtypes[dst] = tctx_.get_pointer(ftIt->second[fidx]);
 					}
 					// --- M4.6 Coroutines (minimal) ---
 					else if (op == "coro-begin" && il.size() == 2)
@@ -2569,11 +2182,6 @@ namespace edn
 					}
 					else if (op == "va-end" && il.size() == 2)
 					{ /* no-op */
-					}
-					else if (op == "if")
-					{
-						// Legacy inline 'if' removed; handled earlier by control_ops module.
-						continue;
 					}
 					else if (op == "try")
 					{ // (try :body [ ... ] :catch [ ... ])  -- Itanium & SEH (catch-all minimal)

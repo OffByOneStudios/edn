@@ -37,6 +37,25 @@ bool handle_alloca(builder::State& S, const std::vector<edn::node_ptr>& il){
     edn::TypeId ty; try { ty = S.tctx.parse_type(il[2]); } catch(...) { return false; }
     auto *av = S.builder.CreateAlloca(S.map_type(ty), nullptr, dst);
     S.vmap[dst] = av; S.vtypes[dst] = S.tctx.get_pointer(ty);
+    // Debug info (mirrors legacy inline implementation)
+    if (S.debug_manager && S.debug_manager->enableDebugInfo) {
+        llvm::Function *F = S.builder.GetInsertBlock() ? S.builder.GetInsertBlock()->getParent() : nullptr;
+        if (F && F->getSubprogram()) {
+            unsigned line = 0;
+            llvm::DebugLoc curLoc = S.builder.getCurrentDebugLocation();
+            if (curLoc) line = curLoc.getLine();
+            if (line == 0) line = F->getSubprogram()->getLine();
+            auto *lv = S.debug_manager->DIB->createAutoVariable(
+                F->getSubprogram(),
+                dst,
+                S.debug_manager->DI_File,
+                line,
+                S.debug_manager->diTypeOf(ty)
+            );
+            auto *expr = S.debug_manager->DIB->createExpression();
+            (void)S.debug_manager->DIB->insertDeclare(av, lv, expr, curLoc, S.builder.GetInsertBlock());
+        }
+    }
     return true;
 }
 
@@ -94,6 +113,8 @@ bool handle_index(builder::State& S, const std::vector<edn::node_ptr>& il){
 
 bool handle_array_lit(builder::State& S, const std::vector<edn::node_ptr>& il){
     // (array-lit %dst <elem-type> <size> [ %e0 ... ])
+    // TODO(debug-info): Consider emitting DI metadata for synthetic array literal temporaries
+    // similar to handle_alloca once array literals need debugger visibility.
     if(il.size()!=5) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="array-lit") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId elemTy; try { elemTy = S.tctx.parse_type(il[2]); } catch(...) { return false; }
@@ -109,6 +130,8 @@ bool handle_struct_lit(builder::State& S, const std::vector<edn::node_ptr>& il,
                        const std::unordered_map<std::string, std::unordered_map<std::string, size_t>>& struct_field_index,
                        const std::unordered_map<std::string, std::vector<edn::TypeId>>& struct_field_types){
     // (struct-lit %dst StructName [ field1 %v1 ... ])
+    // TODO(debug-info): Potentially attach debug info for struct literal stack allocations
+    // if we later surface them as user-visible temporaries or named variables.
     if(il.size()!=4) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="struct-lit") return false;
     std::string dst = trimPct(symName(il[1])); std::string sname = symName(il[2]); if(dst.empty()||sname.empty()) return false;
     if(!std::holds_alternative<edn::vector_t>(il[3]->data)) return false;
