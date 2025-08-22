@@ -4,15 +4,8 @@ project(edn LANGUAGES C CXX VERSION 0.0.1)
 # Options
 option(EDN_BUILD_TESTS "Build tests" ON)
 # Bring-up knob: when ON on Apple, we can selectively disable later-phase tests by default
-option(EDN_PORT_DARWIN "Enable Darwin (macOS arm64) bring-up defaults" OFF)
 option(EDN_ENABLE_COVERAGE "Enable LLVM source-based code coverage (clang -fprofile-instr-generate -fcoverage-mapping)" OFF)
 
-# On Apple, silence linker warnings about duplicate libraries that can occur
-# when LLVM components are mapped to libnames for multiple targets.
-if(APPLE)
-    # Apply to all targets in this directory and below
-    add_link_options(-Wl,-no_warn_duplicate_libraries)
-endif()
 
 # MSVC: ensure exception handling (unwind semantics) is enabled to avoid C4530 warnings
 if(MSVC)
@@ -45,8 +38,17 @@ add_library(edn STATIC
     src/edn/ir/control_ops.cpp
     src/edn/ir/debug.cpp
     src/edn/ir/closure_ops.cpp
-)
-add_library(edn::edn ALIAS edn)
+    src/edn/ir/compare_ops.cpp
+    src/edn/ir/cast_ops.cpp
+    src/edn/ir/pointer_func_ops.cpp
+    src/edn/ir/const_ops.cpp
+    src/edn/ir/variable_ops.cpp
+    src/edn/ir/phi_ops.cpp
+    src/edn/ir/coro_ops.cpp
+    src/edn/ir/exception_ops.cpp
+    src/edn/ir/debug_pipeline.cpp
+    src/edn/ir/di.cpp)
+
 
 include(GNUInstallDirs)
 
@@ -112,19 +114,6 @@ endif()
 message(STATUS "Found LLVM 18: ${LLVM_PACKAGE_VERSION}")
 list(APPEND CMAKE_MODULE_PATH ${LLVM_CMAKE_DIR})
 
-# When doing Darwin bring-up, default to building earlier phase tests only (user can override)
-if(EDN_PORT_DARWIN AND APPLE)
-    foreach(var EDN_BUILD_TESTS_PHASE3 EDN_BUILD_TESTS_PHASE4 EDN_BUILD_TESTS_PHASE4_FULL EDN_BUILD_TESTS_PHASE5)
-        if(NOT DEFINED ${var})
-            set(${var} OFF CACHE BOOL "Darwin bring-up: disable ${var} by default" )
-        endif()
-    endforeach()
-    foreach(var EDN_BUILD_TESTS_CORE EDN_BUILD_TESTS_PHASE2)
-        if(NOT DEFINED ${var})
-            set(${var} ON CACHE BOOL "Darwin bring-up: enable ${var} by default" )
-        endif()
-    endforeach()
-endif()
 
 # Provide version header generation (simple) into build tree
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/include/edn)

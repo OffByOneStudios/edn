@@ -56,17 +56,25 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                 elseBB = llvm::BasicBlock::Create(llctx, "if.else." + std::to_string(C.cfCounter++), C.F);
             if (!B.GetInsertBlock()->getTerminator())
                 B.CreateCondBr(condV, thenBB, hasElse ? elseBB : mergeBB);
-            // then
+            // then (push lexical scope for 'then')
             B.SetInsertPoint(thenBB);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1, 1, &B);
             if (std::holds_alternative<vector_t>(il[2]->data))
                 C.emit_ref(std::get<vector_t>(il[2]->data).elems);
             if (!B.GetInsertBlock()->getTerminator())
                 B.CreateBr(mergeBB);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
             if (hasElse) {
                 B.SetInsertPoint(elseBB);
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                    C.S.debug_manager->pushLexicalBlock(/*line*/1, 1, &B);
                 C.emit_ref(std::get<vector_t>(il[3]->data).elems);
                 if (!B.GetInsertBlock()->getTerminator())
                     B.CreateBr(mergeBB);
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                    C.S.debug_manager->popScope(&B);
             }
             B.SetInsertPoint(mergeBB);
         }
@@ -98,7 +106,11 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                 B.SetInsertPoint(bodyBB);
                 C.loopEndStack.push_back(endBB);
                 C.loopContinueStack.push_back(condBB);
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                    C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
                 C.emit_ref(std::get<vector_t>(il[2]->data).elems);
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                    C.S.debug_manager->popScope(&B);
                 C.loopContinueStack.pop_back();
                 C.loopEndStack.pop_back();
                 if (!B.GetInsertBlock()->getTerminator()) B.CreateBr(condBB);
@@ -145,11 +157,23 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
         B.SetInsertPoint(bodyBB);
         C.loopEndStack.push_back(endBB);
         C.loopContinueStack.push_back(stepBB);
-        if (!bodyVec.empty()) C.emit_ref(bodyVec);
+        if (!bodyVec.empty()) {
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+            C.emit_ref(bodyVec);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
+        }
         C.loopContinueStack.pop_back();
         if (!B.GetInsertBlock()->getTerminator()) B.CreateBr(stepBB);
         B.SetInsertPoint(stepBB);
-        if (!stepVec.empty()) C.emit_ref(stepVec);
+        if (!stepVec.empty()) {
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+            C.emit_ref(stepVec);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
+        }
         C.loopEndStack.pop_back();
         if (!stepBB->getTerminator()) B.CreateBr(condBB);
         B.SetInsertPoint(endBB);
@@ -201,12 +225,20 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
             auto *nextCmpBB = (ci+1<cases.size()) ? caseBlocks[ci+1] : defaultBB;
             B.CreateCondBr(cmp, bodyBB, nextCmpBB);
             B.SetInsertPoint(bodyBB);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
             C.emit_ref(cases[ci].second);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
             if (!bodyBB->getTerminator()) B.CreateBr(mergeBB);
         }
         if (haveDefault) {
             B.SetInsertPoint(defaultBB);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
             C.emit_ref(defaultBody);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
             if (!defaultBB->getTerminator()) B.CreateBr(mergeBB);
         }
         B.SetInsertPoint(mergeBB);
@@ -306,7 +338,11 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                     }
                 }
             }
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
             C.emit_ref(cases[ci].body);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
             if (resultMode) {
                 std::string vnm = cases[ci].valueVar; if (!vnm.empty() && vmap.count(vnm)) incomings.push_back({vmap[vnm], bodyBB});
                 else if (resultTy) incomings.push_back({llvm::UndefValue::get(C.S.map_type(resultTy)), bodyBB});
@@ -322,7 +358,11 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
             else if (std::holds_alternative<list>(defaultNode->data)) {
                 auto &dl = std::get<list>(defaultNode->data).elems; size_t diStart=0; if (!dl.empty() && std::holds_alternative<symbol>(dl[0]->data) && std::get<symbol>(dl[0]->data).name=="default") diStart=1; for (size_t di=diStart; di<dl.size(); ++di) { if (!dl[di] || !std::holds_alternative<keyword>(dl[di]->data)) break; std::string kw = std::get<keyword>(dl[di]->data).name; if (++di >= dl.size()) break; auto valn = dl[di]; if (kw=="body" && valn && std::holds_alternative<vector_t>(valn->data)) { auto &ve = std::get<vector_t>(valn->data).elems; defaultBody.reserve(ve.size()); for (size_t bj=0; bj<ve.size(); ++bj) { auto &bn = ve[bj]; if (bn && std::holds_alternative<keyword>(bn->data)) { std::string kw2 = std::get<keyword>(bn->data).name; if (kw2=="value" && bj+1<ve.size() && ve[bj+1] && std::holds_alternative<symbol>(ve[bj+1]->data)) { defaultValueVar = trimPct(symName(ve[bj+1])); ++bj; continue; } } defaultBody.push_back(bn);} } else if (kw=="value" && valn && std::holds_alternative<symbol>(valn->data)) { defaultValueVar = trimPct(symName(valn)); } }
             }
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
             C.emit_ref(defaultBody);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&B);
             if (resultMode) {
                 if (!defaultValueVar.empty() && vmap.count(defaultValueVar)) incomings.push_back({vmap[defaultValueVar], defaultBB});
                 else if (resultTy) incomings.push_back({llvm::UndefValue::get(C.S.map_type(resultTy)), defaultBB});

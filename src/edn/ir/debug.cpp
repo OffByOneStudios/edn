@@ -28,9 +28,9 @@ void DebugManager::initialize()
     {
         enableDebugInfo = true;
     }
-    std::unique_ptr<llvm::DIBuilder> DIB;
-    // Create a compile unit for DWARF info (result unused)
-    llvm::DIFile *DI_File = nullptr;
+    // Reset members first (in case of re-init)
+    DIB.reset();
+    DI_File = nullptr;
     if (enableDebugInfo)
     {
         // Minimal, backend-agnostic setup
@@ -40,14 +40,8 @@ void DebugManager::initialize()
         // Use synthetic file info (tests often embed strings). Allow override via env.
         std::string srcFile = "inline.edn";
         std::string srcDir = ".";
-        if (const char *sf = std::getenv("EDN_DEBUG_FILE"))
-        {
-            srcFile = sf;
-        }
-        if (const char *sd = std::getenv("EDN_DEBUG_DIR"))
-        {
-            srcDir = sd;
-        }
+        if (const char *sf = std::getenv("EDN_DEBUG_FILE")) { srcFile = sf; }
+        if (const char *sd = std::getenv("EDN_DEBUG_DIR")) { srcDir = sd; }
         DI_File = DIB->createFile(srcFile, srcDir);
         (void)DIB->createCompileUnit(llvm::dwarf::DW_LANG_C, DI_File, "edn", /*isOptimized*/ false, "", 0);
     }
@@ -196,5 +190,43 @@ llvm::DIType* DebugManager::diTypeOf(edn::TypeId id)
         DITypeCache[id] = out;
         return out;
     }
+
+// -------------------- Scope stack helpers ----------------------------------
+llvm::DIScope* DebugManager::currentScope() const {
+    if (!scopeStack.empty()) return scopeStack.back();
+    return DI_File; // may be null when debug disabled
+}
+
+void DebugManager::pushFunctionScope(llvm::DISubprogram* SP) {
+    if (!enableDebugInfo || !SP) return;
+    // Clear any previous stack (fresh function)
+    scopeStack.clear();
+    scopeStack.push_back(SP);
+}
+
+void DebugManager::pushLexicalBlock(unsigned line, unsigned col, llvm::IRBuilder<>* builder) {
+    if (!enableDebugInfo || !DIB) return;
+    auto *parent = currentScope();
+    if (!parent) return;
+    if (line == 0) line = 1;
+    auto *LB = DIB->createLexicalBlock(parent, DI_File, line, col);
+    scopeStack.push_back(LB);
+    if (builder) {
+        builder->SetCurrentDebugLocation(llvm::DILocation::get(builder->getContext(), line, col, LB));
+    }
+}
+
+void DebugManager::popScope(llvm::IRBuilder<>* builder) {
+    if (!enableDebugInfo) return;
+    if (scopeStack.size() <= 1) return; // keep at least function scope
+    scopeStack.pop_back();
+    if (builder) {
+        auto *scope = currentScope();
+        if (scope) {
+            unsigned line = 1;
+            builder->SetCurrentDebugLocation(llvm::DILocation::get(builder->getContext(), line, 1, scope));
+        }
+    }
+}
 
 } // namespace edn::ir::debug

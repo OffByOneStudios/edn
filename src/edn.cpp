@@ -35,6 +35,16 @@
 #include "edn/ir/sum_ops.hpp"
 #include "edn/ir/control_ops.hpp"
 #include "edn/ir/closure_ops.hpp"
+#include "edn/ir/compare_ops.hpp"
+#include "edn/ir/cast_ops.hpp"
+#include "edn/ir/pointer_func_ops.hpp"
+#include "edn/ir/const_ops.hpp"
+#include "edn/ir/variable_ops.hpp"
+#include "edn/ir/phi_ops.hpp"
+#include "edn/ir/coro_ops.hpp"
+#include "edn/ir/exception_ops.hpp"
+#include "edn/ir/debug_pipeline.hpp"
+#include "edn/ir/di.hpp"
 
 namespace edn
 {
@@ -186,34 +196,11 @@ namespace edn
 			auto ftyId = tctx_.get_function(paramIds, retTy, isVariadic);
 			auto *fty = llvm::cast<llvm::FunctionType>(map_type(ftyId));
 			auto *F = llvm::Function::Create(fty, llvm::Function::ExternalLinkage, fname, module_.get());
-			// Attach a DISubprogram to the function if debug is enabled
-			llvm::DISubprogram *DI_SP = nullptr;
-			if (enableDebugInfo && debug_manager_->DIB && debug_manager_->DI_File)
+			// Function-level debug info (skeleton via di module)
+			if (enableDebugInfo)
 			{
-				// Build a real subroutine type for the function signature
-				std::vector<llvm::Metadata *> sigTys;
-				// Return type first
-				sigTys.push_back(static_cast<llvm::Metadata *>(debug_manager_->diTypeOf(retTy)));
-				// Param types
-				for (auto &pr : params)
-				{
-					sigTys.push_back(static_cast<llvm::Metadata *>(debug_manager_->diTypeOf(pr.second)));
-				}
-				auto *subTy = debug_manager_->DIB->createSubroutineType(debug_manager_->DIB->getOrCreateTypeArray(sigTys));
-				unsigned lineNo = edn::line(*fl[0]); // best-effort: use the "fn" token start line
-				if (lineNo == 0)
-					lineNo = 1;
-				DI_SP = debug_manager_->DIB->createFunction(
-					/*Scope=*/debug_manager_->DI_File,
-					/*Name=*/fname,
-					/*LinkageName=*/fname,
-					/*File=*/debug_manager_->DI_File,
-					/*LineNo=*/lineNo,
-					/*Type=*/subTy,
-					/*ScopeLine=*/lineNo,
-					/*Flags=*/llvm::DINode::FlagZero,
-					/*SPFlags=*/llvm::DISubprogram::SPFlagDefinition);
-				F->setSubprogram(DI_SP);
+				unsigned fnLine = edn::line(*fl[0]);
+				edn::ir::di::attach_function_debug(*debug_manager_, *F, fname, retTy, params, fnLine);
 			}
 			// If coroutines are enabled, mark functions as pre-split coroutine to use the Switch-Resumed ABI
 			if (enableCoro)
@@ -272,22 +259,9 @@ namespace edn
 				}
 				return slot;
 			};
-			if (enableDebugInfo && F->getSubprogram())
+			if (enableDebugInfo)
 			{
-				builder.SetCurrentDebugLocation(llvm::DILocation::get(*llctx_, F->getSubprogram()->getLine(), /*Col*/ 1, F->getSubprogram()));
-				// Emit parameter debug info at entry using dbg.value
-				unsigned argIndex = 1;
-				for (auto &arg : F->args())
-				{
-					std::string an = std::string(arg.getName());
-					llvm::DIType *diTy = nullptr;
-					if (auto it = vtypes.find(an); it != vtypes.end())
-						diTy = debug_manager_->diTypeOf(it->second);
-					auto *pvar = debug_manager_->DIB->createParameterVariable(F->getSubprogram(), an, argIndex, debug_manager_->DI_File, F->getSubprogram()->getLine(), diTy, true);
-					auto *expr = debug_manager_->DIB->createExpression();
-					(void)debug_manager_->DIB->insertDbgValueIntrinsic(&arg, pvar, expr, builder.getCurrentDebugLocation(), entry);
-					++argIndex;
-				}
+				edn::ir::di::emit_parameter_debug(*debug_manager_, *F, builder, vtypes);
 			}
 			llvm::Value *lastCoroIdTok = nullptr;			   // holds last coro.id token for ops that need it
 			std::vector<llvm::BasicBlock *> loopEndStack;	   // for break targets (end blocks)
@@ -302,15 +276,8 @@ namespace edn
 			std::vector<llvm::BasicBlock *> sehExceptTargetStack;
 			// Stack of active Itanium exception targets (landingpad dispatch blocks)
 			std::vector<llvm::BasicBlock *> itnExceptTargetStack;
-			// Defer phi creation until predecessors exist: collect specs in current block then create at end of block emission phase.
-			struct PendingPhi
-			{
-				std::string dst;
-				TypeId ty;
-				std::vector<std::pair<std::string, std::string>> incomings;
-				llvm::BasicBlock *insertBlock;
-			};
-			std::vector<PendingPhi> pendingPhis;
+			// Collected phi specifications for deferred realization
+			std::vector<edn::ir::phi_ops::PendingPhi> pendingPhis;
 			auto emit_list = [&](const std::vector<node_ptr> &insts, auto &&emit_ref) -> void
 			{
 				if (functionDone)
@@ -443,6 +410,26 @@ namespace edn
 						{
 							continue; // handled by modular core_ops
 						}
+						// --- Dispatch extracted compare ops (int simple, icmp, fcmp) ---
+						if (edn::ir::compare_ops::handle_int_simple(S, il, inst) ||
+							edn::ir::compare_ops::handle_icmp(S, il) ||
+							edn::ir::compare_ops::handle_fcmp(S, il))
+						{
+							continue; // handled by modular compare_ops
+						}
+						// --- Dispatch extracted cast ops ---
+						if (edn::ir::cast_ops::handle(S, il))
+						{
+							continue; // handled by modular cast_ops
+						}
+						// --- Dispatch extracted pointer/function ops (addr, deref, fnptr, call-indirect) ---
+						if (edn::ir::pointer_func_ops::handle_addr(S, il, ensureSlot) ||
+							edn::ir::pointer_func_ops::handle_deref(S, il) ||
+							edn::ir::pointer_func_ops::handle_fnptr(S, il) ||
+							edn::ir::pointer_func_ops::handle_call_indirect(S, il))
+						{
+							continue; // handled by modular pointer_func_ops
+						}
 						// --- Dispatch extracted memory ops (assign/alloca/load/store/gload/gstore) ---
 						if (edn::ir::memory_ops::handle_assign(S, il) ||
 							edn::ir::memory_ops::handle_alloca(S, il) ||
@@ -461,7 +448,8 @@ namespace edn
 							edn::ir::closure_ops::handle_call_closure(S, il) ||
 							edn::ir::sum_ops::handle_sum_new(S, il, sum_variant_tag_, sum_variant_field_types_) ||
 							edn::ir::sum_ops::handle_sum_is(S, il, sum_variant_tag_) ||
-							edn::ir::sum_ops::handle_sum_get(S, il, sum_variant_tag_, sum_variant_field_types_))
+							edn::ir::sum_ops::handle_sum_get(S, il, sum_variant_tag_, sum_variant_field_types_) ||
+							edn::ir::variable_ops::handle_as(S, il, ensureSlot, initAlias, enableDebugInfo, F, debug_manager_))
 						{
 							continue; // handled by modular memory_ops/sum_ops
 						}
@@ -507,181 +495,15 @@ namespace edn
 							emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
 						}
 					}
-					if (op == "const" && il.size() == 4)
+					// Lightweight state wrapper for standalone simple ops (const)
+					edn::ir::builder::State S_local_for_dispatch{builder, *llctx_, *module_, tctx_,
+																 [&](TypeId id)
+																 { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+					if (edn::ir::const_ops::handle(S_local_for_dispatch, il))
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						llvm::Type *lty = map_type(ty);
-						llvm::Value *cv = nullptr;
-						if (std::holds_alternative<int64_t>(il[3]->data))
-							cv = llvm::ConstantInt::get(lty, (uint64_t)std::get<int64_t>(il[3]->data), true);
-						else if (std::holds_alternative<double>(il[3]->data))
-							cv = llvm::ConstantFP::get(lty, std::get<double>(il[3]->data));
-						if (!cv)
-							cv = llvm::UndefValue::get(lty);
-						vmap[dst] = cv;
-						vtypes[dst] = ty;
+						continue;
 					}
-					else if ((op == "add" || op == "sub" || op == "mul" || op == "sdiv" || op == "udiv" || op == "srem" || op == "urem") && il.size() == 5)
-					{
-						// Legacy integer arithmetic path removed (handled earlier by ir::core_ops)
-					}
-					else if (op == "addr" && il.size() == 4)
-					{ // (addr %dst (ptr <T>) %src)
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId annot;
-						try
-						{
-							annot = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string srcName = trimPct(symName(il[3]));
-						if (srcName.empty())
-							continue;
-						const Type &AT = tctx_.at(annot);
-						if (AT.kind != Type::Kind::Pointer)
-							continue;
-						// Ensure a slot for the source variable and initialize from its current value (if any)
-						TypeId valTy = AT.pointee;
-						// If we already have a tracked type for the source, prefer it
-						if (vtypes.count(srcName))
-							valTy = vtypes[srcName];
-						auto *slot = ensureSlot(srcName, valTy, /*initFromCurrent=*/true);
-						vmap[dst] = slot;
-						vtypes[dst] = annot;
-					}
-					else if (op == "deref" && il.size() == 4)
-					{ // (deref %dst <T> %ptr)
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string ptrName = trimPct(symName(il[3]));
-						if (ptrName.empty())
-							continue;
-						if (!vtypes.count(ptrName))
-							continue;
-						TypeId pty = vtypes[ptrName];
-						const Type &PT = tctx_.at(pty);
-						if (PT.kind != Type::Kind::Pointer || PT.pointee != ty)
-							continue;
-						auto *pv = vmap[ptrName];
-						if (!pv)
-							continue;
-						auto *lv = builder.CreateLoad(map_type(ty), pv, dst);
-						vmap[dst] = lv;
-						vtypes[dst] = ty;
-					}
-					else if (op == "fnptr" && il.size() == 4)
-					{ // (fnptr %dst (ptr (fn-type ...)) Name)
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId pty;
-						try
-						{
-							pty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string fname = symName(il[3]);
-						if (fname.empty())
-							continue;
-						auto *F = module_->getFunction(fname);
-						if (!F)
-						{ // create decl with matching signature if we can
-							const Type &PT = tctx_.at(pty);
-							if (PT.kind != Type::Kind::Pointer)
-								continue;
-							const Type &FT = tctx_.at(PT.pointee);
-							if (FT.kind != Type::Kind::Function)
-								continue;
-							std::vector<llvm::Type *> ps;
-							for (auto pid : FT.params)
-								ps.push_back(map_type(pid));
-							auto *ftyDecl = llvm::FunctionType::get(map_type(FT.ret), ps, FT.variadic);
-							F = llvm::Function::Create(ftyDecl, llvm::Function::ExternalLinkage, fname, module_.get());
-						}
-						if (!F)
-							continue; // take address of function is just function pointer value in LLVM IR
-						vmap[dst] = F;
-						vtypes[dst] = pty;
-					}
-					else if (op == "call-indirect" && il.size() >= 4)
-					{ // (call-indirect %dst <ret> %fptr %args...)
-						std::string dst = trimPct(symName(il[1]));
-						TypeId retTy;
-						try
-						{
-							retTy = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						std::string fptrName = trimPct(symName(il[3]));
-						if (fptrName.empty())
-							continue;
-						if (!vtypes.count(fptrName))
-							continue;
-						TypeId fpty = vtypes[fptrName];
-						const Type &FPT = tctx_.at(fpty);
-						if (FPT.kind != Type::Kind::Pointer)
-							continue;
-						const Type &FT = tctx_.at(FPT.pointee);
-						if (FT.kind != Type::Kind::Function)
-							continue;
-						auto *calleeV = vmap[fptrName];
-						if (!calleeV)
-							continue;
-						std::vector<llvm::Value *> args;
-						bool bad = false;
-						for (size_t ai = 4; ai < il.size(); ++ai)
-						{
-							std::string an = trimPct(symName(il[ai]));
-							if (an.empty() || !vmap.count(an))
-							{
-								bad = true;
-								break;
-							}
-							args.push_back(vmap[an]);
-						}
-						if (bad)
-							continue;
-						llvm::FunctionType *fty = llvm::cast<llvm::FunctionType>(map_type(FPT.pointee));
-						auto *ci = builder.CreateCall(fty, calleeV, args, fty->getReturnType()->isVoidTy() ? "" : dst);
-						if (!fty->getReturnType()->isVoidTy())
-						{
-							vmap[dst] = ci;
-							vtypes[dst] = retTy;
-						}
-					}
-					
+
 					else if ((op == "fadd" || op == "fsub" || op == "fmul" || op == "fdiv") && il.size() == 5)
 					{
 						std::string dst = trimPct(symName(il[1]));
@@ -712,116 +534,15 @@ namespace edn
 					}
 					else if (op == "fcmp" && il.size() == 7)
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						if (!std::holds_alternative<keyword>(il[3]->data))
-							continue;
-						std::string pred = symName(il[4]);
-						auto *va = getVal(il[5]);
-						auto *vb = getVal(il[6]);
-						if (!va || !vb)
-							continue;
-						llvm::CmpInst::Predicate P = llvm::CmpInst::FCMP_OEQ;
-						if (pred == "oeq")
-							P = llvm::CmpInst::FCMP_OEQ;
-						else if (pred == "one")
-							P = llvm::CmpInst::FCMP_ONE;
-						else if (pred == "olt")
-							P = llvm::CmpInst::FCMP_OLT;
-						else if (pred == "ogt")
-							P = llvm::CmpInst::FCMP_OGT;
-						else if (pred == "ole")
-							P = llvm::CmpInst::FCMP_OLE;
-						else if (pred == "oge")
-							P = llvm::CmpInst::FCMP_OGE;
-						else if (pred == "ord")
-							P = llvm::CmpInst::FCMP_ORD;
-						else if (pred == "uno")
-							P = llvm::CmpInst::FCMP_UNO;
-						else if (pred == "ueq")
-							P = llvm::CmpInst::FCMP_UEQ;
-						else if (pred == "une")
-							P = llvm::CmpInst::FCMP_UNE;
-						else if (pred == "ult")
-							P = llvm::CmpInst::FCMP_ULT;
-						else if (pred == "ugt")
-							P = llvm::CmpInst::FCMP_UGT;
-						else if (pred == "ule")
-							P = llvm::CmpInst::FCMP_ULE;
-						else if (pred == "uge")
-							P = llvm::CmpInst::FCMP_UGE;
-						else
-							continue;
-						auto *res = builder.CreateFCmp(P, va, vb, dst);
-						vmap[dst] = res;
-						vtypes[dst] = tctx_.get_base(BaseType::I1);
+						// Legacy fcmp path removed (handled by ir::compare_ops)
 					}
 					else if ((op == "eq" || op == "ne" || op == "lt" || op == "gt" || op == "le" || op == "ge") && il.size() == 5)
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						auto *va = getVal(il[3]);
-						auto *vb = getVal(il[4]);
-						if (!va || !vb)
-							continue;
-						llvm::CmpInst::Predicate P = llvm::CmpInst::ICMP_EQ;
-						if (op == "eq")
-							P = llvm::CmpInst::ICMP_EQ;
-						else if (op == "ne")
-							P = llvm::CmpInst::ICMP_NE;
-						else if (op == "lt")
-							P = llvm::CmpInst::ICMP_SLT;
-						else if (op == "gt")
-							P = llvm::CmpInst::ICMP_SGT;
-						else if (op == "le")
-							P = llvm::CmpInst::ICMP_SLE;
-						else
-							P = llvm::CmpInst::ICMP_SGE;
-						auto *res = builder.CreateICmp(P, va, vb, dst);
-						vmap[dst] = res;
-						vtypes[dst] = tctx_.get_base(BaseType::I1);
-						defNode[dst] = inst;
+						// Legacy simple integer compare path removed (handled by ir::compare_ops)
 					}
 					else if (op == "icmp" && il.size() == 7)
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						if (!std::holds_alternative<keyword>(il[3]->data))
-							continue;
-						std::string pred = symName(il[4]);
-						auto *va = getVal(il[5]);
-						auto *vb = getVal(il[6]);
-						if (!va || !vb)
-							continue;
-						llvm::CmpInst::Predicate P = llvm::CmpInst::ICMP_EQ;
-						if (pred == "eq")
-							P = llvm::CmpInst::ICMP_EQ;
-						else if (pred == "ne")
-							P = llvm::CmpInst::ICMP_NE;
-						else if (pred == "slt")
-							P = llvm::CmpInst::ICMP_SLT;
-						else if (pred == "sgt")
-							P = llvm::CmpInst::ICMP_SGT;
-						else if (pred == "sle")
-							P = llvm::CmpInst::ICMP_SLE;
-						else if (pred == "sge")
-							P = llvm::CmpInst::ICMP_SGE;
-						else if (pred == "ult")
-							P = llvm::CmpInst::ICMP_ULT;
-						else if (pred == "ugt")
-							P = llvm::CmpInst::ICMP_UGT;
-						else if (pred == "ule")
-							P = llvm::CmpInst::ICMP_ULE;
-						else if (pred == "uge")
-							P = llvm::CmpInst::ICMP_UGE;
-						else
-							continue;
-						auto *res = builder.CreateICmp(P, va, vb, dst);
-						vmap[dst] = res;
-						vtypes[dst] = tctx_.get_base(BaseType::I1);
+						// Legacy icmp path removed (handled by ir::compare_ops)
 					}
 					else if ((op == "and" || op == "or" || op == "xor" || op == "shl" || op == "lshr" || op == "ashr") && il.size() == 5)
 					{
@@ -829,476 +550,30 @@ namespace edn
 					}
 					else if ((op == "zext" || op == "sext" || op == "trunc" || op == "bitcast" || op == "sitofp" || op == "uitofp" || op == "fptosi" || op == "fptoui" || op == "ptrtoint" || op == "inttoptr") && il.size() == 4)
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId toTy;
-						try
-						{
-							toTy = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						auto *srcV = getVal(il[3]);
-						if (!srcV)
-							continue;
-						llvm::Value *castV = nullptr;
-						llvm::Type *llvmTo = map_type(toTy);
-						if (llvm::isa<llvm::Constant>(srcV))
-						{
-							auto *tmpAlloca = builder.CreateAlloca(srcV->getType(), nullptr, trimPct(symName(il[3])) + ".cst.tmp");
-							builder.CreateStore(srcV, tmpAlloca);
-							srcV = builder.CreateLoad(srcV->getType(), tmpAlloca, trimPct(symName(il[3])) + ".cst.load");
-						}
-						if (op == "zext")
-							castV = builder.CreateZExt(srcV, llvmTo, dst);
-						else if (op == "sext")
-							castV = builder.CreateSExt(srcV, llvmTo, dst);
-						else if (op == "trunc")
-							castV = builder.CreateTrunc(srcV, llvmTo, dst);
-						else if (op == "bitcast")
-							castV = builder.CreateBitCast(srcV, llvmTo, dst);
-						else if (op == "sitofp")
-							castV = builder.CreateSIToFP(srcV, llvmTo, dst);
-						else if (op == "uitofp")
-							castV = builder.CreateUIToFP(srcV, llvmTo, dst);
-						else if (op == "fptosi")
-							castV = builder.CreateFPToSI(srcV, llvmTo, dst);
-						else if (op == "fptoui")
-							castV = builder.CreateFPToUI(srcV, llvmTo, dst);
-						else if (op == "ptrtoint")
-							castV = builder.CreatePtrToInt(srcV, llvmTo, dst);
-						else if (op == "inttoptr")
-							castV = builder.CreateIntToPtr(srcV, llvmTo, dst);
-						if (castV)
-						{
-							vmap[dst] = castV;
-							vtypes[dst] = toTy;
-						}
+						// Legacy cast path removed (handled by ir::cast_ops)
 					}
 					else if (op == "as" && il.size() == 4)
 					{ // (as %dst <type> %initOrLiteral)
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						llvm::Value *initV = nullptr;
-						llvm::Type *lty = map_type(ty);
-						// initializer can be a symbol or a literal
-						if (std::holds_alternative<symbol>(il[3]->data))
-						{
-							// Resolve directly from current SSA map to avoid alias recursion during initialization
-							std::string initName = trimPct(symName(il[3]));
-							if (!initName.empty())
-							{
-								if (auto itInit = vmap.find(initName); itInit != vmap.end())
-								{
-									initV = itInit->second;
-								}
-							}
-						}
-						else if (std::holds_alternative<int64_t>(il[3]->data))
-						{
-							initV = llvm::ConstantInt::get(lty, (uint64_t)std::get<int64_t>(il[3]->data), true);
-						}
-						else if (std::holds_alternative<double>(il[3]->data))
-						{
-							initV = llvm::ConstantFP::get(lty, std::get<double>(il[3]->data));
-						}
-						if (!initV)
-						{
-							// Fallback to undef/null of the declared type if initializer isn't resolvable
-							initV = llvm::UndefValue::get(lty);
-						}
-						auto *slot = ensureSlot(dst, ty, /*initFromCurrent=*/false);
-						builder.CreateStore(initV, slot);
-						vtypes[dst] = ty;
-						// Also expose a loaded SSA value for %dst so paths that consult vmap directly see the current value.
-						// getVal will prefer the slot, but a few ops read vmap directly (e.g., some legacy paths).
-						auto *loaded = builder.CreateLoad(map_type(ty), slot, dst);
-						vmap[dst] = loaded;
-						// Now register alias so future reads of the initializer symbol go through this variable's slot
-						if (std::holds_alternative<symbol>(il[3]->data))
-						{
-							std::string initName = trimPct(symName(il[3]));
-							if (!initName.empty())
-							{
-								initAlias[initName] = dst;
-								// Also redirect the initializer symbol's SSA to the current loaded value
-								vmap[initName] = loaded;
-								vtypes[initName] = ty;
-							}
-						}
-						// Optionally emit debug info for the local variable
-						if (enableDebugInfo && F->getSubprogram())
-						{
-							auto *lv = debug_manager_->DIB->createAutoVariable(F->getSubprogram(), dst, debug_manager_->DI_File, builder.getCurrentDebugLocation() ? builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(), debug_manager_->diTypeOf(ty));
-							auto *expr = debug_manager_->DIB->createExpression();
-							(void)debug_manager_->DIB->insertDeclare(slot, lv, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
-						}
+					  // Legacy 'as' variable init path removed (handled by ir::variable_ops)
 					}
-					
-					else if (op == "phi" && il.size() == 4)
+
+					else if (edn::ir::phi_ops::collect(S_local_for_dispatch, il, pendingPhis))
 					{
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						TypeId ty;
-						try
-						{
-							ty = tctx_.parse_type(il[2]);
-						}
-						catch (...)
-						{
-							continue;
-						}
-						if (!std::holds_alternative<vector_t>(il[3]->data))
-							continue;
-						std::vector<std::pair<std::string, std::string>> incomings;
-						for (auto &inc : std::get<vector_t>(il[3]->data).elems)
-						{
-							if (!inc || !std::holds_alternative<list>(inc->data))
-								continue;
-							auto &pl = std::get<list>(inc->data).elems;
-							if (pl.size() != 2)
-								continue;
-							std::string val = trimPct(symName(pl[0]));
-							std::string label = symName(pl[1]);
-							if (!val.empty() && !label.empty())
-								incomings.emplace_back(val, label);
-						}
-						pendingPhis.push_back(PendingPhi{dst, ty, std::move(incomings), builder.GetInsertBlock()});
+						continue; // handled by phi_ops (collection phase)
 					}
 
 					else if (op == "panic" && il.size() == 1)
-					{ // (panic) -> abort or unwind depending on EDN_PANIC
-						if (panicUnwind && enableEHItanium && selectedPersonality)
-						{
-							// Itanium: emit invoke to __cxa_throw so exceptional edge routes to active landingpad
-							auto *i8Ty = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8Ptr = llvm::PointerType::getUnqual(i8Ty);
-							auto *throwFTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*llctx_), {i8Ptr, i8Ptr, i8Ptr}, /*isVarArg*/ false);
-							auto throwCallee = module_->getOrInsertFunction("__cxa_throw", throwFTy);
-							llvm::Value *nullp = llvm::ConstantPointerNull::get(i8Ptr);
-							// Determine exceptional target
-							llvm::BasicBlock *exTarget = nullptr;
-							if (!itnExceptTargetStack.empty())
-							{
-								exTarget = itnExceptTargetStack.back();
-							}
-							else
-							{
-								exTarget = edn::ir::exceptions::create_panic_cleanup_landingpad(F, builder);
-							}
-							// Normal dest (never taken) just contains unreachable
-							auto *unwCont = llvm::BasicBlock::Create(*llctx_, "panic.cont", F);
-							builder.CreateInvoke(throwFTy, throwCallee.getCallee(), unwCont, exTarget, {nullp, nullp, nullp});
-							llvm::IRBuilder<> nb(unwCont);
-							if (enableDebugInfo && F->getSubprogram())
-								nb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
-							nb.CreateUnreachable();
-							// Current block is terminated; subsequent emission will continue in other blocks (e.g., handler/cont)
-						}
-						else if (panicUnwind && enableEHSEH && selectedPersonality)
-						{
-							// SEH: emit invoke to RaiseException so unwind flows into catchswitch/catchpad if inside try
-							auto *i32 = llvm::Type::getInt32Ty(*llctx_);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8ptr = llvm::PointerType::getUnqual(i8);
-							auto *raiseFTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*llctx_), {i32, i32, i32, i8ptr}, false);
-							auto raiseCallee = module_->getOrInsertFunction("RaiseException", raiseFTy);
-							auto *code = llvm::ConstantInt::get(i32, 0xE0ED0001);
-							auto *flags = llvm::ConstantInt::get(i32, 1);
-							auto *nargs = llvm::ConstantInt::get(i32, 0);
-							llvm::Value *argsPtr = llvm::ConstantPointerNull::get(i8ptr);
-							llvm::BasicBlock *exTarget = sehExceptTargetStack.empty() ? nullptr : sehExceptTargetStack.back();
-							if (!exTarget)
-							{
-								// Fallback to shared cleanup funclet
-								sehCleanupBB = edn::ir::exceptions::ensure_seh_cleanup(F, builder, sehCleanupBB);
-								exTarget = sehCleanupBB;
-							}
-							auto *unwCont = llvm::BasicBlock::Create(*llctx_, "panic.cont", F);
-							builder.CreateInvoke(raiseFTy, raiseCallee.getCallee(), unwCont, exTarget, {code, flags, nargs, argsPtr});
-							llvm::IRBuilder<> nb(unwCont);
-							if (enableDebugInfo && F->getSubprogram())
-								nb.SetCurrentDebugLocation(builder.getCurrentDebugLocation());
-							nb.CreateUnreachable();
-						}
-						else
-						{
-							// Default: abort via llvm.trap for deterministic tests
-							auto callee = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::trap);
-							builder.CreateCall(callee);
-							builder.CreateUnreachable();
-						}
-						continue;
+					{
+						edn::ir::builder::State S_exc{builder, *llctx_, *module_, tctx_, [&](TypeId id)
+													  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+						edn::ir::exception_ops::Context EC{S_exc, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes) { /* unused here */ }};
+						if (edn::ir::exception_ops::handle_panic(EC, il))
+							continue;
 					}
 					// --- M4.6 Coroutines (minimal) ---
-					else if (op == "coro-begin" && il.size() == 2)
-					{ // (coro-begin %hdl) -> ptr handle
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-						auto *i8p = llvm::PointerType::getUnqual(i8);
-						llvm::Value *hdl = nullptr;
-						if (enableCoro)
-						{
-							// Proper minimal sequence: id + begin
-							auto idDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_id);
-							auto beginDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_begin);
-							auto *i32 = llvm::Type::getInt32Ty(*llctx_);
-							llvm::Value *alignV = llvm::ConstantInt::get(i32, 0); // default alignment semantics
-							llvm::Value *nullp = llvm::ConstantPointerNull::get(i8p);
-							// token %id = llvm.coro.id(i32 0, ptr null, ptr null, ptr null)
-							auto *idTok = builder.CreateCall(idDecl, {alignV, nullp, nullp, nullp}, "coro.id");
-							lastCoroIdTok = idTok;
-							// ptr %hdl = llvm.coro.begin(token %id, ptr null)
-							hdl = builder.CreateCall(beginDecl, {idTok, nullp}, dst);
-						}
-						else
-						{
-							hdl = llvm::ConstantPointerNull::get(i8p);
-						}
-						vmap[dst] = hdl;
-						vtypes[dst] = tctx_.get_pointer(tctx_.get_base(BaseType::I8));
-					}
-					else if (op == "coro-suspend" && il.size() == 3)
-					{ // (coro-suspend %st %hdlOrTok) -> i8 status
-						std::string dst = trimPct(symName(il[1]));
-						std::string h = trimPct(symName(il[2]));
-						if (dst.empty() || h.empty() || !vmap.count(h))
-							continue;
-						llvm::Value *stV = nullptr;
-						if (enableCoro)
-						{
-							auto suspendDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_suspend);
-							// If operand is a token, pass it; otherwise use token none.
-							auto *i1 = llvm::Type::getInt1Ty(*llctx_);
-							auto *tokArg = vmap[h]->getType()->isTokenTy() ? vmap[h] : (llvm::Value *)llvm::ConstantTokenNone::get(*llctx_);
-							llvm::Value *isFinal = llvm::ConstantInt::getFalse(i1);
-							stV = builder.CreateCall(suspendDecl, {tokArg, isFinal}, dst);
-						}
-						else
-						{
-							stV = llvm::ConstantInt::get(llvm::Type::getInt8Ty(*llctx_), 0);
-						}
-						vmap[dst] = stV;
-						vtypes[dst] = tctx_.get_base(BaseType::I8);
-					}
-					else if (op == "coro-final-suspend" && il.size() == 3)
-					{ // (coro-final-suspend %st %hdlOrTok) -> i8 status
-						std::string dst = trimPct(symName(il[1]));
-						std::string h = trimPct(symName(il[2]));
-						if (dst.empty() || h.empty() || !vmap.count(h))
-							continue;
-						llvm::Value *stV = nullptr;
-						if (enableCoro)
-						{
-							auto suspendDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_suspend);
-							auto *i1 = llvm::Type::getInt1Ty(*llctx_);
-							auto *tokArg = vmap[h]->getType()->isTokenTy() ? vmap[h] : (llvm::Value *)llvm::ConstantTokenNone::get(*llctx_);
-							llvm::Value *isFinal = llvm::ConstantInt::getTrue(i1);
-							stV = builder.CreateCall(suspendDecl, {tokArg, isFinal}, dst);
-						}
-						else
-						{
-							stV = llvm::ConstantInt::get(llvm::Type::getInt8Ty(*llctx_), 0);
-						}
-						vmap[dst] = stV;
-						vtypes[dst] = tctx_.get_base(BaseType::I8);
-					}
-					else if (op == "coro-save" && il.size() == 3)
-					{ // (coro-save %sv %hdl) -> token
-						std::string dst = trimPct(symName(il[1]));
-						std::string h = trimPct(symName(il[2]));
-						if (dst.empty() || h.empty() || !vmap.count(h))
-							continue;
-						llvm::Value *tokV = nullptr;
-						if (enableCoro)
-						{
-							auto saveDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_save);
-							tokV = builder.CreateCall(saveDecl, {vmap[h]}, dst);
-						}
-						else
-						{
-							// Represent as token none when disabled
-							tokV = llvm::ConstantTokenNone::get(*llctx_);
-						}
-						vmap[dst] = tokV; // type map uses a placeholder; TC tracks it as i8
-					}
-					else if (op == "coro-id" && il.size() == 2)
-					{ // (coro-id %cid) -> token (bound for later ops)
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						if (lastCoroIdTok)
-						{
-							vmap[dst] = lastCoroIdTok;
-						}
-					}
-					else if (op == "coro-size" && il.size() == 2)
-					{ // (coro-size %sz) -> i64
-						std::string dst = trimPct(symName(il[1]));
-						if (dst.empty())
-							continue;
-						llvm::Value *szV = nullptr;
-						if (enableCoro)
-						{
-							auto *i64 = llvm::Type::getInt64Ty(*llctx_);
-							auto sizeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_size, {i64});
-							szV = builder.CreateCall(sizeDecl, {}, dst);
-						}
-						else
-						{
-							szV = llvm::ConstantInt::get(llvm::Type::getInt64Ty(*llctx_), 0);
-						}
-						vmap[dst] = szV;
-						vtypes[dst] = tctx_.get_base(BaseType::I64);
-					}
-					else if (op == "coro-alloc" && il.size() == 3)
-					{ // (coro-alloc %need %cid) -> i1
-						std::string dst = trimPct(symName(il[1]));
-						std::string cid = trimPct(symName(il[2]));
-						if (dst.empty() || cid.empty() || !vmap.count(cid))
-							continue;
-						llvm::Value *needV = nullptr;
-						if (enableCoro)
-						{
-							auto allocDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_alloc);
-							needV = builder.CreateCall(allocDecl, {vmap[cid]}, dst);
-						}
-						else
-						{
-							needV = llvm::ConstantInt::getFalse(llvm::Type::getInt1Ty(*llctx_));
-						}
-						vmap[dst] = needV;
-						vtypes[dst] = tctx_.get_base(BaseType::I1);
-					}
-					else if (op == "coro-free" && il.size() == 4)
-					{ // (coro-free %mem %cid %hdl) -> ptr
-						std::string dst = trimPct(symName(il[1]));
-						std::string cid = trimPct(symName(il[2]));
-						std::string h = trimPct(symName(il[3]));
-						if (dst.empty() || cid.empty() || h.empty() || !vmap.count(cid) || !vmap.count(h))
-							continue;
-						llvm::Value *memV = nullptr;
-						if (enableCoro)
-						{
-							auto freeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_free);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8p = llvm::PointerType::getUnqual(i8);
-							auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
-							memV = builder.CreateCall(freeDecl, {vmap[cid], hdlCast}, dst);
-						}
-						else
-						{
-							memV = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
-						}
-						vmap[dst] = memV;
-						vtypes[dst] = tctx_.get_pointer(tctx_.get_base(BaseType::I8));
-					}
-					else if (op == "coro-promise" && il.size() == 3)
-					{ // (coro-promise %p %hdl) -> ptr
-						std::string dst = trimPct(symName(il[1]));
-						std::string h = trimPct(symName(il[2]));
-						if (dst.empty() || h.empty() || !vmap.count(h))
-							continue;
-						llvm::Value *pV = nullptr;
-						if (enableCoro)
-						{
-							auto promDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_promise);
-							auto *i32 = llvm::Type::getInt32Ty(*llctx_);
-							auto *i1 = llvm::Type::getInt1Ty(*llctx_);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8p = llvm::PointerType::getUnqual(i8);
-							llvm::Value *alignZero = llvm::ConstantInt::get(i32, 0);
-							llvm::Value *fromPromise = llvm::ConstantInt::getFalse(i1);
-							// coro.promise(ptr handle, i32 align, i1 fromPromise) -> ptr
-							auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
-							pV = builder.CreateCall(promDecl, {hdlCast, alignZero, fromPromise}, dst);
-						}
-						else
-						{
-							pV = llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
-						}
-						vmap[dst] = pV;
-						vtypes[dst] = tctx_.get_pointer(tctx_.get_base(BaseType::I8));
-					}
-					else if (op == "coro-resume" && il.size() == 2)
-					{ // (coro-resume %hdl)
-						std::string h = trimPct(symName(il[1]));
-						if (h.empty() || !vmap.count(h))
-							continue;
-						if (enableCoro)
-						{
-							auto resumeDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_resume);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8p = llvm::PointerType::getUnqual(i8);
-							auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
-							builder.CreateCall(resumeDecl, {hdlCast});
-						}
-					}
-					else if (op == "coro-destroy" && il.size() == 2)
-					{ // (coro-destroy %hdl)
-						std::string h = trimPct(symName(il[1]));
-						if (h.empty() || !vmap.count(h))
-							continue;
-						if (enableCoro)
-						{
-							auto destroyDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_destroy);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8p = llvm::PointerType::getUnqual(i8);
-							auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
-							builder.CreateCall(destroyDecl, {hdlCast});
-						}
-					}
-					else if (op == "coro-done" && il.size() == 3)
-					{ // (coro-done %d %hdl) -> i1
-						std::string dst = trimPct(symName(il[1]));
-						std::string h = trimPct(symName(il[2]));
-						if (dst.empty() || h.empty() || !vmap.count(h))
-							continue;
-						llvm::Value *dV = nullptr;
-						if (enableCoro)
-						{
-							auto doneDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_done);
-							auto *i8 = llvm::Type::getInt8Ty(*llctx_);
-							auto *i8p = llvm::PointerType::getUnqual(i8);
-							auto *hdlCast = builder.CreateBitCast(vmap[h], i8p);
-							dV = builder.CreateCall(doneDecl, {hdlCast}, dst);
-						}
-						else
-						{
-							dV = llvm::ConstantInt::getFalse(llvm::Type::getInt1Ty(*llctx_));
-						}
-						vmap[dst] = dV;
-						vtypes[dst] = tctx_.get_base(BaseType::I1);
-					}
-					else if (op == "coro-end" && il.size() == 2)
-					{ // (coro-end %hdl)
-						std::string h = trimPct(symName(il[1]));
-						if (h.empty() || !vmap.count(h))
-							continue;
-						if (enableCoro)
-						{
-							auto endDecl = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::coro_end);
-							auto *i1 = llvm::Type::getInt1Ty(*llctx_);
-							llvm::Value *u0 = llvm::ConstantInt::getFalse(i1);
-							auto *tokNone = llvm::ConstantTokenNone::get(*llctx_);
-							(void)builder.CreateCall(endDecl, {vmap[h], u0, tokNone}, "coro.end");
-						}
+					else if (edn::ir::coro_ops::handle(S_local_for_dispatch, il, enableCoro, lastCoroIdTok))
+					{
+						continue; // handled by coro_ops
 					}
 					else if (op == "call" && il.size() >= 4)
 					{
@@ -1501,88 +776,15 @@ namespace edn
 					{ /* no-op */
 					}
 					else if (op == "try")
-					{ // (try :body [ ... ] :catch [ ... ])  -- Itanium & SEH (catch-all minimal)
-						// Parse sections
-						node_ptr bodyNode = nullptr, catchNode = nullptr;
-						for (size_t i = 1; i < il.size(); ++i)
-						{
-							if (!il[i] || !std::holds_alternative<keyword>(il[i]->data))
-								break;
-							std::string kw = std::get<keyword>(il[i]->data).name;
-							if (++i >= il.size())
-								break;
-							auto val = il[i];
-							if (kw == "body" && val && std::holds_alternative<vector_t>(val->data))
-								bodyNode = val;
-							else if (kw == "catch" && val && std::holds_alternative<vector_t>(val->data))
-								catchNode = val;
-						}
-						if (!bodyNode || !catchNode)
-						{
+					{
+						edn::ir::builder::State S_exc{builder, *llctx_, *module_, tctx_, [&](TypeId id)
+													  { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+						edn::ir::exception_ops::Context EC{S_exc, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes)
+														   { emit_ref(nodes, emit_ref); }};
+						if (edn::ir::exception_ops::handle_try(EC, il))
 							continue;
-						}
-						// Create blocks
-						auto *bodyBB = llvm::BasicBlock::Create(*llctx_, "try.body." + std::to_string(cfCounter++), F);
-						auto *contBB = llvm::BasicBlock::Create(*llctx_, "try.end." + std::to_string(cfCounter++), F);
-						if (enableEHSEH && selectedPersonality)
-						{
-							// SEH path: catchswitch/catchpad/catchret to handler
-							auto *catchHandlerBB = llvm::BasicBlock::Create(*llctx_, "try.handler." + std::to_string(cfCounter++), F);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(bodyBB);
-							auto scf = edn::ir::exceptions::create_seh_catch_scaffold(F, builder, contBB);
-							// After creating the catchpad, branch to handler
-							builder.SetInsertPoint(scf.catchPadBB);
-							builder.CreateCatchRet(scf.catchPad, catchHandlerBB);
-							// Body with SEH exception target
-							builder.SetInsertPoint(bodyBB);
-							sehExceptTargetStack.push_back(scf.dispatchBB);
-							emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
-							sehExceptTargetStack.pop_back();
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(contBB);
-							// Handler body
-							builder.SetInsertPoint(catchHandlerBB);
-							emit_ref(std::get<vector_t>(catchNode->data).elems, emit_ref);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(contBB);
-							builder.SetInsertPoint(contBB);
-						}
-						else if (enableEHItanium && selectedPersonality)
-						{
-							// Itanium path: landingpad catch-all -> handler
-							auto *handlerBB = llvm::BasicBlock::Create(*llctx_, "try.handler." + std::to_string(cfCounter++), F);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(bodyBB);
-							// Landingpad with catch-all
-							auto *lpadBB = edn::ir::exceptions::create_catch_all_landingpad(F, builder, handlerBB);
-							// Body with Itanium exception target
-							builder.SetInsertPoint(bodyBB);
-							itnExceptTargetStack.push_back(lpadBB);
-							emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
-							itnExceptTargetStack.pop_back();
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(contBB);
-							// Handler body
-							builder.SetInsertPoint(handlerBB);
-							emit_ref(std::get<vector_t>(catchNode->data).elems, emit_ref);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(contBB);
-							builder.SetInsertPoint(contBB);
-						}
-						else
-						{
-							// No EH enabled: just emit body then catch (no-op structural)
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(bodyBB);
-							builder.SetInsertPoint(bodyBB);
-							emit_ref(std::get<vector_t>(bodyNode->data).elems, emit_ref);
-							if (!builder.GetInsertBlock()->getTerminator())
-								builder.CreateBr(contBB);
-							builder.SetInsertPoint(contBB);
-						}
 					}
-					
+
 					else if (op == "ret" && il.size() == 3)
 					{
 						std::string rv = trimPct(symName(il[2]));
@@ -1619,33 +821,10 @@ namespace edn
 			};
 			emit_list(std::get<vector_t>(body->data).elems, emit_list);
 			// Realize pending phi nodes now that all basic blocks exist.
-			for (auto &pp : pendingPhis)
-			{
-				llvm::BasicBlock *insertBB = pp.insertBlock;
-				if (!insertBB)
-					continue;
-				llvm::IRBuilder<> tmpBuilder(insertBB, insertBB->begin());
-				llvm::PHINode *phi = tmpBuilder.CreatePHI(map_type(pp.ty), (unsigned)pp.incomings.size(), pp.dst);
-				vmap[pp.dst] = phi;
-				vtypes[pp.dst] = pp.ty;
-				for (auto &inc : pp.incomings)
-				{
-					auto itv = vmap.find(inc.first);
-					if (itv == vmap.end())
-						continue; // find basic block by exact name
-					llvm::BasicBlock *pred = nullptr;
-					for (auto &bb : *F)
-					{
-						if (bb.getName() == inc.second)
-						{
-							pred = &bb;
-							break;
-						}
-					}
-					if (pred)
-						phi->addIncoming(itv->second, pred);
-				}
-			}
+			edn::ir::builder::State S_finalize{builder, *llctx_, *module_, tctx_, [&](TypeId id)
+											   { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+			edn::ir::phi_ops::finalize(S_finalize, pendingPhis, F, [&](TypeId id)
+									   { return map_type(id); });
 			if (!entry->getTerminator())
 			{
 				if (fty->getReturnType()->isVoidTy())
@@ -1654,94 +833,9 @@ namespace edn
 					builder.CreateRet(llvm::Constant::getNullValue(fty->getReturnType()));
 			}
 		}
-		// Finalize DI after all functions are emitted
-		if (enableDebugInfo && debug_manager_->DIB)
-		{
-			debug_manager_->DIB->finalize();
-		}
-		// Optional: run an optimization pipeline if enabled. EDN_PASS_PIPELINE overrides presets.
-		if (const char *enable = std::getenv("EDN_ENABLE_PASSES"); enable && std::string(enable) == "1")
-		{
-			// Setup PassBuilder and analysis managers once
-			llvm::PassBuilder PB;
-			llvm::LoopAnalysisManager LAM;
-			llvm::FunctionAnalysisManager FAM;
-			llvm::CGSCCAnalysisManager CGAM;
-			llvm::ModuleAnalysisManager MAM;
-			PB.registerModuleAnalyses(MAM);
-			PB.registerCGSCCAnalyses(CGAM);
-			PB.registerFunctionAnalyses(FAM);
-			PB.registerLoopAnalyses(LAM);
-			PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-			// If a textual pipeline is provided, try to parse and run it.
-			if (const char *pipeline = std::getenv("EDN_PASS_PIPELINE"); pipeline && *pipeline)
-			{
-				llvm::ModulePassManager MPM;
-				// parsePassPipeline returns llvm::Error in recent LLVM; consume on failure and fall back.
-				if (auto Err = PB.parsePassPipeline(MPM, pipeline))
-				{
-					llvm::consumeError(std::move(Err));
-				}
-				else
-				{
-					// Optional IR verification before running pipeline (for debugging)
-					if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
-					{
-						if (llvm::verifyModule(*module_, &llvm::errs()))
-						{
-							llvm::errs() << "[edn] IR verify failed before custom pipeline\n";
-						}
-					}
-					MPM.run(*module_, MAM);
-					if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
-					{
-						if (llvm::verifyModule(*module_, &llvm::errs()))
-						{
-							llvm::errs() << "[edn] IR verify failed after custom pipeline\n";
-						}
-					}
-					return module_.get();
-				}
-			}
-
-			// No custom pipeline or parse failed: use presets via EDN_OPT_LEVEL (0/1/2/3)
-			llvm::OptimizationLevel optLevel = llvm::OptimizationLevel::O1; // default
-			if (const char *lvl = std::getenv("EDN_OPT_LEVEL"); lvl && *lvl)
-			{
-				std::string s = lvl;
-				for (char &c : s)
-					c = (char)tolower((unsigned char)c);
-				if (s == "0" || s == "o0")
-					optLevel = llvm::OptimizationLevel::O0;
-				else if (s == "2" || s == "o2")
-					optLevel = llvm::OptimizationLevel::O2;
-				else if (s == "3" || s == "o3")
-					optLevel = llvm::OptimizationLevel::O3;
-				else
-					optLevel = llvm::OptimizationLevel::O1;
-			}
-			if (optLevel != llvm::OptimizationLevel::O0)
-			{
-				llvm::ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(optLevel);
-				if (const char *v = std::getenv("EDN_VERIFY_IR"); v && std::string(v) == "1")
-				{
-					if (llvm::verifyModule(*module_, &llvm::errs()))
-					{
-						llvm::errs() << "[edn] IR verify failed before preset pipeline\n";
-					}
-				}
-				MPM.run(*module_, MAM);
-				if (const char *v2 = std::getenv("EDN_VERIFY_IR"); v2 && std::string(v2) == "1")
-				{
-					if (llvm::verifyModule(*module_, &llvm::errs()))
-					{
-						llvm::errs() << "[edn] IR verify failed after preset pipeline\n";
-					}
-				}
-			}
-			// For O0, do nothing (preserve IR for debugging)
-		}
+		// Finalize debug info & optional pass pipeline via helper module
+		edn::ir::debug_pipeline::finalize_debug(debug_manager_, enableDebugInfo);
+		edn::ir::debug_pipeline::run_pass_pipeline(*module_);
 		return module_.get();
 	}
 
