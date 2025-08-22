@@ -15,7 +15,7 @@ namespace edn::ir::control_ops {
 // Context passed to control-flow handlers, bundling required references
 struct Context {
     builder::State& S;
-    int& cfCounter;
+    size_t& cfCounter;
     llvm::Function* F; // current function being built
     std::function<void(const std::vector<edn::node_ptr>&)> emit_ref; // recursive emitter for nested vectors
     std::function<llvm::Value*(const std::string&)> eval_defined; // recompute some SSA values

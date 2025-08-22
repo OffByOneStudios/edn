@@ -44,6 +44,7 @@ add_library(edn STATIC
     src/edn/ir/sum_ops.cpp
     src/edn/ir/control_ops.cpp
     src/edn/ir/debug.cpp
+    src/edn/ir/closure_ops.cpp
 )
 add_library(edn::edn ALIAS edn)
 

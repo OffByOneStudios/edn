@@ -19,12 +19,25 @@ bool handle_sum_new(builder::State& S, const std::vector<edn::node_ptr>& il,
     llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx), 0); llvm::Value *tagIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); auto *tagPtr = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, tagIdx}, dst+".tag.addr"); S.builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint64_t)tag,true), tagPtr);
     llvm::Value *payIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),1); auto *payloadPtr = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, payIdx}, dst+".payload.addr"); auto *i8Ptr=llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(S.llctx)); auto *rawPayloadPtr = S.builder.CreateBitCast(payloadPtr, i8Ptr, dst+".raw");
     uint64_t offset=0; for(size_t i=0;i<vals.size() && i<variants[tag].size(); ++i){ llvm::Type *fty = S.map_type(variants[tag][i]); uint64_t fsz = edn::ir::size_in_bytes(S.module, fty); auto *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(S.llctx), offset); auto *dstPtr = S.builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(S.llctx), rawPayloadPtr, offVal, dst+".fld"+std::to_string(i)+".raw"); auto *typedPtr = S.builder.CreateBitCast(dstPtr, llvm::PointerType::getUnqual(fty), dst+".fld"+std::to_string(i)+".ptr"); S.builder.CreateStore(vals[i], typedPtr); offset += fsz; }
-    S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname)); return true;
+    S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname));
+    // Emit debug info (parity with legacy in edn.cpp)
+    if(S.debug_manager && S.debug_manager->enableDebugInfo && S.builder.GetInsertBlock()){
+        if(auto *F = S.builder.GetInsertBlock()->getParent(); F && F->getSubprogram()){
+            auto *lv = S.debug_manager->DIB->createAutoVariable(F->getSubprogram(), dst, S.debug_manager->DI_File,
+                S.builder.getCurrentDebugLocation() ? S.builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(),
+                S.debug_manager->diTypeOf(S.tctx.get_struct(sname)));
+            auto *expr = S.debug_manager->DIB->createExpression();
+            (void)S.debug_manager->DIB->insertDeclare(allocaPtr, lv, expr, S.builder.getCurrentDebugLocation(), S.builder.GetInsertBlock());
+        }
+    }
+    return true;
 }
 
 bool handle_sum_is(builder::State& S, const std::vector<edn::node_ptr>& il,
                    const std::unordered_map<std::string, std::unordered_map<std::string,int>>& sum_variant_tag){
     // (sum-is %dst SumName %val Variant)
+    // TODO(debug-info): If we later want to expose the temporary comparison result to the debugger
+    // with a stable name, we could emit a dbg.value here referencing the i1 result.
     if(il.size()!=5) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data)|| std::get<edn::symbol>(il[0]->data).name!="sum-is") return false;
     std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) return false; if(!S.vmap.count(val)) return false; auto tIt = sum_variant_tag.find(sname); if(tIt==sum_variant_tag.end()) return false; auto vtIt = tIt->second.find(vname); if(vtIt==tIt->second.end()) return false; int tag=vtIt->second; auto *ST=llvm::StructType::getTypeByName(S.llctx, "struct."+sname); if(!ST) return false; llvm::Value *zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value *tagIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); auto *tagPtr = S.builder.CreateInBoundsGEP(ST, S.vmap[val], {zero, tagIdx}, dst+".tag.addr"); auto *loaded = S.builder.CreateLoad(llvm::Type::getInt32Ty(S.llctx), tagPtr, dst+".tag"); auto *cmp = S.builder.CreateICmpEQ(loaded, llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint64_t)tag,true), dst); S.vmap[dst]=cmp; S.vtypes[dst]=S.tctx.get_base(edn::BaseType::I1); return true;
 }
@@ -33,6 +46,7 @@ bool handle_sum_get(builder::State& S, const std::vector<edn::node_ptr>& il,
                     const std::unordered_map<std::string, std::unordered_map<std::string,int>>& sum_variant_tag,
                     const std::unordered_map<std::string, std::vector<std::vector<edn::TypeId>>>& sum_variant_field_types){
     // (sum-get %dst SumName %val Variant <index>)
+    // TODO(debug-info): Potentially attach a dbg.value for extracted field if named source mapping desired.
     if(il.size()!=6) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data)|| std::get<edn::symbol>(il[0]->data).name!="sum-get") return false;
     std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) return false; if(!S.vmap.count(val)) return false; if(!std::holds_alternative<int64_t>(il[5]->data)) return false; int64_t idxLit=(int64_t)std::get<int64_t>(il[5]->data); if(idxLit<0) return false; size_t idx=(size_t)idxLit;
     auto vfieldsIt = sum_variant_field_types.find(sname); auto vtagIt = sum_variant_tag.find(sname); if(vfieldsIt==sum_variant_field_types.end()||vtagIt==sum_variant_tag.end()) return false; auto vtIt=vtagIt->second.find(vname); if(vtIt==vtagIt->second.end()) return false; int tag=vtIt->second; auto &variants=vfieldsIt->second; if(tag<0||(size_t)tag>=variants.size()) return false; auto &fields=variants[tag]; if(idx>=fields.size()) return false; edn::TypeId fieldTyId=fields[idx]; auto *ST=llvm::StructType::getTypeByName(S.llctx, "struct."+sname); if(!ST) return false;
