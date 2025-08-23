@@ -107,8 +107,18 @@ SEHCatchScaffold create_seh_catch_scaffold(llvm::Function* F,
         llvm::Value* ti2 = llvm::ConstantPointerNull::get(i8p);
         // We need the catchswitch token; fetch it by taking the terminator of dispatchBB
         auto* csTerm = out.dispatchBB->getTerminator();
-        auto* cs = llvm::cast<llvm::CatchSwitchInst>(csTerm);
-        out.catchPad = eb.CreateCatchPad(cs, {ti0, ti1, ti2}, "cpad");
+        if(!csTerm || !llvm::isa<llvm::CatchSwitchInst>(csTerm)) {
+            // Defensive: log and create an unreachable if structure malformed mid-emission
+            if(csTerm){
+                fprintf(stderr, "[guard][exceptions] expected CatchSwitchInst terminator but got opcode=%u\n", (unsigned)csTerm->getOpcode());
+            } else {
+                fprintf(stderr, "[guard][exceptions] missing catchswitch terminator in dispatchBB\n");
+            }
+            auto* unr = eb.CreateUnreachable(); (void)unr;
+        } else {
+            auto* cs = llvm::cast<llvm::CatchSwitchInst>(csTerm);
+            out.catchPad = eb.CreateCatchPad(cs, {ti0, ti1, ti2}, "cpad");
+        }
     }
     return out;
 }

@@ -33,6 +33,7 @@ void DebugManager::initialize()
     DI_File = nullptr;
     if (enableDebugInfo)
     {
+    if(const char* skip = std::getenv("EDN_SKIP_PAYLOAD_ARRAY_DI")){ if(std::string(skip)=="1") { skipPayloadArrayDI = true; std::cerr << "[di][cfg] skipping payload array DI entries\n"; } }
         // Minimal, backend-agnostic setup
         module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
         module->addModuleFlag(llvm::Module::Warning, "Dwarf Version", 5u);
@@ -136,6 +137,10 @@ llvm::DIType* DebugManager::diTypeOf(edn::TypeId id)
                     llvm::Type *fLL = edn::ir::map_type(emitter->tctx_, *emitter->llctx_, fid);
                     std::cout << "[di][member] struct=" << T.struct_name << " i=" << i << " fid=" << fid
                               << " fLL.kind=" << (unsigned)fLL->getTypeID() << " fDI=" << (void*)fDI << "\n";
+                    if(skipPayloadArrayDI && T.struct_name=="T" && i==1){
+                        std::cout << "[di][member] SKIP array DI for struct T field 1 (diagnostic)\n";
+                        fDI = nullptr; // force null DIType for this field
+                    }
                     uint64_t fSizeBits = edn::ir::layout::alloc_size_bytes(*module, fLL) * 8;
                     uint32_t fAlignBits = edn::ir::layout::abi_align_bits(*module, fLL);
                     uint64_t offBits = SL ? SL->getElementOffsetInBits((unsigned)i) : 0;

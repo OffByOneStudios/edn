@@ -33,6 +33,7 @@ namespace edn::ir::debug
         bool enableDebugInfo = false; // Set to true if debug info should be generated
         std::unique_ptr<llvm::DIBuilder> DIB;
         llvm::DIFile *DI_File;
+    bool skipPayloadArrayDI = false; // diagnostic: optionally skip DI for sum payload array field
 
     public:
         std::unordered_map<edn::TypeId, llvm::DIType *> DITypeCache;
