@@ -24,7 +24,8 @@ bool handle_block(Context &C, const std::vector<node_ptr>& il, std::vector<std::
     if(!localsNode && !bodyNode) return true; // accept empty
     // Push new lexical scope for debug (if enabled) via builder state debug_manager
     if(C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
-        C.S.debug_manager->pushLexicalBlock(1,1,&C.S.builder);
+    C.S.debug_manager->pushLexicalBlock(1,1,&C.S.builder);
+    ++C.S.lexicalDepth;
     // Emit locals: (local <type> %name)
     if(localsNode){
         for(auto &ln : std::get<vector_t>(localsNode->data).elems){

@@ -38,14 +38,22 @@ void run_phase4_eh_seh_try_catch_smoke_test();
 void run_phase4_eh_itanium_try_catch_smoke_test();
 void run_phase4_eh_panic_inside_try_itanium_test();
 void run_phase4_eh_panic_inside_try_seh_test();
+void run_phase4_eh_panic_unwind_regression_test();
 void run_phase4_coro_ir_golden_test();
 void run_phase4_coro_lowering_smoke_test();
+void run_phase4_coro_minimal_regression_test();
 void run_phase4_coro_jit_smoke_test();
 void run_phase4_coro_negative_tests();
+void run_phase4_coro_suspend_regression_test();
 void run_phase4_debug_info_smoke_test();
 void run_phase4_debug_info_locals_test();
 void run_phase4_debug_info_struct_members_test();
+void run_phase4_debug_info_scopes_test();
 void run_phase4_abi_golden_test();
+void run_phase4_showvt_fallback_test();
+void run_phase4_pass_pipeline_test();
+void run_phase4_verify_ir_test();
+void run_phase4_resolver_shadow_test();
 
 int main(){
     // Core Phase 4
@@ -73,6 +81,8 @@ int main(){
     run_phase4_debug_info_smoke_test();
     run_phase4_debug_info_locals_test();
     run_phase4_debug_info_struct_members_test();
+    run_phase4_debug_info_scopes_test();
+    run_phase4_resolver_shadow_test();
 
     // EH matrix
     run_phase4_eh_panic_test();
@@ -88,14 +98,20 @@ int main(){
     run_phase4_eh_itanium_try_catch_smoke_test();
     run_phase4_eh_panic_inside_try_itanium_test();
     run_phase4_eh_panic_inside_try_seh_test();
+    run_phase4_eh_panic_unwind_regression_test();
 
     // Coroutines (IR + lowering + negatives)
     run_phase4_coro_ir_golden_test();
     run_phase4_coro_lowering_smoke_test();
+    run_phase4_coro_minimal_regression_test();
+    run_phase4_coro_suspend_regression_test();
     run_phase4_coro_negative_tests();
 
     // ABI reference
     run_phase4_abi_golden_test();
+        run_phase4_showvt_fallback_test();
+            run_phase4_pass_pipeline_test();
+            run_phase4_verify_ir_test();
 
     // Optional JIT smokes that could be flaky in Release; gate behind EDN_RUN_JIT=1
     if(env_enabled("EDN_RUN_JIT")){

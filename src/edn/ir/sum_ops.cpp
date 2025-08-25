@@ -1,5 +1,6 @@
 #include "edn/ir/sum_ops.hpp"
 #include "edn/ir/types.hpp"
+#include "edn/ir/di.hpp" // for di::declare_local
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Support/raw_ostream.h>
@@ -15,7 +16,7 @@ bool handle_sum_new(builder::State& S, const std::vector<edn::node_ptr>& il,
     // (sum-new %dst SumName Variant [ %v* ])
     if(!(il.size()==4 || il.size()==5)) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="sum-new") return false;
     std::string dst = trimPct(symName(il[1])); std::string sname = symName(il[2]); std::string vname = symName(il[3]); if(dst.empty()||sname.empty()||vname.empty()) return false;
-    auto vtagMapIt = sum_variant_tag.find(sname); auto vfieldsIt = sum_variant_field_types.find(sname); if(vtagMapIt==sum_variant_tag.end()||vfieldsIt==sum_variant_field_types.end()) return false; auto tIt = vtagMapIt->second.find(vname); if(tIt==vtagMapIt->second.end()) return false; int tag=tIt->second; auto &variants=vfieldsIt->second; if(tag<0 || (size_t)tag>=variants.size()) return false;
+    auto vtagMapIt = sum_variant_tag.find(sname); auto vfieldsIt = sum_variant_field_types.find(sname); if(vtagMapIt==sum_variant_tag.end()||vfieldsIt==sum_variant_field_types.end()) return false; auto tIt = vtagMapIt->second.find(vname); if(tIt==vtagMapIt->second.end()) return false; int tag=tIt->second; if(tag<0) return false; auto utag = static_cast<size_t>(tag); auto &variants=vfieldsIt->second; if(utag>=variants.size()) return false;
     std::vector<llvm::Value*> vals; if(il.size()==5 && std::holds_alternative<edn::vector_t>(il[4]->data)){ for(auto &nv: std::get<edn::vector_t>(il[4]->data).elems){ std::string vn=trimPct(symName(nv)); if(vn.empty()||!S.vmap.count(vn)){ vals.clear(); break; } vals.push_back(S.vmap[vn]); } }
     auto *ST = llvm::StructType::getTypeByName(S.llctx, "struct."+sname); if(!ST) return false; 
     // Instrument: log struct element LLVM type IDs for diagnostics
@@ -29,18 +30,32 @@ bool handle_sum_new(builder::State& S, const std::vector<edn::node_ptr>& il,
     auto *tagPtr = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, tagIdx}, dst+".tag.addr"); S.builder.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint64_t)tag,true), tagPtr);
     llvm::Value *payIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),1); 
     fprintf(stderr, "[dbg][sum_new] creating payload GEP for %s (ST=%p)\n", sname.c_str(), (void*)ST);
-    auto *payloadPtr = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, payIdx}, dst+".payload.addr"); auto *i8Ptr=llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(S.llctx)); auto *rawPayloadPtr = S.builder.CreateBitCast(payloadPtr, i8Ptr, dst+".raw");
-    uint64_t offset=0; for(size_t i=0;i<vals.size() && i<variants[tag].size(); ++i){ llvm::Type *fty = S.map_type(variants[tag][i]); if(!fty){ fprintf(stderr, "[dbg][sum_new] null LLVM type for variant field %zu of %s.%s\n", i, sname.c_str(), vname.c_str()); return false; } uint64_t fsz = edn::ir::size_in_bytes(S.module, fty); fprintf(stderr, "[dbg][sum_new] field %zu size=%llu tyid=%u\n", i, (unsigned long long)fsz, (unsigned)fty->getTypeID()); auto *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(S.llctx), offset); auto *dstPtr = S.builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(S.llctx), rawPayloadPtr, offVal, dst+".fld"+std::to_string(i)+".raw"); auto *typedPtr = S.builder.CreateBitCast(dstPtr, llvm::PointerType::getUnqual(fty), dst+".fld"+std::to_string(i)+".ptr"); S.builder.CreateStore(vals[i], typedPtr); offset += fsz; }
-    S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname));
-    // Emit debug info (parity with legacy in edn.cpp)
-    if(S.debug_manager && S.debug_manager->enableDebugInfo && S.builder.GetInsertBlock()){
-        if(auto *F = S.builder.GetInsertBlock()->getParent(); F && F->getSubprogram()){
-            auto *lv = S.debug_manager->DIB->createAutoVariable(F->getSubprogram(), dst, S.debug_manager->DI_File,
-                S.builder.getCurrentDebugLocation() ? S.builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine(),
-                S.debug_manager->diTypeOf(S.tctx.get_struct(sname)));
-            auto *expr = S.debug_manager->DIB->createExpression();
-            (void)S.debug_manager->DIB->insertDeclare(allocaPtr, lv, expr, S.builder.getCurrentDebugLocation(), S.builder.GetInsertBlock());
+    auto *payloadPtr = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, payIdx}, dst+".payload.addr");
+    auto *i8Ptr=llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(S.llctx));
+    auto *rawPayloadPtr = S.builder.CreateBitCast(payloadPtr, i8Ptr, dst+".payload.raw");
+    uint64_t offset=0;
+    for(size_t i=0;i<vals.size() && i<variants[utag].size(); ++i){
+        llvm::Type *fty = S.map_type(variants[utag][i]);
+        if(!fty){
+            fprintf(stderr, "[dbg][sum_new] null LLVM type for variant field %zu of %s.%s\n", i, sname.c_str(), vname.c_str());
+            return false;
         }
+    uint64_t fsz = edn::ir::size_in_bytes(S.module, fty);
+        fprintf(stderr, "[dbg][sum_new] field %zu size=%llu tyid=%u\n", i, (unsigned long long)fsz, (unsigned)fty->getTypeID());
+        auto *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(S.llctx), offset);
+        std::string baseName = dst+".payload.f"+std::to_string(i);
+        auto *dstPtr = S.builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(S.llctx), rawPayloadPtr, offVal, baseName+".raw");
+        auto *typedPtr = S.builder.CreateBitCast(dstPtr, llvm::PointerType::getUnqual(fty), baseName+".ptr");
+        S.builder.CreateStore(vals[i], typedPtr);
+    offset += fsz;
+    }
+    S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname));
+    // Emit debug info via centralized helper
+    if(S.debug_manager && S.debug_manager->enableDebugInfo && S.builder.GetInsertBlock()){
+        unsigned line = S.builder.getCurrentDebugLocation() ? S.builder.getCurrentDebugLocation()->getLine()
+                        : (S.builder.GetInsertBlock()->getParent() && S.builder.GetInsertBlock()->getParent()->getSubprogram()
+                           ? S.builder.GetInsertBlock()->getParent()->getSubprogram()->getLine() : 1);
+        edn::ir::di::declare_local(*S.debug_manager, S.builder, allocaPtr, dst, S.tctx.get_struct(sname), line);
     }
     // Env-gated immediate verification & IR dump after sum_new
     static bool verifyAfter = [](){ const char* v = std::getenv("EDN_VERIFY_AFTER_SUM_OPS"); return v && std::string(v)=="1"; }();
@@ -107,10 +122,22 @@ bool handle_sum_get(builder::State& S, const std::vector<edn::node_ptr>& il,
     // TODO(debug-info): Potentially attach a dbg.value for extracted field if named source mapping desired.
     if(il.size()!=6) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data)|| std::get<edn::symbol>(il[0]->data).name!="sum-get") return false;
     std::string dst=trimPct(symName(il[1])); std::string sname=symName(il[2]); std::string val=trimPct(symName(il[3])); std::string vname=symName(il[4]); if(dst.empty()||sname.empty()||val.empty()||vname.empty()) return false; if(!S.vmap.count(val)) return false; if(!std::holds_alternative<int64_t>(il[5]->data)) return false; int64_t idxLit=(int64_t)std::get<int64_t>(il[5]->data); if(idxLit<0) return false; size_t idx=(size_t)idxLit;
-    auto vfieldsIt = sum_variant_field_types.find(sname); auto vtagIt = sum_variant_tag.find(sname); if(vfieldsIt==sum_variant_field_types.end()||vtagIt==sum_variant_tag.end()) return false; auto vtIt=vtagIt->second.find(vname); if(vtIt==vtagIt->second.end()) return false; int tag=vtIt->second; auto &variants=vfieldsIt->second; if(tag<0||(size_t)tag>=variants.size()) return false; auto &fields=variants[tag]; if(idx>=fields.size()) return false; edn::TypeId fieldTyId=fields[idx]; auto *ST=llvm::StructType::getTypeByName(S.llctx, "struct."+sname); if(!ST) return false;
+    auto vfieldsIt = sum_variant_field_types.find(sname); auto vtagIt = sum_variant_tag.find(sname); if(vfieldsIt==sum_variant_field_types.end()||vtagIt==sum_variant_tag.end()) return false; auto vtIt=vtagIt->second.find(vname); if(vtIt==vtagIt->second.end()) return false; int tag=vtIt->second; if(tag<0) return false; auto utag = static_cast<size_t>(tag); auto &variants=vfieldsIt->second; if(utag>=variants.size()) return false; auto &fields=variants[utag]; if(idx>=fields.size()) return false; edn::TypeId fieldTyId=fields[idx]; auto *ST=llvm::StructType::getTypeByName(S.llctx, "struct."+sname); if(!ST) return false;
     llvm::Value *zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value *payIdx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),1); 
     fprintf(stderr, "[dbg][sum_get] creating payload GEP for %s (ST=%p)\n", sname.c_str(), (void*)ST);
-    auto *payloadPtr=S.builder.CreateInBoundsGEP(ST, S.vmap[val], {zero, payIdx}, dst+".payload.addr"); auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(S.llctx)); auto *rawPayloadPtr = S.builder.CreateBitCast(payloadPtr, i8PtrTy, dst+".raw"); uint64_t offset=0; for(size_t i=0;i<idx && i<fields.size(); ++i){ llvm::Type *fty = S.map_type(fields[i]); offset += edn::ir::size_in_bytes(S.module, fty);} llvm::Value *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(S.llctx), offset); llvm::Value *fieldRaw = S.builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(S.llctx), rawPayloadPtr, offVal, dst+".fld.raw"); llvm::Type *fieldLL = S.map_type(fieldTyId); auto *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL); auto *typedPtr = S.builder.CreateBitCast(fieldRaw, fieldPtrTy, dst+".fld.ptr"); auto *lv = S.builder.CreateLoad(fieldLL, typedPtr, dst); S.vmap[dst]=lv; S.vtypes[dst]=fieldTyId; 
+    auto *payloadPtr=S.builder.CreateInBoundsGEP(ST, S.vmap[val], {zero, payIdx}, dst+".payload.addr");
+    auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(S.llctx));
+    auto *rawPayloadPtr = S.builder.CreateBitCast(payloadPtr, i8PtrTy, dst+".payload.raw");
+    uint64_t offset=0;
+    for(size_t i=0;i<static_cast<size_t>(idx) && i<fields.size(); ++i){ llvm::Type *fty = S.map_type(fields[i]); offset += edn::ir::size_in_bytes(S.module, fty);} 
+    llvm::Value *offVal = llvm::ConstantInt::get(llvm::Type::getInt64Ty(S.llctx), offset);
+    std::string baseName = dst+".payload.f"+std::to_string(idx);
+    llvm::Value *fieldRaw = S.builder.CreateInBoundsGEP(llvm::Type::getInt8Ty(S.llctx), rawPayloadPtr, offVal, baseName+".raw");
+    llvm::Type *fieldLL = S.map_type(fieldTyId);
+    auto *fieldPtrTy = llvm::PointerType::getUnqual(fieldLL);
+    auto *typedPtr = S.builder.CreateBitCast(fieldRaw, fieldPtrTy, baseName+".ptr");
+    auto *lv = S.builder.CreateLoad(fieldLL, typedPtr, dst);
+    S.vmap[dst]=lv; S.vtypes[dst]=fieldTyId; 
     static bool verifyAfter = [](){ const char* v = std::getenv("EDN_VERIFY_AFTER_SUM_OPS"); return v && std::string(v)=="1"; }();
     static bool dumpAfter = [](){ const char* v = std::getenv("EDN_DUMP_IR_AFTER_SUM_OPS"); return v && std::string(v)=="1"; }();
     if((verifyAfter || dumpAfter) && S.builder.GetInsertBlock()){

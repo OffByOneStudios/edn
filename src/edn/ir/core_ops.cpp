@@ -45,8 +45,8 @@ bool handle_float_arith(builder::State& S, const std::vector<edn::node_ptr>& il)
     if(op!="fadd" && op!="fsub" && op!="fmul" && op!="fdiv") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId ty{}; try{ ty = S.tctx.parse_type(il[2]); }catch(...){ return false; }
-    auto *va = builder::get_value(S, il[3]);
-    auto *vb = builder::get_value(S, il[4]);
+    auto *va = edn::ir::resolver::get_value(S, il[3]);
+    auto *vb = edn::ir::resolver::get_value(S, il[4]);
     if(!va||!vb) return false;
     llvm::Value* r=nullptr;
     if(op=="fadd") r=S.builder.CreateFAdd(va,vb,dst);
@@ -62,8 +62,8 @@ bool handle_bitwise_shift(builder::State& S, const std::vector<edn::node_ptr>& i
     if(op!="and" && op!="or" && op!="xor" && op!="shl" && op!="lshr" && op!="ashr") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId ty{}; try{ ty = S.tctx.parse_type(il[2]); }catch(...){ return false; }
-    auto *va = builder::get_value(S, il[3]);
-    auto *vb = builder::get_value(S, il[4]);
+    auto *va = edn::ir::resolver::get_value(S, il[3]);
+    auto *vb = edn::ir::resolver::get_value(S, il[4]);
     if(!va||!vb) return false;
     llvm::Value* r=nullptr;
     if(op=="and") r=S.builder.CreateAnd(va,vb,dst);

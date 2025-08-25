@@ -31,14 +31,20 @@ void run_phase4_eh_seh_try_catch_smoke_test();
 void run_phase4_eh_itanium_try_catch_smoke_test();
 void run_phase4_eh_panic_inside_try_itanium_test();
 void run_phase4_eh_panic_inside_try_seh_test();
+void run_phase4_eh_panic_unwind_regression_test();
 void run_phase4_coro_ir_golden_test();
 void run_phase4_coro_lowering_smoke_test();
+void run_phase4_coro_minimal_regression_test();
 void run_phase4_coro_jit_smoke_test();
 void run_phase4_coro_negative_tests();
+void run_phase4_coro_suspend_regression_test();
 void run_phase4_debug_info_smoke_test();
 void run_phase4_debug_info_locals_test();
 void run_phase4_debug_info_struct_members_test();
+void run_phase4_debug_info_scopes_test();
 void run_phase4_abi_golden_test();
+void run_phase4_resolver_shadow_test();
+void run_phase4_match_binding_offsets_test();
 
 int main(){
     run_phase4_eh_disabled_no_invoke_test();
@@ -50,8 +56,13 @@ int main(){
     run_phase4_generics_dedup_test();
     run_phase4_generics_negative_tests();
     run_phase4_traits_macro_test();
+    run_phase4_resolver_shadow_test();
+    run_phase4_match_binding_offsets_test();
     // TEMP: bisect segfault after traits test; run no further tests for now.
     // run_phase4_closures_min_test();
+    run_phase4_coro_minimal_regression_test();
+    run_phase4_coro_suspend_regression_test();
+    // (Optional) run_phase4_eh_panic_unwind_regression_test(); // keep minimal binary lean
     std::cout << "[phase4] All tests passed\n";
     return 0;
 }

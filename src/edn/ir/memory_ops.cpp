@@ -1,5 +1,6 @@
 #include "edn/ir/memory_ops.hpp"
 #include "edn/ir/types.hpp"
+#include "edn/ir/di.hpp"
 #include <llvm/IR/IRBuilder.h>
 
 namespace edn::ir::memory_ops {
@@ -35,26 +36,17 @@ bool handle_alloca(builder::State& S, const std::vector<edn::node_ptr>& il){
     if(il.size()!=3) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="alloca") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false; 
     edn::TypeId ty; try { ty = S.tctx.parse_type(il[2]); } catch(...) { return false; }
+    // Create a new alloca even if name already exists (shadowing)
     auto *av = S.builder.CreateAlloca(S.map_type(ty), nullptr, dst);
     S.vmap[dst] = av; S.vtypes[dst] = S.tctx.get_pointer(ty);
-    // Debug info (mirrors legacy inline implementation)
+    if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(av)) {
+        S.shadowSlots[dst].push_back({S.lexicalDepth, AI, ty});
+        // Update varSlots to refer to newest shadow.
+        S.varSlots[dst] = AI;
+    }
     if (S.debug_manager && S.debug_manager->enableDebugInfo) {
-        llvm::Function *F = S.builder.GetInsertBlock() ? S.builder.GetInsertBlock()->getParent() : nullptr;
-        if (F && F->getSubprogram()) {
-            unsigned line = 0;
-            llvm::DebugLoc curLoc = S.builder.getCurrentDebugLocation();
-            if (curLoc) line = curLoc.getLine();
-            if (line == 0) line = F->getSubprogram()->getLine();
-            auto *lv = S.debug_manager->DIB->createAutoVariable(
-                F->getSubprogram(),
-                dst,
-                S.debug_manager->DI_File,
-                line,
-                S.debug_manager->diTypeOf(ty)
-            );
-            auto *expr = S.debug_manager->DIB->createExpression();
-            (void)S.debug_manager->DIB->insertDeclare(av, lv, expr, curLoc, S.builder.GetInsertBlock());
-        }
+        di::declare_local(*S.debug_manager, S.builder, av, dst, ty,
+                          S.builder.getCurrentDebugLocation()? S.builder.getCurrentDebugLocation()->getLine() : (S.builder.GetInsertBlock()->getParent()->getSubprogram()? S.builder.GetInsertBlock()->getParent()->getSubprogram()->getLine():1));
     }
     return true;
 }
@@ -102,7 +94,7 @@ bool handle_index(builder::State& S, const std::vector<edn::node_ptr>& il){
     if(il.size()!=5) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="index") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId elemTy; try { elemTy = S.tctx.parse_type(il[2]); } catch(...) { return false; }
-    auto *baseV = builder::get_value(S, il[3]); auto *idxV = builder::get_value(S, il[4]); if(!baseV || !idxV) return false;
+    auto *baseV = edn::ir::resolver::get_value(S, il[3]); auto *idxV = edn::ir::resolver::get_value(S, il[4]); if(!baseV || !idxV) return false;
     std::string baseName = trimPct(symName(il[3])); if(!S.vtypes.count(baseName)) return false;
     edn::TypeId baseTyId = S.vtypes[baseName]; const edn::Type* baseTy = &S.tctx.at(baseTyId); if(baseTy->kind!=edn::Type::Kind::Pointer) return false;
     const edn::Type* arrTy = &S.tctx.at(baseTy->pointee); if(arrTy->kind!=edn::Type::Kind::Array || arrTy->elem!=elemTy) return false;
@@ -126,7 +118,7 @@ bool handle_array_lit(builder::State& S, const std::vector<edn::node_ptr>& il){
     }
     auto *AT = llvm::cast<llvm::ArrayType>(rawArrTy);
     auto *allocaPtr = S.builder.CreateAlloca(AT, nullptr, dst);
-    for(size_t i=0;i<elems.size();++i){ if(!std::holds_alternative<edn::symbol>(elems[i]->data)) continue; std::string val = trimPct(symName(elems[i])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; llvm::Value *zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value *idx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint32_t)i); auto *gep = S.builder.CreateInBoundsGEP(AT, allocaPtr, {zero, idx}, dst+".elem"+std::to_string(i)+".addr"); S.builder.CreateStore(vit->second, gep);}    
+    for(size_t i=0;i<elems.size();++i){ if(!std::holds_alternative<edn::symbol>(elems[i]->data)) continue; std::string val = trimPct(symName(elems[i])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; if(i>UINT32_MAX) break; llvm::Value *zero=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value *idx=llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),(uint32_t)i); auto *gep = S.builder.CreateInBoundsGEP(AT, allocaPtr, {zero, idx}, dst+".elem"+std::to_string(i)+".addr"); S.builder.CreateStore(vit->second, gep);}    
     S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(arrTy); return true;
 }
 
@@ -143,21 +135,12 @@ bool handle_struct_lit(builder::State& S, const std::vector<edn::node_ptr>& il,
     auto *ST = llvm::StructType::getTypeByName(S.llctx, "struct."+sname);
     if(!ST){ std::vector<llvm::Type*> ftys; for(auto tid: ftIt->second) ftys.push_back(S.map_type(tid)); ST = llvm::StructType::create(S.llctx, ftys, "struct."+sname); }
     auto *allocaPtr = S.builder.CreateAlloca(ST, nullptr, dst);
-    if(S.debug_manager && S.debug_manager->enableDebugInfo && S.debug_manager->DIB){
-        if(auto *F = S.builder.GetInsertBlock()->getParent(); F && F->getSubprogram()){
-            unsigned line = S.builder.getCurrentDebugLocation() ? S.builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine();
-            auto *scope = S.debug_manager->currentScope();
-            auto *diTy = S.debug_manager->diTypeOf(S.tctx.get_struct(sname));
-            if(auto *sp = F->getSubprogram()){
-                auto *lv = S.debug_manager->DIB->createAutoVariable(scope ? scope : sp, dst, S.debug_manager->DI_File, line, diTy, true);
-                auto *expr = S.debug_manager->DIB->createExpression();
-                // Use dbg.declare (not dbg.value) so tests can find a DbgDeclareInst
-                S.debug_manager->DIB->insertDeclare(allocaPtr, lv, expr, S.builder.getCurrentDebugLocation(), S.builder.GetInsertBlock());
-            }
-        }
+    if(S.debug_manager && S.debug_manager->enableDebugInfo){
+        di::declare_local(*S.debug_manager, S.builder, allocaPtr, dst, S.tctx.get_struct(sname),
+                          S.builder.getCurrentDebugLocation()? S.builder.getCurrentDebugLocation()->getLine() : (S.builder.GetInsertBlock()->getParent()->getSubprogram()? S.builder.GetInsertBlock()->getParent()->getSubprogram()->getLine() : 1));
     }
     auto &vec = std::get<edn::vector_t>(il[3]->data).elems;
-    for(size_t i=0, fi=0; i+1<vec.size(); i+=2, ++fi){ if(!std::holds_alternative<edn::symbol>(vec[i]->data) || !std::holds_alternative<edn::symbol>(vec[i+1]->data)) continue; std::string fname = symName(vec[i]); std::string val=trimPct(symName(vec[i+1])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; auto idxMapIt = idxIt->second.find(fname); if(idxMapIt==idxIt->second.end()) continue; uint32_t fidx = idxMapIt->second; llvm::Value* zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value* fIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx), fidx); auto *gep = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, fIndex}, dst+"."+fname+".addr"); S.builder.CreateStore(vit->second, gep);}    
+    for(size_t i=0, fi=0; i+1<vec.size(); i+=2, ++fi){ if(!std::holds_alternative<edn::symbol>(vec[i]->data) || !std::holds_alternative<edn::symbol>(vec[i+1]->data)) continue; std::string fname = symName(vec[i]); std::string val=trimPct(symName(vec[i+1])); if(val.empty()) continue; auto vit=S.vmap.find(val); if(vit==S.vmap.end()) continue; auto idxMapIt = idxIt->second.find(fname); if(idxMapIt==idxIt->second.end()) continue; size_t fidxSz = idxMapIt->second; if(fidxSz>UINT32_MAX) continue; uint32_t fidx = static_cast<uint32_t>(fidxSz); llvm::Value* zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx),0); llvm::Value* fIndex = llvm::ConstantInt::get(llvm::Type::getInt32Ty(S.llctx), fidx); auto *gep = S.builder.CreateInBoundsGEP(ST, allocaPtr, {zero, fIndex}, dst+"."+fname+".addr"); S.builder.CreateStore(vit->second, gep);}    
     S.vmap[dst]=allocaPtr; S.vtypes[dst]=S.tctx.get_pointer(S.tctx.get_struct(sname)); return true;
 }
 

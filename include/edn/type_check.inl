@@ -166,7 +166,7 @@ inline void TypeChecker::collect_globals(TypeCheckResult& r, const std::vector<n
             auto emitInitError = [&](const std::string& code, const std::string& msg, const std::string& hint=""){ error_code(r,*n,code,msg,hint); r.success=false; };
             auto isIntLit=[&](const node_ptr& lit){ return lit && std::holds_alternative<int64_t>(lit->data); };
             auto isFloatLit=[&](const node_ptr& lit){ return lit && std::holds_alternative<double>(lit->data); };
-            auto addMismatch=[&](const std::string& code, const std::string& role, TypeId expected, const std::string& msg, const std::string& hint){
+            auto addMismatch=[&](const std::string& code, const std::string& role [[maybe_unused]], TypeId expected, const std::string& msg, const std::string& hint){
                 // emit error with expected/found style notes (Phase 3 diagnostics uniformity)
                 ErrorReporter rep{&r.errors,&r.warnings};
                 auto err = rep.make_error(code,msg,hint,line(*n),col(*n));

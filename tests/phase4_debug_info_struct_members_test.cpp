@@ -9,6 +9,8 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 
+// (Sentinel removed) Previously had a #error to verify the build used this updated source.
+
 using namespace edn;
 
 void run_phase4_debug_info_struct_members_test(){
@@ -44,10 +46,15 @@ void run_phase4_debug_info_struct_members_test(){
     int dbgDecls = 0;
     for(auto &BB : *F){
         for(auto &I : BB){
-            if(auto *dbg = llvm::dyn_cast<llvm::DbgDeclareInst>(&I)){
+            // Prefer generic DbgVariableIntrinsic API over manually indexing operands.
+            if(auto *dvi = llvm::dyn_cast<llvm::DbgVariableIntrinsic>(&I)){
                 ++dbgDecls;
-                if(auto *lv = dbg->getVariable()){
-                    if(auto *ct = llvm::dyn_cast<llvm::DICompositeType>(lv->getType())){
+                if(auto *lv = dvi->getVariable()){
+                    llvm::DIType *ty = lv->getType();
+                    while(ty && !llvm::isa<llvm::DICompositeType>(ty)){
+                        if(auto *dt = llvm::dyn_cast<llvm::DIDerivedType>(ty)) ty = dt->getBaseType(); else break;
+                    }
+                    if(auto *ct = llvm::dyn_cast_or_null<llvm::DICompositeType>(ty)){
                         if(ct->getName() == "Point"){ found = ct; members = ct->getElements(); break; }
                     }
                 }

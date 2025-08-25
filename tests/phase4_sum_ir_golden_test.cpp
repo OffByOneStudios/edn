@@ -58,19 +58,19 @@ void run_phase4_sum_ir_golden_tests(){
         expect_contains(ir, "s.payload.addr = getelementptr inbounds %struct.T, ptr %s, i32 0, i32 1");
     // Note: with opaque pointers we no longer emit an explicit bitcast to a raw ptr
         // Field 0 at offset 0 (i32)
-    expect_contains(ir, "s.fld0.raw = getelementptr inbounds i8, ptr %s.payload.addr, i64 0");
-    expect_contains(ir, "store i32 %x, ptr %s.fld0.raw");
+    expect_contains(ir, "s.payload.f0.raw = getelementptr inbounds i8, ptr %s.payload.addr, i64 0");
+    expect_contains(ir, "store i32 %x, ptr %s.payload.f0.raw");
         // Field 1 at offset 4 (i64)
-    expect_contains(ir, "s.fld1.raw = getelementptr inbounds i8, ptr %s.payload.addr, i64 4");
-    expect_contains(ir, "store i64 %y, ptr %s.fld1.raw");
+    expect_contains(ir, "s.payload.f1.raw = getelementptr inbounds i8, ptr %s.payload.addr, i64 4");
+    expect_contains(ir, "store i64 %y, ptr %s.payload.f1.raw");
         // Extraction loads
         expect_contains(ir, "g0.payload.addr = getelementptr inbounds %struct.T, ptr %s, i32 0, i32 1");
     // No explicit bitcast; compute field addresses from payload.addr
-    expect_contains(ir, "g0.fld.raw = getelementptr inbounds i8, ptr %g0.payload.addr, i64 0");
-    expect_contains(ir, "g0 = load i32, ptr %g0.fld.raw");
+    expect_contains(ir, "g0.payload.f0.raw = getelementptr inbounds i8, ptr %g0.payload.addr, i64 0");
+    expect_contains(ir, "g0 = load i32, ptr %g0.payload.f0.raw");
     expect_contains(ir, "g1.payload.addr = getelementptr inbounds %struct.T, ptr %s, i32 0, i32 1");
-    expect_contains(ir, "g1.fld.raw = getelementptr inbounds i8, ptr %g1.payload.addr, i64 4");
-    expect_contains(ir, "g1 = load i64, ptr %g1.fld.raw");
+    expect_contains(ir, "g1.payload.f1.raw = getelementptr inbounds i8, ptr %g1.payload.addr, i64 4");
+    expect_contains(ir, "g1 = load i64, ptr %g1.payload.f1.raw");
     }
 
     std::cout << "[phase4] golden IR: sum-is...\n";
@@ -110,9 +110,8 @@ void run_phase4_sum_ir_golden_tests(){
         expect_contains(ir, "match.tag = load i32, ptr %match.tag.addr");
         expect_contains(ir, "match.cmp = icmp eq i32 %match.tag, 0");
         expect_contains(ir, "icmp eq i32 %match.tag, 1");
-        // Payload extraction for binds
-        expect_contains(ir, "match.payload.addr = getelementptr inbounds %struct.T, ptr %p, i32 0, i32 1");
-    // No explicit bitcast; compute field addresses from payload.addr
+    // Payload extraction for binds (current naming uses x.raw / y.raw rather than x.payload.f0.raw)
+    expect_contains(ir, "match.payload.addr = getelementptr inbounds %struct.T, ptr %p, i32 0, i32 1");
     expect_contains(ir, "x.raw = getelementptr inbounds i8, ptr %match.payload.addr, i64 0");
     expect_contains(ir, "x = load i32, ptr %x.raw");
     expect_contains(ir, "y.raw = getelementptr inbounds i8, ptr %match.payload.addr, i64 4");

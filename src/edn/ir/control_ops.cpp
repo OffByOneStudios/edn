@@ -1,4 +1,5 @@
 #include "edn/ir/control_ops.hpp"
+#include "edn/ir/di.hpp"
 
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
@@ -58,25 +59,47 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                 B.CreateCondBr(condV, thenBB, hasElse ? elseBB : mergeBB);
             // then (push lexical scope for 'then')
             B.SetInsertPoint(thenBB);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->pushLexicalBlock(/*line*/1, 1, &B);
+                ++C.S.lexicalDepth;
+            }
             if (std::holds_alternative<vector_t>(il[2]->data))
                 C.emit_ref(std::get<vector_t>(il[2]->data).elems);
             if (!B.GetInsertBlock()->getTerminator())
                 B.CreateBr(mergeBB);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->popScope(&B);
+                --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+            }
             if (hasElse) {
                 B.SetInsertPoint(elseBB);
-                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                     C.S.debug_manager->pushLexicalBlock(/*line*/1, 1, &B);
+                    ++C.S.lexicalDepth;
+                }
                 C.emit_ref(std::get<vector_t>(il[3]->data).elems);
                 if (!B.GetInsertBlock()->getTerminator())
                     B.CreateBr(mergeBB);
-                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                     C.S.debug_manager->popScope(&B);
+                    --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+                }
             }
             B.SetInsertPoint(mergeBB);
+        }
+        return true;
+    }
+
+    // generic lexical block ------------------------------------------------
+    // Syntax: (block [ ...body... ]) -- used for tests to force nested scopes
+    if (isOp(il, "block")) {
+        if (il.size() >= 2 && il[1] && std::holds_alternative<vector_t>(il[1]->data)) {
+            auto &body = std::get<vector_t>(il[1]->data).elems;
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&C.S.builder);
+            C.emit_ref(body);
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                C.S.debug_manager->popScope(&C.S.builder);
         }
         return true;
     }
@@ -106,11 +129,15 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                 B.SetInsertPoint(bodyBB);
                 C.loopEndStack.push_back(endBB);
                 C.loopContinueStack.push_back(condBB);
-                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                     C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+                    ++C.S.lexicalDepth;
+                }
                 C.emit_ref(std::get<vector_t>(il[2]->data).elems);
-                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+                if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                     C.S.debug_manager->popScope(&B);
+                    --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+                }
                 C.loopContinueStack.pop_back();
                 C.loopEndStack.pop_back();
                 if (!B.GetInsertBlock()->getTerminator()) B.CreateBr(condBB);
@@ -158,21 +185,29 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
         C.loopEndStack.push_back(endBB);
         C.loopContinueStack.push_back(stepBB);
         if (!bodyVec.empty()) {
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+                ++C.S.lexicalDepth;
+            }
             C.emit_ref(bodyVec);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->popScope(&B);
+                --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+            }
         }
         C.loopContinueStack.pop_back();
         if (!B.GetInsertBlock()->getTerminator()) B.CreateBr(stepBB);
         B.SetInsertPoint(stepBB);
         if (!stepVec.empty()) {
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+                ++C.S.lexicalDepth;
+            }
             C.emit_ref(stepVec);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->popScope(&B);
+                --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+            }
         }
         C.loopEndStack.pop_back();
         if (!stepBB->getTerminator()) B.CreateBr(condBB);
@@ -225,20 +260,28 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
             auto *nextCmpBB = (ci+1<cases.size()) ? caseBlocks[ci+1] : defaultBB;
             B.CreateCondBr(cmp, bodyBB, nextCmpBB);
             B.SetInsertPoint(bodyBB);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+                ++C.S.lexicalDepth;
+            }
             C.emit_ref(cases[ci].second);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->popScope(&B);
+                --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+            }
             if (!bodyBB->getTerminator()) B.CreateBr(mergeBB);
         }
         if (haveDefault) {
             B.SetInsertPoint(defaultBB);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->pushLexicalBlock(/*line*/1,1,&B);
+                ++C.S.lexicalDepth;
+            }
             C.emit_ref(defaultBody);
-            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
+            if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
                 C.S.debug_manager->popScope(&B);
+                --C.S.lexicalDepth; edn::ir::builder::unwind_scope(C.S);
+            }
             if (!defaultBB->getTerminator()) B.CreateBr(mergeBB);
         }
         B.SetInsertPoint(mergeBB);
@@ -263,7 +306,7 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
         if (sname.empty() || val.empty() || !vmap.count(val)) return true;
         auto *ST = llvm::StructType::getTypeByName(llctx, "struct." + sname);
         if (!ST) return true;
-        llvm::Value* zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 0);
+    llvm::Value* zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 0);
         llvm::Value* tagIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 0);
         auto *tagPtr = B.CreateInBoundsGEP(ST, vmap[val], {zero, tagIdx}, "match.tag.addr");
         auto *tagVal = B.CreateLoad(llvm::Type::getInt32Ty(llctx), tagPtr, "match.tag");
@@ -315,15 +358,17 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
             B.CreateCondBr(cmp, bodyBB, next);
             B.SetInsertPoint(bodyBB);
             if (!cases[ci].binds.empty()) {
-                llvm::Value *zero = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 0);
+                llvm::Value *zero2 = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 0);
                 llvm::Value *payIdx = llvm::ConstantInt::get(llvm::Type::getInt32Ty(llctx), 1);
-                auto *payloadPtr = B.CreateInBoundsGEP(ST, vmap[val], {zero, payIdx}, "match.payload.addr");
+                auto *payloadPtr = B.CreateInBoundsGEP(ST, vmap[val], {zero2, payIdx}, "match.payload.addr");
                 auto *i8PtrTy = llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(llctx));
                 auto *rawPayloadPtr = B.CreateBitCast(payloadPtr, i8PtrTy, "match.raw");
                 if (auto vfieldsIt = C.sum_variant_field_types.find(sname); vfieldsIt != C.sum_variant_field_types.end()) {
                     auto &variants = vfieldsIt->second; int tag = cases[ci].tag;
-                    if (tag >=0 && (size_t)tag < variants.size()) {
-                        auto &fields = variants[tag];
+                    if (tag >=0) {
+                        size_t utag = static_cast<size_t>(tag);
+                        if(utag < variants.size()) {
+                        auto &fields = variants[utag];
                         for (auto &bp : cases[ci].binds) {
                             size_t idx = bp.second; if (idx >= fields.size()) continue;
                             uint64_t offset = 0; for (size_t fi=0; fi<idx; ++fi) { llvm::Type* fl = C.S.map_type(fields[fi]); offset += edn::ir::size_in_bytes(C.S.module, fl); }
@@ -334,6 +379,11 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
                             auto *typedPtr = B.CreateBitCast(fieldRaw, fieldPtrTy, bp.first + ".ptr");
                             auto *lv = B.CreateLoad(fieldLL, typedPtr, bp.first);
                             vmap[bp.first] = lv; vtypes[bp.first] = fields[idx];
+                            if(C.S.debug_manager && C.S.debug_manager->enableDebugInfo){
+                                // Use di::declare_local (will choose dbg.value for SSA value)
+                                di::declare_local(*C.S.debug_manager, B, lv, bp.first, fields[idx], B.getCurrentDebugLocation()? B.getCurrentDebugLocation()->getLine(): (C.F->getSubprogram()? C.F->getSubprogram()->getLine():1));
+                            }
+                        }
                         }
                     }
                 }

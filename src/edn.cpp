@@ -1,6 +1,7 @@
 // edn.cpp - Clean IR emitter implementation (fully rewritten after corruption)
 #include "edn/edn.hpp"
 #include "edn/ir_emitter.hpp"
+#include "edn/ir/resolver.hpp"
 #include "edn/generics.hpp"
 #include "edn/traits.hpp"
 #include "edn/diagnostics_json.hpp"
@@ -12,7 +13,7 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/Verifier.h>
-#include <llvm/IR/DIBuilder.h>
+// Debug info specifics now encapsulated in ir/di.* helpers; avoid direct DIBuilder usage here.
 #include <llvm/IR/DebugInfoMetadata.h>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/PassManager.h>
@@ -233,6 +234,7 @@ static bool installFatalHandlerIfRequested() {
 			if (fname.empty() || !body)
 				continue;
 			std::vector<TypeId> paramIds;
+			paramIds.reserve(params.size());
 			for (auto &pr : params)
 				paramIds.push_back(pr.second);
 			// Determine variadic flag by re-parsing :vararg from function list (cheap scan)
@@ -248,10 +250,11 @@ static bool installFatalHandlerIfRequested() {
 			}
 			if (isExternal)
 			{ // emit declaration only (skip body even if mistakenly present)
-				std::vector<TypeId> paramIds;
+				std::vector<TypeId> extParamIds;
+				extParamIds.reserve(params.size());
 				for (auto &pr : params)
-					paramIds.push_back(pr.second);
-				auto ftyId = tctx_.get_function(paramIds, retTy, isVariadic);
+					extParamIds.push_back(pr.second);
+				auto ftyId = tctx_.get_function(extParamIds, retTy, isVariadic);
 				{
 					llvm::Type* rawTy = map_type(ftyId);
 					if(!llvm::isa<llvm::FunctionType>(rawTy)) {
@@ -281,9 +284,9 @@ static bool installFatalHandlerIfRequested() {
 			// Function-level debug info (skeleton via di module)
 			if (enableDebugInfo)
 			{
-				unsigned fnLine = edn::line(*fl[0]);
+				unsigned fnLine = static_cast<unsigned>(edn::line(*fl[0]));
 				auto *SP = edn::ir::di::attach_function_debug(*debug_manager_, *F, fname, retTy, params, fnLine);
-				if(!SP) { fprintf(stderr, "[dbg] attach_function_debug returned null for %s (enable=%d, DIB=%p, File=%p)\n", fname.c_str(), (int)debug_manager_->enableDebugInfo, debug_manager_->DIB.get(), debug_manager_->DI_File); }
+				if(!SP) { fprintf(stderr, "[dbg] attach_function_debug returned null for %s (enable=%d, DIB=%p, File=%s)\n", fname.c_str(), (int)debug_manager_->enableDebugInfo, (void*)debug_manager_->DIB.get(), debug_manager_->DI_File ? debug_manager_->DI_File->getFilename().data() : "<null>"); }
 				else { fprintf(stderr, "[dbg] attached DISubprogram for %s line=%u\n", fname.c_str(), fnLine); }
 			}
 			// If coroutines are enabled, mark functions as pre-split coroutine to use the Switch-Resumed ABI
@@ -321,44 +324,20 @@ static bool installFatalHandlerIfRequested() {
 			std::unordered_map<std::string, llvm::AllocaInst *> varSlots;
 			// Map initializer SSA names to their owning mutable variable (from `(as %dst <ty> %init)`)
 			std::unordered_map<std::string, std::string> initAlias;
-			auto ensureSlot = [&](const std::string &name, TypeId ty, bool initFromCurrent) -> llvm::AllocaInst *
-			{
-				auto it = varSlots.find(name);
-				if (it != varSlots.end())
-					return it->second;
-				// Place allocas in the entry block for canonical form
-				llvm::IRBuilder<> eb(&*entry->getFirstInsertionPt());
-				auto *slot = eb.CreateAlloca(map_type(ty), nullptr, name + ".slot");
-				varSlots[name] = slot;
-				// Record the value type of the slot's contents
-				vtypes[name] = ty;
-				// Optionally initialize the slot with any existing SSA value for this name
-				if (initFromCurrent)
-				{
-					auto itv = vmap.find(name);
-					if (itv != vmap.end() && itv->second)
-					{
-						builder.CreateStore(itv->second, slot);
-					}
-				}
-				return slot;
+			// Track defining EDN nodes for values (used to recompute conditions each iteration)
+			std::unordered_map<std::string, node_ptr> defNode;
+			// Legacy ensureSlot replaced by resolver::ensure_slot; keep capture glue until full refactor done.
+			auto ensureSlot = [&](const std::string &name, TypeId ty, bool initFromCurrent) -> llvm::AllocaInst * {
+				edn::ir::builder::State tmpState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+				return edn::ir::resolver::ensure_slot(tmpState, name, ty, initFromCurrent);
 			};
-			if (enableDebugInfo)
-			{
-				if (auto *SP = F->getSubprogram()) {
-					builder.SetCurrentDebugLocation(llvm::DILocation::get(F->getContext(), SP->getLine(), 1, SP));
-				} else {
-					fprintf(stderr, "[dbg] no subprogram at param emission for %s\n", fname.c_str());
-				}
-				edn::ir::di::emit_parameter_debug(*debug_manager_, *F, builder, vtypes);
-			}
+			if (enableDebugInfo) { edn::ir::di::setup_function_entry_debug(*debug_manager_, *F, builder, vtypes); }
 			llvm::Value *lastCoroIdTok = nullptr;			   // holds last coro.id token for ops that need it
 			std::vector<llvm::BasicBlock *> loopEndStack;	   // for break targets (end blocks)
 			std::vector<llvm::BasicBlock *> loopContinueStack; // for continue targets (condition re-check or step blocks)
 			size_t cfCounter = 0;
 			bool functionDone = false;
-			// Track defining EDN nodes for values (used to recompute conditions each iteration)
-			std::unordered_map<std::string, node_ptr> defNode;
+			// (moved defNode declaration earlier so lambdas can capture it)
 			// Reusable Windows SEH cleanup funclet block (created on first use)
 			llvm::BasicBlock *sehCleanupBB = nullptr;
 			// Stack of active SEH exception targets (catch dispatch blocks)
@@ -383,111 +362,18 @@ static bool installFatalHandlerIfRequested() {
 					if (!std::holds_alternative<symbol>(il[0]->data))
 						continue;
 					std::string op = std::get<symbol>(il[0]->data).name;
-					auto getVal = [&](const node_ptr &n) -> llvm::Value *
-					{
-						std::string nm = trimPct(symName(n));
-						if (nm.empty())
-							return nullptr;
-						// If this name was an initializer to an `as`-declared variable, redirect to that variable
-						auto loadFromAliasedVar = [&](const std::string &key) -> llvm::Value *
-						{
-							auto aIt = initAlias.find(key);
-							if (aIt == initAlias.end())
-								return (llvm::Value *)nullptr;
-							const std::string &var = aIt->second;
-							// Prefer loading from the variable's slot
-							if (auto s2 = varSlots.find(var); s2 != varSlots.end())
-							{
-								auto t2 = vtypes.find(var);
-								if (t2 == vtypes.end())
-									return (llvm::Value *)nullptr;
-								return builder.CreateLoad(map_type(t2->second), s2->second, var);
-							}
-							// Fallback to any SSA value registered for the variable
-							if (auto vv = vmap.find(var); vv != vmap.end())
-								return vv->second;
-							return (llvm::Value *)nullptr;
-						};
-						if (auto aliased = loadFromAliasedVar(nm))
-							return aliased;
-						// Try common synthesized suffixes used for constants/temps
-						auto normalized = nm;
-						auto stripSuffix = [&](const char *suf)
-						{ size_t L = strlen(suf); if(normalized.size()>=L && normalized.rfind(suf)==normalized.size()-L) normalized.resize(normalized.size()-L); };
-						stripSuffix(".cst.load");
-						stripSuffix(".load");
-						stripSuffix(".cst.tmp");
-						stripSuffix(".tmp");
-						if (normalized != nm)
-						{
-							if (auto aliased2 = loadFromAliasedVar(normalized))
-								return aliased2;
-						}
-						// If this name has a stack slot, always load from it
-						auto sIt = varSlots.find(nm);
-						if (sIt != varSlots.end())
-						{
-							auto tIt = vtypes.find(nm);
-							if (tIt == vtypes.end())
-								return nullptr;
-							return builder.CreateLoad(map_type(tIt->second), sIt->second, nm);
-						}
-						auto it = vmap.find(nm);
-						return (it != vmap.end()) ? it->second : nullptr;
+					auto getVal = [&](const node_ptr &n) -> llvm::Value * {
+							edn::ir::builder::State tmpState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+						return edn::ir::resolver::get_value(tmpState, n);
 					};
 					// Attempt to recompute value from its defining EDN node (limited set: eq/ne/lt/gt/le/ge, and/or/xor)
-					auto evalDefined = [&](const std::string &name) -> llvm::Value *
-					{
-						auto it = defNode.find(name);
-						if (it == defNode.end())
-							return nullptr;
-						auto dn = it->second;
-						if (!dn || !std::holds_alternative<list>(dn->data))
-							return nullptr;
-						auto &dl = std::get<list>(dn->data).elems;
-						if (dl.empty() || !std::holds_alternative<symbol>(dl[0]->data))
-							return nullptr;
-						std::string dop = std::get<symbol>(dl[0]->data).name;
-						auto valOf = [&](size_t idx) -> llvm::Value *
-						{ if(idx>=dl.size()) return nullptr; return getVal(dl[idx]); };
-						if ((dop == "eq" || dop == "ne" || dop == "lt" || dop == "gt" || dop == "le" || dop == "ge") && dl.size() == 5)
-						{
-							llvm::Value *va = valOf(3);
-							llvm::Value *vb = valOf(4);
-							if (!va || !vb)
-								return nullptr;
-							llvm::CmpInst::Predicate P = llvm::CmpInst::ICMP_EQ;
-							if (dop == "eq")
-								P = llvm::CmpInst::ICMP_EQ;
-							else if (dop == "ne")
-								P = llvm::CmpInst::ICMP_NE;
-							else if (dop == "lt")
-								P = llvm::CmpInst::ICMP_SLT;
-							else if (dop == "gt")
-								P = llvm::CmpInst::ICMP_SGT;
-							else if (dop == "le")
-								P = llvm::CmpInst::ICMP_SLE;
-							else
-								P = llvm::CmpInst::ICMP_SGE;
-							return builder.CreateICmp(P, va, vb, name + ".re");
-						}
-						if ((dop == "and" || dop == "or" || dop == "xor") && dl.size() == 5)
-						{
-							llvm::Value *va = valOf(3);
-							llvm::Value *vb = valOf(4);
-							if (!va || !vb)
-								return nullptr;
-							if (dop == "and")
-								return builder.CreateAnd(va, vb, name + ".re");
-							if (dop == "or")
-								return builder.CreateOr(va, vb, name + ".re");
-							return builder.CreateXor(va, vb, name + ".re");
-						}
-						return nullptr;
+					auto evalDefined = [&](const std::string &name) -> llvm::Value * {
+							edn::ir::builder::State tmpState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+						return edn::ir::resolver::eval_defined(tmpState, name);
 					};
 
 						// Create a shared builder::State reused across most dispatch handlers to reduce duplication
-						edn::ir::builder::State sharedState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+						edn::ir::builder::State sharedState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}}; // lexicalDepth/shadowSlots default
 						// --- Dispatch extracted core ops (integer/float arith, bitwise, shifts, ptr math) ---
 						{
 							edn::ir::builder::State &S = sharedState;
@@ -583,7 +469,7 @@ static bool installFatalHandlerIfRequested() {
 
 						else if (op == "panic" && il.size() == 1)
 						{
-							edn::ir::exception_ops::Context EC{sharedState, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> &nodes) { /* unused here */ }};
+							edn::ir::exception_ops::Context EC{sharedState, builder, *llctx_, *module_, F, enableDebugInfo, panicUnwind, enableEHItanium, enableEHSEH, selectedPersonality, cfCounter, sehExceptTargetStack, itnExceptTargetStack, sehCleanupBB, [&](const std::vector<edn::node_ptr> & /*nodes*/) { /* unused */ }};
 							if (edn::ir::exception_ops::handle_panic(EC, il))
 								continue;
 						}
@@ -611,7 +497,7 @@ static bool installFatalHandlerIfRequested() {
 			emit_list(std::get<vector_t>(body->data).elems, emit_list);
 			// Realize pending phi nodes now that all basic blocks exist.
 			edn::ir::builder::State S_finalize{builder, *llctx_, *module_, tctx_, [&](TypeId id)
-											   { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_};
+											   { return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
 			edn::ir::phi_ops::finalize(S_finalize, pendingPhis, F, [&](TypeId id)
 									   { return map_type(id); });
 			if (!entry->getTerminator())
@@ -637,18 +523,18 @@ static bool installFatalHandlerIfRequested() {
 				}
 			}
 		}
-		if(enableDebugInfo){ std::cerr << "[dbg][finalize] about to DIBuilder::finalize() module=" << module_.get() << "\n"; }
-		edn::ir::debug_pipeline::finalize_debug(debug_manager_, enableDebugInfo);
-		if(enableDebugInfo){ std::cerr << "[dbg][finalize] completed DIBuilder::finalize() module=" << module_.get() << "\n"; }
-		// Fallback: ensure ShowVT vtable struct exists for ABI golden test even if trait expansion pruned it
-		{
+		// Centralized finalize now handled via di helper (with logging)
+		edn::ir::di::finalize_module_debug(*debug_manager_, enableDebugInfo);
+		// Fallback: ensure ShowVT vtable struct exists for ABI golden test even if trait expansion pruned it.
+		// Now gated by EDN_FORCE_SHOWVT_FALLBACK=1 to avoid polluting unrelated modules.
+		if(const char* forceShowVT = std::getenv("EDN_FORCE_SHOWVT_FALLBACK"); forceShowVT && (forceShowVT[0]=='1'||forceShowVT[0]=='y'||forceShowVT[0]=='Y'||forceShowVT[0]=='t'||forceShowVT[0]=='T')) {
 			std::string vtName = "struct.ShowVT";
 			auto *st = llvm::StructType::getTypeByName(*llctx_, vtName);
 			if(!st) {
 				st = llvm::StructType::create(*llctx_, vtName);
 				std::vector<llvm::Type*> flds; flds.push_back(llvm::PointerType::getUnqual(llvm::Type::getInt8Ty(*llctx_)));
 				st->setBody(flds, /*packed*/false);
-				if(enableDebugInfo) { std::cerr << "[dbg][vt-fallback] created %struct.ShowVT type body\n"; }
+				if(enableDebugInfo) { std::cerr << "[dbg][vt-fallback] created %struct.ShowVT type body (gated)\n"; }
 			}
 			// Ensure the type is actually referenced so it prints in IR: add an internal global if absent
 			const char *globalName = "__edn.showvt.fallback";
@@ -656,7 +542,7 @@ static bool installFatalHandlerIfRequested() {
 				auto *init = llvm::ConstantAggregateZero::get(st);
 				(void) new llvm::GlobalVariable(*module_, st, /*isConstant*/false,
 									 llvm::GlobalValue::InternalLinkage, init, globalName);
-				if(enableDebugInfo) { std::cerr << "[dbg][vt-fallback] added global to force %struct.ShowVT emission\n"; }
+				if(enableDebugInfo) { std::cerr << "[dbg][vt-fallback] added global to force %struct.ShowVT emission (gated)\n"; }
 			}
 		}
 		edn::ir::debug_pipeline::run_pass_pipeline(*module_);

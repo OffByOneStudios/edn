@@ -29,8 +29,10 @@ void run_phase4_abi_golden_test()
     std::cout << "[phase4] ABI golden test (no verifier)...\n";
 #if defined(_WIN32)
     _putenv_s("EDN_ENABLE_PASSES", "0");
+    _putenv_s("EDN_FORCE_SHOWVT_FALLBACK", "1"); // ensure ShowVT struct emitted for golden test
 #else
     setenv("EDN_ENABLE_PASSES", "0", 1);
+    setenv("EDN_FORCE_SHOWVT_FALLBACK", "1", 1); // ensure ShowVT struct emitted for golden test
 #endif
     auto ast = parse(R"EDN(
         (module :id "abi"

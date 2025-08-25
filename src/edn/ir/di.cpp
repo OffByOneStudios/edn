@@ -4,6 +4,7 @@
 
 #include <llvm/IR/DIBuilder.h>
 #include <llvm/BinaryFormat/Dwarf.h>
+// Avoid iostream to reduce build dependencies; use fprintf(stderr, ...) instead.
 
 namespace edn::ir::di {
 
@@ -16,7 +17,7 @@ llvm::DISubprogram* attach_function_debug(debug::DebugManager& dbg,
 {
     if(!dbg.enableDebugInfo || !dbg.DIB || !dbg.DI_File)
         return nullptr;
-    if(lineNo == 0) lineNo = 1;
+    if(lineNo == 0) lineNo = ++dbg.pseudoLineCounter;
     // Build signature (return type + param types)
     std::vector<llvm::Metadata*> sigTys;
     sigTys.push_back(static_cast<llvm::Metadata*>(dbg.diTypeOf(retTy))); // may be nullptr for void
@@ -67,15 +68,43 @@ void declare_local(debug::DebugManager& dbg,
                    edn::TypeId ty,
                    unsigned lineNo)
 {
-    if(!dbg.enableDebugInfo || !dbg.DIB) return; // skeleton: unimplemented detailed local semantics
-    if(auto *SP = builder.GetInsertBlock()->getParent()->getSubprogram()){
-        if(lineNo == 0) lineNo = SP->getLine();
-        llvm::DIType* diTy = dbg.diTypeOf(ty);
+    if(!dbg.enableDebugInfo || !dbg.DIB) return;
+    auto *IB = builder.GetInsertBlock(); if(!IB) return;
+    auto *F = IB->getParent(); if(!F) return;
+    auto *SP = F->getSubprogram(); if(!SP) return;
+    if(lineNo == 0) lineNo = ++dbg.pseudoLineCounter;
+    llvm::DIType* diTy = dbg.diTypeOf(ty);
     auto *scope = dbg.currentScope();
     auto *var = dbg.DIB->createAutoVariable(scope ? scope : SP, name, dbg.DI_File, lineNo, diTy, true);
-        auto *expr = dbg.DIB->createExpression();
-        dbg.DIB->insertDbgValueIntrinsic(value, var, expr, builder.getCurrentDebugLocation(), builder.GetInsertBlock());
+    auto *expr = dbg.DIB->createExpression();
+    // Heuristic: if value is an alloca or pointer to stack slot, use dbg.declare (addressable variable)
+    if(!builder.getCurrentDebugLocation()) {
+        // Synthesize a location so DIBuilder does not assert; column set to 1
+        builder.SetCurrentDebugLocation(llvm::DILocation::get(SP->getContext(), lineNo, 1, scope ? scope : SP));
     }
+    if(llvm::isa<llvm::AllocaInst>(value)) {
+        dbg.DIB->insertDeclare(value, var, expr, builder.getCurrentDebugLocation(), IB);
+    } else {
+        dbg.DIB->insertDbgValueIntrinsic(value, var, expr, builder.getCurrentDebugLocation(), IB);
+    }
+}
+
+void setup_function_entry_debug(debug::DebugManager& dbg,
+                                llvm::Function& F,
+                                llvm::IRBuilder<>& builder,
+                                const std::unordered_map<std::string, edn::TypeId>& vtypes) {
+    if(!dbg.enableDebugInfo || !F.getSubprogram()) return;
+    if(auto *SP = F.getSubprogram()) {
+        builder.SetCurrentDebugLocation(llvm::DILocation::get(F.getContext(), SP->getLine(), 1, SP));
+    }
+    emit_parameter_debug(dbg, F, builder, vtypes);
+}
+
+void finalize_module_debug(debug::DebugManager& dbg, bool enable) {
+    if(!enable) return;
+    if(enable){ fprintf(stderr, "[dbg][finalize] about to DIBuilder::finalize() dbg=%p DIB=%p\n", (void*)&dbg, (void*)dbg.DIB.get()); }
+    if(dbg.DIB) dbg.DIB->finalize();
+    if(enable){ fprintf(stderr, "[dbg][finalize] completed DIBuilder::finalize() dbg=%p DIB=%p\n", (void*)&dbg, (void*)dbg.DIB.get()); }
 }
 
 } // namespace edn::ir::di

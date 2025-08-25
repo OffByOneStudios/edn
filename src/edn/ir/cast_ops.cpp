@@ -16,7 +16,7 @@ bool handle(builder::State& S, const std::vector<edn::node_ptr>& il){
     if(op!="zext" && op!="sext" && op!="trunc" && op!="bitcast" && op!="sitofp" && op!="uitofp" && op!="fptosi" && op!="fptoui" && op!="ptrtoint" && op!="inttoptr") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId toTy; try{ toTy = S.tctx.parse_type(il[2]); }catch(...){ return false; }
-    auto *srcV = builder::get_value(S, il[3]); if(!srcV) return false;
+    auto *srcV = edn::ir::resolver::get_value(S, il[3]); if(!srcV) return false;
     llvm::Type* llvmTo = S.map_type(toTy);
     // If constant, load via temporary alloca to avoid constant folding corner cases that legacy path handled.
     if(llvm::isa<llvm::Constant>(srcV)){

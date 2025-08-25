@@ -30,15 +30,49 @@ struct State {
     std::unordered_map<std::string, edn::node_ptr>& defNode;
 
     std::shared_ptr<edn::ir::debug::DebugManager> debug_manager;
+
+    // --- Shadowing support --------------------------------------------------
+    // Current lexical depth (0 = function body). Managed in tandem with DebugManager scope pushes.
+    int lexicalDepth = 0;
+    // For each variable name, stack of shadowed allocas/values with the depth they were declared.
+    struct ShadowEntry { int depth; llvm::AllocaInst* slot; edn::TypeId ty; };
+    std::unordered_map<std::string, std::vector<ShadowEntry>> shadowSlots;
 };
 
-// Resolve a node to an LLVM Value*, respecting variable slots and initializer aliases.
-llvm::Value* get_value(State& S, const edn::node_ptr& n);
+// Unwind shadow slots when leaving a lexical scope (after State.lexicalDepth already decremented)
+inline void unwind_scope(State& S){
+    int depth = S.lexicalDepth;
+    for(auto it = S.shadowSlots.begin(); it != S.shadowSlots.end();){
+        auto &vec = it->second;
+        while(!vec.empty() && vec.back().depth > depth) vec.pop_back();
+        if(vec.empty()){
+            S.varSlots.erase(it->first);
+            S.vmap.erase(it->first);
+            S.vtypes.erase(it->first);
+            it = S.shadowSlots.erase(it);
+        } else {
+            // Restore latest visible shadow
+            auto &ent = vec.back();
+            S.varSlots[it->first] = ent.slot;
+            S.vmap[it->first] = ent.slot; // pointer (alloca)
+            S.vtypes[it->first] = S.tctx.get_pointer(ent.ty);
+            ++it;
+        }
+    }
+}
 
-// Like get_value, but prefers loading from variable slots when possible, even if an SSA value exists.
+// Forward declarations (implemented in resolver).
+} // namespace edn::ir::builder
+
+namespace edn::ir::resolver {
+    // Forward declarations only (implemented out-of-line in resolver.cpp). No inline bodies here.
+    llvm::Value* get_value(edn::ir::builder::State& S, const edn::node_ptr& n);
+    llvm::Value* eval_defined(edn::ir::builder::State& S, const std::string& name);
+}
+
+namespace edn::ir::builder {
+
+// Transitional wrappers removed: call edn::ir::resolver::get_value / eval_defined directly.
 llvm::Value* resolve_preferring_slots(State& S, const edn::node_ptr& n);
-
-// Attempt to recompute a named SSA value from its defining EDN node (subset of ops).
-llvm::Value* eval_defined(State& S, const std::string& name);
 
 } // namespace edn::ir::builder

@@ -415,9 +415,9 @@ struct action< let_stmt > {
         // consume 'let'
         if(s.compare(i,3,"let")!=0) return; i+=3; ltrim(s,i);
         // optional 'mut'
-        bool is_mut = false;
         if(i+3 <= s.size() && s.compare(i,3,"mut")==0){
-            i += 3; ltrim(s,i); is_mut = true;
+            // 'mut' currently parsed but unused; advance position only
+            i += 3; ltrim(s,i);
         }
         // name
         auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i);

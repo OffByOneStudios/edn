@@ -34,6 +34,7 @@ namespace edn::ir::debug
         std::unique_ptr<llvm::DIBuilder> DIB;
         llvm::DIFile *DI_File;
     bool skipPayloadArrayDI = false; // diagnostic: optionally skip DI for sum payload array field
+    unsigned pseudoLineCounter = 1; // monotonic pseudo line numbers for lack of real source mapping
 
     public:
         std::unordered_map<edn::TypeId, llvm::DIType *> DITypeCache;

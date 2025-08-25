@@ -461,8 +461,11 @@ namespace edn
     inline std::string to_pretty_string(const node &n, int indentWidth)
     {
         // helper lambdas
-        auto indentStr = [](int n)
-        { return std::string(n, ' '); };
+        auto indentStr = [](int n) -> std::string
+        {
+            if(n < 0) n = 0; // clamp
+            return std::string(static_cast<size_t>(n), ' ');
+        };
         std::function<std::string(const node &, int)> pp = [&](const node &x, int indent)
         {
             if (std::holds_alternative<std::monostate>(x.data))

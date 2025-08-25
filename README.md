@@ -11,6 +11,9 @@ Header-only EDN parser & experimental LLVM-oriented IR (+ type checker, diagnost
 - Multi-phase language growth (Phases 1–3, plus experimental Phase 4 and Phase 5 prototypes) with stable error codes & structured notes
 - JSON diagnostics export (`EDN_DIAG_JSON=1`)
 
+### Phase 4 Status (Port & Parity)
+Phase 4 modularization & parity work is complete on macOS: resolver unification, modular IR emitter split, structured debug info (scopes, shadowed locals, struct & match binding offsets), coroutine minimal & suspend/final-suspend tests, panic unwind (Itanium & SEH model code paths), pass pipeline + IR verification toggles, JIT smoke tests, and ShowVT fallback gating. Remaining deferred follow-up: Windows validation of SEH / personality selection (tracked separately). Build is warning-free under strict flags (`EDN_STRICT_WARNINGS=ON`) and duplicate LLVM link libraries have been pruned. See `docs/DEBUG_INFO.md` for design details.
+
 ### IR Instruction Set (Phases 1–3)
 
 The embedded experimental IR supports these instruction forms (EDN list syntax):

@@ -5,6 +5,8 @@ project(edn LANGUAGES C CXX VERSION 0.0.1)
 option(EDN_BUILD_TESTS "Build tests" ON)
 # Bring-up knob: when ON on Apple, we can selectively disable later-phase tests by default
 option(EDN_ENABLE_COVERAGE "Enable LLVM source-based code coverage (clang -fprofile-instr-generate -fcoverage-mapping)" OFF)
+option(EDN_STRICT_WARNINGS "Enable strict compiler warnings" ON)
+option(EDN_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 
 
 # MSVC: ensure exception handling (unwind semantics) is enabled to avoid C4530 warnings
@@ -32,6 +34,7 @@ add_library(edn STATIC
     src/edn/ir/exceptions.cpp
     src/edn/ir/collect.cpp
     src/edn/ir/builder.cpp
+    src/edn/ir/function_builder.cpp
     src/edn/ir/core_ops.cpp
     src/edn/ir/memory_ops.cpp
     src/edn/ir/sum_ops.cpp
@@ -51,6 +54,8 @@ add_library(edn STATIC
     src/edn/ir/return_ops.cpp
     # Newly extracted simple flow constructs (block locals/body)
     src/edn/ir/flow_ops.cpp
+    # New centralized resolver for value/slot management
+    src/edn/ir/resolver.cpp
     src/edn/ir/debug_pipeline.cpp
     src/edn/ir/di.cpp)
 
@@ -67,6 +72,26 @@ if(NOT MSVC)
 endif()
 
 target_compile_features(edn PUBLIC cxx_std_20)
+
+# Apply warning flags (library + consumers inherit PUBLIC when appropriate)
+if(EDN_STRICT_WARNINGS)
+    if(MSVC)
+        target_compile_options(edn PUBLIC /W4)
+        if(EDN_WARNINGS_AS_ERRORS)
+            target_compile_options(edn PUBLIC /WX)
+        endif()
+    else()
+        target_compile_options(edn PUBLIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion)
+        if(EDN_WARNINGS_AS_ERRORS)
+            target_compile_options(edn PUBLIC -Werror)
+        endif()
+    endif()
+endif()
+
+# Suppress noisy duplicate library warnings on macOS (seen with LLVM component linkage)
+if(APPLE)
+    add_link_options(-Wno-ignored-duplicate-libraries)
+endif()
 
 # Coverage instrumentation (only when explicitly enabled and using Clang/AppleClang)
 if(EDN_ENABLE_COVERAGE)
@@ -101,7 +126,12 @@ elseif(WIN32)
 elseif(UNIX)
     list(APPEND LLVM_COMPONENTS X86)
 endif()
+
+
+
 llvm_map_components_to_libnames(llvm_libs ${LLVM_COMPONENTS})
+
+
 target_link_libraries(edn PUBLIC ${llvm_libs})
 
 if(TARGET fmt::fmt)
@@ -167,11 +197,13 @@ add_subdirectory(benchmarks)
 
 # Tools
 add_executable(phase1_driver tools/phase1_driver.cpp)
-target_link_libraries(phase1_driver PRIVATE edn ${llvm_libs})
+# Link only against edn; LLVM libs already propagated transitively via edn's PUBLIC link interface
+target_link_libraries(phase1_driver PRIVATE edn)
 target_compile_features(phase1_driver PRIVATE cxx_std_20)
 
 add_executable(phase3_driver tools/phase3_driver.cpp)
-target_link_libraries(phase3_driver PRIVATE edn ${llvm_libs})
+# Link only against edn; avoid duplicate LLVM libs on link line
+target_link_libraries(phase3_driver PRIVATE edn)
 target_compile_features(phase3_driver PRIVATE cxx_std_20)
 
 # Languages (prototype front-ends)

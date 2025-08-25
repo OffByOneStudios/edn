@@ -40,4 +40,16 @@ void declare_local(debug::DebugManager& dbg,
                    edn::TypeId ty,
                    unsigned lineNo);
 
+// Combined helper: set the builder's current debug location to the function's
+// DISubprogram line and emit parameter debug intrinsics in one call.
+// Safe to call when debug disabled (no-op). vtypes maps parameter names to TypeId.
+void setup_function_entry_debug(debug::DebugManager& dbg,
+                                llvm::Function& F,
+                                llvm::IRBuilder<>& builder,
+                                const std::unordered_map<std::string, edn::TypeId>& vtypes);
+
+// Finalize module-level debug info (DIBuilder::finalize) with diagnostic logging.
+// Centralizes finalize logging previously inline in edn.cpp.
+void finalize_module_debug(debug::DebugManager& dbg, bool enable);
+
 } // namespace edn::ir::di

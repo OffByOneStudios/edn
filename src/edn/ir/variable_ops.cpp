@@ -1,6 +1,7 @@
 #include "edn/ir/variable_ops.hpp"
 #include "edn/ir/types.hpp"
 #include "edn/ir/debug.hpp"
+#include "edn/ir/di.hpp"
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>
 
@@ -43,13 +44,10 @@ bool handle_as(builder::State& S, const std::vector<edn::node_ptr>& il,
             initAlias[initName]=dst; S.vmap[initName]=loaded; S.vtypes[initName]=ty;
         }
     }
-    if(enableDebugInfo && F && F->getSubprogram() && dbgMgr && dbgMgr->DIB){
-        unsigned line = S.builder.getCurrentDebugLocation()? S.builder.getCurrentDebugLocation()->getLine() : F->getSubprogram()->getLine();
-        // Prefer dbg.declare for allocas (addressable locals)
-        auto *scope = dbgMgr->currentScope();
-        auto *lv = dbgMgr->DIB->createAutoVariable(scope ? scope : F->getSubprogram(), dst, dbgMgr->DI_File, line, dbgMgr->diTypeOf(ty));
-        auto *expr = dbgMgr->DIB->createExpression();
-        (void)dbgMgr->DIB->insertDeclare(slot, lv, expr, S.builder.getCurrentDebugLocation(), S.builder.GetInsertBlock());
+    if(enableDebugInfo && F && dbgMgr){
+        // Use centralized helper; future logic (declare vs value) lives there
+        di::declare_local(*dbgMgr, S.builder, slot, dst, ty,
+                          S.builder.getCurrentDebugLocation()? S.builder.getCurrentDebugLocation()->getLine() : (F->getSubprogram()? F->getSubprogram()->getLine() : 1));
     }
     return true;
 }

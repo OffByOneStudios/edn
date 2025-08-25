@@ -19,6 +19,7 @@ set(EDN_TESTS_CORE
 )
 if(EDN_BUILD_TESTS_CORE)
 add_executable(edn_tests_core ${EDN_TESTS_CORE} ${CMAKE_CURRENT_SOURCE_DIR}/core_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/test_env.cpp)
+# Link only against edn; LLVM libs are already transitively linked
 target_link_libraries(edn_tests_core PRIVATE edn)
 target_compile_features(edn_tests_core PRIVATE cxx_std_20)
 target_compile_definitions(edn_tests_core PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")

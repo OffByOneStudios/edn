@@ -12,7 +12,7 @@ using namespace edn;
 
 static std::string read_all(const std::filesystem::path& p){
     std::ifstream ifs(p, std::ios::binary); if(!ifs) return {};
-    std::string s; ifs.seekg(0,std::ios::end); s.resize((size_t)ifs.tellg()); ifs.seekg(0); ifs.read(&s[0], s.size()); return s;
+    std::string s; ifs.seekg(0,std::ios::end); auto sz = ifs.tellg(); if(sz < 0) return {}; size_t usz = static_cast<size_t>(sz); s.resize(usz); ifs.seekg(0); if(usz>0) ifs.read(&s[0], static_cast<std::streamsize>(usz)); return s;
 }
 
 void run_phase3_examples_smoke(){
