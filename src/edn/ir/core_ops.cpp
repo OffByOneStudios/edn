@@ -1,9 +1,13 @@
 #include "edn/ir/core_ops.hpp"
 #include "edn/ir/layout.hpp"
 #include "edn/ir/types.hpp"
+#include "edn/ir/resolver.hpp"
 
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
+
+// Force rebuild marker (EDN-0001 slot-preference iteration). If this comment is present,
+// core_ops.cpp has been recompiled after integer arithmetic operand resolution changes.
 
 namespace edn::ir::core_ops {
 
@@ -25,8 +29,76 @@ bool handle_integer_arith(builder::State& S, const std::vector<edn::node_ptr>& i
     if(op!="add" && op!="sub" && op!="mul" && op!="sdiv" && op!="udiv" && op!="srem" && op!="urem") return false;
     std::string dst = trimPct(symName(il[1])); if(dst.empty()) return false;
     edn::TypeId ty{}; try{ ty = S.tctx.parse_type(il[2]); }catch(...){ return false; }
-    auto *va = builder::resolve_preferring_slots(S, il[3]);
-    auto *vb = builder::resolve_preferring_slots(S, il[4]);
+    auto resolveOperand = [&](const edn::node_ptr& n)->llvm::Value*{
+        if(n && std::holds_alternative<edn::symbol>(n->data)){
+            std::string name = trimPct(std::get<edn::symbol>(n->data).name);
+            if(!name.empty()){
+                if(auto vsIt = S.varSlots.find(name); vsIt != S.varSlots.end()){
+                    auto tyIt = S.vtypes.find(name);
+                    if(tyIt != S.vtypes.end()){
+                        if(const char* dbg2 = std::getenv("EDN_DEBUG_ARITH")){
+                            fprintf(stderr, "[arith][slot-load] sym=%s tyId=%llu slot=%p depth=%d\n", name.c_str(), (unsigned long long)tyIt->second, (void*)vsIt->second, S.lexicalDepth);
+                        }
+                        return S.builder.CreateLoad(S.map_type(tyIt->second), vsIt->second, name);
+                    } else if(const char* dbg3 = std::getenv("EDN_DEBUG_ARITH")) {
+                        fprintf(stderr, "[arith][slot-has-no-type] sym=%s slot=%p\n", name.c_str(), (void*)vsIt->second);
+                    }
+                } else if(const char* dbg4 = std::getenv("EDN_DEBUG_ARITH")) {
+                    fprintf(stderr, "[arith][no-slot] sym=%s vtypeKnown=%d varSlots.size=%zu -> keys:", name.c_str(), (int)S.vtypes.count(name), S.varSlots.size());
+                    size_t shown=0; for(auto &kv : S.varSlots){ if(shown<8) fprintf(stderr, " %s", kv.first.c_str()); else { fprintf(stderr, " ..."); break;} ++shown; }
+                    fprintf(stderr, "\n");
+                    // EDN-0001: Lazy slot promotion. If this appears to be a user variable (not internal __rl_ prefix)
+                    // with a current SSA value, promote it to a slot so subsequent mutations operate on memory.
+                    if(!name.empty() && !S.varSlots.count(name) && S.vmap.count(name) && !S.vtypes.empty() && name.rfind("__rl_",0)!=0){
+                        auto tIt = S.vtypes.find(name);
+                        if(tIt != S.vtypes.end()){
+                            if(const char* dbgProm = std::getenv("EDN_DEBUG_ARITH")) fprintf(stderr, "[arith][promote-slot] sym=%s tyId=%llu\n", name.c_str(), (unsigned long long)tIt->second);
+                            // Allocate slot at entry and initialize from current SSA value.
+                            auto *slot = resolver::ensure_slot(S, name, tIt->second, /*initFromCurrent=*/true);
+                            if(slot){
+                                // Replace current SSA value with a load to keep consistency.
+                                auto *loaded = S.builder.CreateLoad(S.map_type(tIt->second), slot, name);
+                                S.vmap[name] = loaded;
+                                return loaded; // Use loaded value as operand immediately.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if(const char* dbg5 = std::getenv("EDN_DEBUG_ARITH")){
+            if(n && std::holds_alternative<edn::symbol>(n->data)){
+                fprintf(stderr, "[arith][resolver-fallback] sym=%s\n", trimPct(std::get<edn::symbol>(n->data).name).c_str());
+            }
+        }
+        return resolver::get_value(S, n);
+    };
+    auto *va = resolveOperand(il[3]);
+    auto *vb = resolveOperand(il[4]);
+    // EDN-0001: If either operand corresponds to a promoted variable but we still captured its
+    // pre-promotion constant (e.g. %__rl_c26.cst.load), attempt a second resolution pass now that
+    // the slot exists to force a load from the slot.
+    auto refreshIfPromoted = [&](llvm::Value* &v, const edn::node_ptr& src){
+        if(!src || !std::holds_alternative<edn::symbol>(src->data)) return;
+        std::string name = trimPct(std::get<edn::symbol>(src->data).name);
+        if(name.empty()) return;
+        if(S.varSlots.count(name)){
+            // Re-load from slot to avoid stale constant folding of initializer inside loops.
+            auto tIt = S.vtypes.find(name);
+            if(tIt!=S.vtypes.end()){
+                if(const char* dbg2 = std::getenv("EDN_DEBUG_ARITH")) fprintf(stderr, "[arith][refresh-slot] sym=%s\n", name.c_str());
+                v = S.builder.CreateLoad(S.map_type(tIt->second), S.varSlots[name], name);
+            }
+        }
+    };
+    refreshIfPromoted(va, il[3]);
+    refreshIfPromoted(vb, il[4]);
+    if(const char* dbg = std::getenv("EDN_DEBUG_ARITH")){
+        (void)dbg;
+        if(va && vb){
+            fprintf(stderr, "[arith] op=%s dst=%s lhs.ty=%u rhs.ty=%u\n", op.c_str(), dst.c_str(), (unsigned)va->getType()->getTypeID(), (unsigned)vb->getType()->getTypeID());
+        }
+    }
     if(!va||!vb) return false;
     llvm::Value* r=nullptr;
     if(op=="add") r=S.builder.CreateAdd(va,vb,dst);

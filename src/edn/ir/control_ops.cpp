@@ -93,6 +93,9 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
     // generic lexical block ------------------------------------------------
     // Syntax: (block [ ...body... ]) -- used for tests to force nested scopes
     if (isOp(il, "block")) {
+        // If this is the keyword-based form (block :body [...]) or (block :locals [...] :body [...])
+        // let flow_ops::handle_block process it. We only handle the simple legacy form (block [ ... ]) here.
+        if (il.size() >= 2 && il[1] && std::holds_alternative<keyword>(il[1]->data)) return false; // delegate
         if (il.size() >= 2 && il[1] && std::holds_alternative<vector_t>(il[1]->data)) {
             auto &body = std::get<vector_t>(il[1]->data).elems;
             if (C.S.debug_manager && C.S.debug_manager->enableDebugInfo)
@@ -106,6 +109,9 @@ bool handle(Context& C, const std::vector<node_ptr>& il) {
 
     // while ----------------------------------------------------------------
     if (isOp(il, "while")) {
+        if(const char* dbgLoop = std::getenv("EDN_DEBUG_TOP_EMIT"); dbgLoop && std::string(dbgLoop)=="1") {
+            fprintf(stderr, "[emit][control][while] entering while op=%s size=%zu\n", il.size()>=1 && il[0] && std::holds_alternative<symbol>(il[0]->data)? std::get<symbol>(il[0]->data).name.c_str():"?", il.size());
+        }
         if (il.size() >= 3 && std::holds_alternative<vector_t>(il[2]->data)) {
             auto *condBB = llvm::BasicBlock::Create(llctx, "while.cond." + std::to_string(C.cfCounter++), C.F);
             auto *bodyBB = llvm::BasicBlock::Create(llctx, "while.body." + std::to_string(C.cfCounter++), C.F);

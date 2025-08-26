@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 // IR context/env (centralized env parsing)
 #include "edn/ir/context.hpp"
@@ -271,6 +272,59 @@ static bool installFatalHandlerIfRequested() {
 				continue; // handled above
 			}
 			auto ftyId = tctx_.get_function(paramIds, retTy, isVariadic);
+			// EDN-0001 enhanced pre-pass: capture (as ...) and synthetic (const + bitcast) initializers.
+			std::vector<std::vector<node_ptr>> preHoistAsForms;
+			struct PendingBitcastInit { std::string var; TypeId ty; int64_t ival; double fval; bool isFP; };
+			std::vector<PendingBitcastInit> preHoistBitcasts;
+			// Map of variable -> pending synthetic initializer (const + bitcast pattern) for lazy backfill
+			// if eager pre-hoist is disabled or skipped. Populated during pre-hoist attempt/disable path.
+			std::unordered_map<std::string, PendingBitcastInit> syntheticInitMap;
+			// Persist const metadata so pre-hoist path can materialize literal stores even if the
+			// original (const ...) instruction hasn't executed yet.
+			struct PreConstInfo { TypeId ty; int64_t ival; double fval; bool isFP; };
+			std::unordered_map<std::string, PreConstInfo> preConstMap;
+			if(body && std::holds_alternative<vector_t>(body->data)){
+				struct ConstInfo { TypeId ty; int64_t ival; double fval; bool isFP; };
+				std::unordered_map<std::string, ConstInfo> constMap; // local gather then merge into preConstMap
+				// Pass 1: gather consts
+				for(auto &inst : std::get<vector_t>(body->data).elems){
+					if(const char* dbgScan = std::getenv("EDN_DEBUG_AS")){
+						if(inst && std::holds_alternative<list>(inst->data)){
+							auto &sil = std::get<list>(inst->data).elems;
+							if(!sil.empty() && sil[0] && std::holds_alternative<symbol>(sil[0]->data)){
+								fprintf(stderr, "[dbg][pre-pass][scan2] op=%s size=%zu\n", std::get<symbol>(sil[0]->data).name.c_str(), sil.size());
+							}
+						}
+					}
+					if(!inst || !std::holds_alternative<list>(inst->data)) continue;
+					auto &il = std::get<list>(inst->data).elems; if(il.size()!=4) continue;
+					if(!il[0] || !std::holds_alternative<symbol>(il[0]->data)) continue;
+					std::string op = std::get<symbol>(il[0]->data).name;
+					if(op=="const" && il[1] && std::holds_alternative<symbol>(il[1]->data)){
+						std::string cname = std::get<symbol>(il[1]->data).name; if(!cname.empty() && cname[0]=='%') cname.erase(0,1);
+						try { TypeId cty = tctx_.parse_type(il[2]); if(std::holds_alternative<int64_t>(il[3]->data)) constMap[cname] = ConstInfo{cty, std::get<int64_t>(il[3]->data),0.0,false}; else if(std::holds_alternative<double>(il[3]->data)) constMap[cname] = ConstInfo{cty,0,std::get<double>(il[3]->data),true}; } catch(...) {}
+					}
+				}
+				// Pass 2: collect (as) and bitcast wrapping const
+				for(auto &inst : std::get<vector_t>(body->data).elems){
+					if(!inst || !std::holds_alternative<list>(inst->data)) continue;
+					auto &il = std::get<list>(inst->data).elems;
+					if(il.size()==4 && il[0] && std::holds_alternative<symbol>(il[0]->data)){
+						std::string op = std::get<symbol>(il[0]->data).name;
+						if(op=="as") { preHoistAsForms.push_back(il); continue; }
+						if(op=="bitcast" && il[1] && std::holds_alternative<symbol>(il[1]->data) && il[3] && std::holds_alternative<symbol>(il[3]->data)){
+							std::string dst = std::get<symbol>(il[1]->data).name; if(!dst.empty()&&dst[0]=='%') dst.erase(0,1);
+							std::string src = std::get<symbol>(il[3]->data).name; if(!src.empty()&&src[0]=='%') src.erase(0,1);
+							if(constMap.count(src)){
+								try { TypeId vty = tctx_.parse_type(il[2]); auto &ci = constMap[src]; preHoistBitcasts.push_back(PendingBitcastInit{dst,vty,ci.ival,ci.fval,ci.isFP}); } catch(...) {}
+							}
+						}
+					}
+				}
+				// Merge gathered consts into persistent preConstMap
+				for(auto &kv : constMap){ preConstMap.emplace(kv.first, PreConstInfo{kv.second.ty, kv.second.ival, kv.second.fval, kv.second.isFP}); }
+				if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][pre-pass] captured as=%zu bitcast-inits=%zu\n", preHoistAsForms.size(), preHoistBitcasts.size());
+			}
 			llvm::Type* rawFty = map_type(ftyId);
 			if(!llvm::isa<llvm::FunctionType>(rawFty)) {
 				fprintf(stderr, "[dbg][emit] non-function type when defining %s kind=%u\n", fname.c_str(), (unsigned)rawFty->getTypeID());
@@ -326,10 +380,42 @@ static bool installFatalHandlerIfRequested() {
 			std::unordered_map<std::string, std::string> initAlias;
 			// Track defining EDN nodes for values (used to recompute conditions each iteration)
 			std::unordered_map<std::string, node_ptr> defNode;
+			// Track which vars have been lazily backfilled to avoid duplicate stores
+			std::unordered_set<std::string> syntheticInitBackfilled;
+			// Pre-hoisted (as ...) set declared early so ensureSlot can see it
+			std::unordered_set<std::string> preHoistedAs; // populated later when executing pre-hoist forms
 			// Legacy ensureSlot replaced by resolver::ensure_slot; keep capture glue until full refactor done.
 			auto ensureSlot = [&](const std::string &name, TypeId ty, bool initFromCurrent) -> llvm::AllocaInst * {
 				edn::ir::builder::State tmpState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
-				return edn::ir::resolver::ensure_slot(tmpState, name, ty, initFromCurrent);
+				auto *slot = edn::ir::resolver::ensure_slot(tmpState, name, ty, initFromCurrent);
+				// Lazy synthetic initializer backfill (EDN-0001): if this variable originated from a
+				// synthetic const+bitcast pattern and was NOT eagerly pre-hoisted, emit a one-time store
+				// in the entry block now so subsequent loop arithmetic loads the evolving slot value.
+				if(slot && syntheticInitMap.count(name) && !preHoistedAs.count(name) && !syntheticInitBackfilled.count(name)){
+					auto &bi = syntheticInitMap[name];
+					if(bi.ty != TypeId{}){
+						llvm::Type *rawTy = nullptr; try { rawTy = map_type(bi.ty); } catch(...) { rawTy = nullptr; }
+						if(rawTy){
+							// Only insert store if slot has no prior store (heuristic to avoid clobber)
+							bool hasStore = false; for(auto *U : slot->users()){ if(llvm::isa<llvm::StoreInst>(U)){ hasStore = true; break; } }
+							if(!hasStore){
+								llvm::IRBuilder<> eb(&*slot->getParent()->getFirstInsertionPt());
+								llvm::Value *lit = bi.isFP ? (llvm::Value*)llvm::ConstantFP::get(rawTy, bi.fval)
+									: (llvm::Value*)llvm::ConstantInt::get(rawTy, (uint64_t)bi.ival, true);
+								if(const char* dbgLazy = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][lazy-init][store] var=%s\n", name.c_str());
+								// Store and prime an SSA load at current insertion if value absent
+								llvm::StoreInst *st = eb.CreateStore(lit, slot);
+								(void)st;
+								if(!vmap.count(name)){
+									vtypes[name] = bi.ty;
+									vmap[name] = builder.CreateLoad(rawTy, slot, name);
+								}
+							}
+							syntheticInitBackfilled.insert(name);
+						}
+					}
+				}
+				return slot;
 			};
 			if (enableDebugInfo) { edn::ir::di::setup_function_entry_debug(*debug_manager_, *F, builder, vtypes); }
 			llvm::Value *lastCoroIdTok = nullptr;			   // holds last coro.id token for ops that need it
@@ -346,10 +432,109 @@ static bool installFatalHandlerIfRequested() {
 			std::vector<llvm::BasicBlock *> itnExceptTargetStack;
 			// Collected phi specifications for deferred realization
 			std::vector<edn::ir::phi_ops::PendingPhi> pendingPhis;
+			// Execute the pre-hoisted (as ...) forms now that builder is ready
+			for(auto &il : preHoistAsForms){
+				if(il.size()!=4) continue; if(!il[1] || !std::holds_alternative<symbol>(il[1]->data)) continue;
+				std::string dst = std::get<symbol>(il[1]->data).name; if(!dst.empty() && dst[0]=='%') dst.erase(0,1); if(dst.empty()) continue;
+				if(preHoistedAs.count(dst)) continue;
+				// If initializer is a symbol referencing a known const, materialize store directly
+				bool handledConstInit = false;
+				if(il[3] && std::holds_alternative<symbol>(il[3]->data)){
+					std::string initSym = std::get<symbol>(il[3]->data).name; if(!initSym.empty() && initSym[0]=='%') initSym.erase(0,1);
+					auto itC = preConstMap.find(initSym);
+					if(itC != preConstMap.end()){
+						TypeId dstTy{}; try { dstTy = tctx_.parse_type(il[2]); } catch(...) { dstTy = {}; }
+						if(dstTy != TypeId{}){
+							edn::ir::builder::State preS{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+							auto *slot = edn::ir::resolver::ensure_slot(preS, dst, dstTy, false);
+							if(slot){
+								llvm::Type *rawTy = map_type(dstTy);
+								llvm::IRBuilder<> eb(&*slot->getParent()->getFirstInsertionPt());
+								llvm::Value *literal = itC->second.isFP ? (llvm::Value*)llvm::ConstantFP::get(rawTy, itC->second.fval)
+									: (llvm::Value*)llvm::ConstantInt::get(rawTy, (uint64_t)itC->second.ival, true);
+								// Insert after existing allocas for deterministic ordering
+								eb.CreateStore(literal, slot);
+								vtypes[dst] = dstTy;
+								auto *loaded = builder.CreateLoad(rawTy, slot, dst);
+								vmap[dst] = loaded;
+								initAlias[initSym] = dst; // force later references to load from slot
+								preHoistedAs.insert(dst);
+								handledConstInit = true;
+								if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][as][pre-hoist-const] dst=%s initSym=%s val=%s\n", dst.c_str(), initSym.c_str(), itC->second.isFP?"fp":"int");
+							}
+						}
+					}
+				}
+				if(handledConstInit) continue;
+				edn::ir::builder::State preS{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+				if(edn::ir::variable_ops::handle_as(preS, il, ensureSlot, initAlias, enableDebugInfo, F, debug_manager_)){
+					preHoistedAs.insert(dst);
+					if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][as][pre-hoist] dst=%s\n", dst.c_str());
+				}
+			}
+			// Hoist synthetic bitcast initializers (allocate slot + store const) with crash diagnostics.
+			// Controlled by EDN_DISABLE_BITCAST_PREHOIST=1 (disable) or EDN_FORCE_BITCAST_PREHOIST=1 (force enable regardless of disable flag).
+			// Safety guards to avoid prior segfault: verify entry block present, valid mapped type (non-null, non-void), and skip exotic/unexpected type IDs.
+			bool disableBitcast = false; if(const char* dis = std::getenv("EDN_DISABLE_BITCAST_PREHOIST")) disableBitcast = (dis[0]=='1'||dis[0]=='y'||dis[0]=='Y'||dis[0]=='t'||dis[0]=='T');
+			bool forceBitcast = false; if(const char* fe = std::getenv("EDN_FORCE_BITCAST_PREHOIST")) forceBitcast = (fe[0]=='1'||fe[0]=='y'||fe[0]=='Y'||fe[0]=='t'||fe[0]=='T');
+			bool enableBitcastHoist = (forceBitcast || !disableBitcast);
+			if(enableBitcastHoist){
+				for(auto &bi : preHoistBitcasts){
+					if(preHoistedAs.count(bi.var)) continue; // already via as
+					// Record candidate for potential lazy backfill (even if eager hoist succeeds we mark preHoistedAs to suppress backfill)
+					syntheticInitMap.emplace(bi.var, bi);
+					if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][attempt] var=%s ty=%llu isFP=%d iVal=%lld fVal=%f\n", bi.var.c_str(), (unsigned long long)bi.ty, bi.isFP?1:0, (long long)bi.ival, bi.fval);
+					// Basic sanity: skip obviously invalid TypeId (0 often maps to void) to avoid misalloc
+					if(bi.ty == TypeId{}) { if(const char* dbgPre2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][skip] var=%s reason=zero-typeid\n", bi.var.c_str()); continue; }
+					llvm::Type* rawTy = nullptr; 
+					try { rawTy = map_type(bi.ty); } catch(...) { rawTy = nullptr; }
+					if(!rawTy){ if(const char* dbgPre2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][skip] var=%s reason=map_type-null\n", bi.var.c_str()); continue; }
+					// Reject types that can't be stored directly (void, label, metadata, token)
+					if(rawTy->isVoidTy() || rawTy->isLabelTy() || rawTy->isMetadataTy() || rawTy->isTokenTy()){
+						if(const char* dbgPre2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][skip] var=%s reason=unsupported-raw-type kind=%u\n", bi.var.c_str(), (unsigned)rawTy->getTypeID());
+						continue;
+					}
+					// Ensure entry block exists before ensure_slot (segfault guard)
+					llvm::Function* curF = builder.GetInsertBlock() ? builder.GetInsertBlock()->getParent() : nullptr;
+					if(!curF || curF->empty()){
+						if(const char* dbgPre2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][defer] var=%s reason=no-entry-block\n", bi.var.c_str());
+						continue; // leave for lazy backfill
+					}
+					edn::ir::builder::State preS{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
+					if(const char* dbgPre4 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][before-ensure] var=%s rawTyID=%u\n", bi.var.c_str(), (unsigned)rawTy->getTypeID());
+					auto *slot = edn::ir::resolver::ensure_slot(preS, bi.var, bi.ty, false);
+					if(const char* dbgPre5 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][after-ensure] var=%s slot=%p\n", bi.var.c_str(), (void*)slot);
+					if(!slot){ if(const char* dbgPre2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][skip] var=%s reason=no-slot\n", bi.var.c_str()); continue; }
+					llvm::Value* initV = nullptr;
+					if(bi.isFP) initV = llvm::ConstantFP::get(rawTy, bi.fval); else initV = llvm::ConstantInt::get(rawTy, (uint64_t)bi.ival, true);
+					// Insert the initializing store immediately AFTER the alloca to preserve canonical dominance ordering.
+					{
+						llvm::IRBuilder<> eb(slot->getParent());
+						auto it = llvm::BasicBlock::iterator(slot);
+						++it; // position after alloca (safe even if at end)
+						if(it==slot->getParent()->end()) eb.SetInsertPoint(slot->getParent()); else eb.SetInsertPoint(slot->getParent(), it);
+						eb.CreateStore(initV, slot);
+					}
+					if(const char* dbgPre3 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][bitcast-pre-hoist][done] var=%s slot=%p ty.ll=%p\n", bi.var.c_str(), (void*)slot, (void*)rawTy);
+					preHoistedAs.insert(bi.var);
+				}
+			} else if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) {
+				fprintf(stderr, "[dbg][bitcast-pre-hoist][disabled]\n");
+				// Populate syntheticInitMap so lazy backfill can initialize on first slot use
+				for(auto &bi : preHoistBitcasts){ if(!preHoistedAs.count(bi.var)) syntheticInitMap.emplace(bi.var, bi); }
+			}
+			if(const char* dbgPre = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][as][pre-hoist-summary] count=%zu\n", preHoistedAs.size());
 			auto emit_list = [&](const std::vector<node_ptr> &insts, auto &&emit_ref) -> void
 			{
 				if (functionDone)
 					return;
+				// EDN-0001 instrumentation: one-time dump of current varSlots keys when first entering emit_list for a function
+				static bool dumpedSlotsOnce = false;
+				if(!dumpedSlotsOnce && std::getenv("EDN_DEBUG_AS")){
+					fprintf(stderr, "[emit][slots-initial] count=%zu", varSlots.size());
+					for(auto &kv: varSlots){ fprintf(stderr, " %s", kv.first.c_str()); }
+					fprintf(stderr, "\n"); dumpedSlotsOnce = true;
+				}
 				for (auto &inst : insts)
 				{
 					if (functionDone)
@@ -362,6 +547,15 @@ static bool installFatalHandlerIfRequested() {
 					if (!std::holds_alternative<symbol>(il[0]->data))
 						continue;
 					std::string op = std::get<symbol>(il[0]->data).name;
+					// TEMP debug trace for EDN-0001: log each op name
+					if(const char* dbgLoop = std::getenv("EDN_DEBUG_TOP_EMIT"); dbgLoop && std::string(dbgLoop)=="1") {
+						fprintf(stderr, "[emit][top] op=%s\n", op.c_str());
+					}
+					// Skip already pre-hoisted (as ...) forms to avoid re-initializing after mutation
+					if(op == "as" && il.size() == 4 && il[1] && std::holds_alternative<symbol>(il[1]->data)){
+						std::string nm = std::get<symbol>(il[1]->data).name; if(!nm.empty() && nm[0]=='%') nm = nm.substr(1);
+						if(preHoistedAs.find(nm) != preHoistedAs.end()) continue;
+					}
 					auto getVal = [&](const node_ptr &n) -> llvm::Value * {
 							edn::ir::builder::State tmpState{builder, *llctx_, *module_, tctx_, [&](TypeId id){ return map_type(id); }, vmap, vtypes, varSlots, initAlias, defNode, debug_manager_, 0, {}};
 						return edn::ir::resolver::get_value(tmpState, n);

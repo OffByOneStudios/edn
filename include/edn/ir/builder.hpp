@@ -1,3 +1,5 @@
+// NOTE: builder.hpp intentionally does NOT define inline resolver helpers (get_value / eval_defined).
+// If you encounter ODR issues, ensure no stale precompiled headers are present.
 #pragma once
 
 #include <string>
@@ -54,8 +56,8 @@ inline void unwind_scope(State& S){
             // Restore latest visible shadow
             auto &ent = vec.back();
             S.varSlots[it->first] = ent.slot;
-            S.vmap[it->first] = ent.slot; // pointer (alloca)
-            S.vtypes[it->first] = S.tctx.get_pointer(ent.ty);
+            // Don't stuff the raw alloca into vmap as a value (we now enforce loads for SSA use).
+            S.vtypes[it->first] = ent.ty;
             ++it;
         }
     }
@@ -64,11 +66,8 @@ inline void unwind_scope(State& S){
 // Forward declarations (implemented in resolver).
 } // namespace edn::ir::builder
 
-namespace edn::ir::resolver {
-    // Forward declarations only (implemented out-of-line in resolver.cpp). No inline bodies here.
-    llvm::Value* get_value(edn::ir::builder::State& S, const edn::node_ptr& n);
-    llvm::Value* eval_defined(edn::ir::builder::State& S, const std::string& name);
-}
+// Forward declarations live solely in resolver.hpp; avoid redeclaring here to prevent any
+// subtle ODR or name lookup ambiguities if headers are included in different orders.
 
 namespace edn::ir::builder {
 

@@ -460,91 +460,93 @@ namespace edn
 
     inline std::string to_pretty_string(const node &n, int indentWidth)
     {
-        // helper lambdas
-        auto indentStr = [](int n) -> std::string
-        {
-            if(n < 0) n = 0; // clamp
-            return std::string(static_cast<size_t>(n), ' ');
+        // Strategy: produce compact single-line forms for simple/short collections.
+        // Only introduce newlines for: nested collections, long lines, or control-ish forms
+        // (e.g., lists whose head symbol is one of a known set or which contain keyword sections).
+
+        auto indentStr = [](int spaces) -> std::string {
+            if (spaces < 0) spaces = 0;
+            return std::string(static_cast<size_t>(spaces), ' ');
         };
-        std::function<std::string(const node &, int)> pp = [&](const node &x, int indent)
-        {
-            if (std::holds_alternative<std::monostate>(x.data))
-                return std::string("nil");
-            if (std::holds_alternative<bool>(x.data))
-                return std::get<bool>(x.data) ? std::string("true") : std::string("false");
-            if (std::holds_alternative<int64_t>(x.data))
-                return std::to_string(std::get<int64_t>(x.data));
-            if (std::holds_alternative<double>(x.data))
-            {
-                std::ostringstream oss;
-                oss << std::get<double>(x.data);
-                return oss.str();
-            }
-            if (std::holds_alternative<std::string>(x.data))
-                return '"' + std::get<std::string>(x.data) + '"';
-            if (std::holds_alternative<keyword>(x.data))
-                return std::string(":") + std::get<keyword>(x.data).name;
-            if (std::holds_alternative<symbol>(x.data))
-                return std::get<symbol>(x.data).name;
-            if (std::holds_alternative<list>(x.data))
-            {
+
+        auto is_atomic = [](const node &x) -> bool {
+            return std::holds_alternative<std::monostate>(x.data) ||
+                   std::holds_alternative<bool>(x.data) ||
+                   std::holds_alternative<int64_t>(x.data) ||
+                   std::holds_alternative<double>(x.data) ||
+                   std::holds_alternative<std::string>(x.data) ||
+                   std::holds_alternative<keyword>(x.data) ||
+                   std::holds_alternative<symbol>(x.data);
+        };
+
+        const size_t MAX_INLINE_LEN = 90; // heuristic
+
+        std::function<std::string(const node&, int)> pp = [&](const node &x, int indent) -> std::string {
+            // Scalars
+            if (std::holds_alternative<std::monostate>(x.data)) return "nil";
+            if (std::holds_alternative<bool>(x.data)) return std::get<bool>(x.data)?"true":"false";
+            if (std::holds_alternative<int64_t>(x.data)) return std::to_string(std::get<int64_t>(x.data));
+            if (std::holds_alternative<double>(x.data)) { std::ostringstream oss; oss<<std::get<double>(x.data); return oss.str(); }
+            if (std::holds_alternative<std::string>(x.data)) return '"'+std::get<std::string>(x.data)+'"';
+            if (std::holds_alternative<keyword>(x.data)) return ':'+std::get<keyword>(x.data).name;
+            if (std::holds_alternative<symbol>(x.data)) return std::get<symbol>(x.data).name;
+
+            auto join_inline_list = [&](const std::vector<node_ptr>& elems, char openC, char closeC)->std::string {
+                std::string out; out+=openC; bool first=true; for(auto &e: elems){ if(!first) out+=' '; first=false; out+=pp(*e, indent); if(out.size()>MAX_INLINE_LEN) return std::string(); } out+=closeC; return out; };
+
+            // list
+            if (std::holds_alternative<list>(x.data)) {
                 const auto &elems = std::get<list>(x.data).elems;
-                if (elems.empty())
-                    return std::string("()");
-                std::string out = "(\n";
-                for (size_t i = 0; i < elems.size(); ++i)
-                {
-                    out += indentStr(indent + indentWidth) + pp(*elems[i], indent + indentWidth);
-                    out += "\n";
+                if (elems.empty()) return "()";
+                bool allAtomic = true; for(auto &e: elems){ if(!is_atomic(*e)){ allAtomic=false; break;} }
+                // Determine if head symbol suggests multiline (control / fn / module)
+                bool forceMulti = false;
+                if(!elems.empty() && std::holds_alternative<symbol>(elems[0]->data)){
+                    static const char* controlSyms[] = {"module","fn","if","while","for","switch","match","block","rif","rwhile","rloop"};
+                    std::string head = std::get<symbol>(elems[0]->data).name;
+                    for(auto s: controlSyms){ if(head==s){ forceMulti=true; break; } }
                 }
-                out += indentStr(indent) + ")";
+                if(allAtomic && !forceMulti){
+                    auto inlineForm = join_inline_list(elems,'(',')');
+                    if(!inlineForm.empty()) return inlineForm; // fits single line
+                }
+                // Multiline fallback
+                std::string out="(\n"; size_t i=0; for(auto &e: elems){
+                    out += indentStr(indent + indentWidth) + pp(*e, indent + indentWidth);
+                    if(++i<elems.size()) out += '\n';
+                }
+                out += '\n' + indentStr(indent) + ')';
                 return out;
             }
-            if (std::holds_alternative<vector_t>(x.data))
-            {
+            // vector
+            if (std::holds_alternative<vector_t>(x.data)) {
                 const auto &elems = std::get<vector_t>(x.data).elems;
-                if (elems.empty())
-                    return std::string("[]");
-                std::string out = "[\n";
-                for (size_t i = 0; i < elems.size(); ++i)
-                {
-                    out += indentStr(indent + indentWidth) + pp(*elems[i], indent + indentWidth);
-                    out += "\n";
+                if (elems.empty()) return "[]";
+                bool allAtomic=true; for(auto &e: elems){ if(!is_atomic(*e)){ allAtomic=false; break;} }
+                if(allAtomic){ auto inlineForm = join_inline_list(elems,'[',']'); if(!inlineForm.empty()) return inlineForm; }
+                std::string out="[\n"; size_t i=0; for(auto &e: elems){ out += indentStr(indent+indentWidth)+pp(*e, indent+indentWidth); if(++i<elems.size()) out+='\n'; }
+                out += '\n'+indentStr(indent)+']'; return out;
+            }
+            // set
+            if (std::holds_alternative<set>(x.data)) {
+                const auto &elems = std::get<set>(x.data).elems; if(elems.empty()) return "#{}"; bool allAtomic=true; for(auto &e: elems){ if(!is_atomic(*e)){ allAtomic=false; break;} }
+                if(allAtomic){ auto inlineForm = join_inline_list(elems,'{','}'); if(!inlineForm.empty()) return std::string("#")+inlineForm; }
+                std::string out = "#{\n"; size_t i=0; for(auto &e: elems){ out += indentStr(indent+indentWidth)+pp(*e, indent+indentWidth); if(++i<elems.size()) out+='\n'; }
+                out += '\n'+indentStr(indent)+'}'; return out;
+            }
+            // map
+            if (std::holds_alternative<map>(x.data)) {
+                const auto &entries = std::get<map>(x.data).entries; if(entries.empty()) return "{}";
+                bool allAtomic=true; for(auto &kv: entries){ if(!is_atomic(*kv.first) || !is_atomic(*kv.second)){ allAtomic=false; break;} }
+                if(allAtomic){
+                    std::string inlineOut = "{"; bool first=true; for(auto &kv: entries){ if(!first) inlineOut+=' '; first=false; inlineOut+=pp(*kv.first, indent)+' '+pp(*kv.second, indent); if(inlineOut.size()>MAX_INLINE_LEN) { inlineOut.clear(); break; } }
+                    if(!inlineOut.empty()){ inlineOut+='}'; return inlineOut; }
                 }
-                out += indentStr(indent) + "]";
-                return out;
+                std::string out="{\n"; size_t i=0; for(auto &kv: entries){ out += indentStr(indent+indentWidth)+pp(*kv.first, indent+indentWidth)+' '+pp(*kv.second, indent+indentWidth); if(++i<entries.size()) out+='\n'; }
+                out += '\n'+indentStr(indent)+'}'; return out;
             }
-            if (std::holds_alternative<set>(x.data))
-            {
-                const auto &elems = std::get<set>(x.data).elems;
-                if (elems.empty())
-                    return std::string("#{}");
-                std::string out = "#{\n";
-                for (size_t i = 0; i < elems.size(); ++i)
-                {
-                    out += indentStr(indent + indentWidth) + pp(*elems[i], indent + indentWidth) + "\n";
-                }
-                out += indentStr(indent) + "}";
-                return out;
-            }
-            if (std::holds_alternative<map>(x.data))
-            {
-                const auto &entries = std::get<map>(x.data).entries;
-                if (entries.empty())
-                    return std::string("{}");
-                std::string out = "{\n";
-                for (size_t i = 0; i < entries.size(); ++i)
-                {
-                    out += indentStr(indent + indentWidth) + pp(*entries[i].first, indent + indentWidth) + " " + pp(*entries[i].second, indent + indentWidth) + "\n";
-                }
-                out += indentStr(indent) + "}";
-                return out;
-            }
-            if (std::holds_alternative<tagged_value>(x.data))
-            {
-                const auto &tv = std::get<tagged_value>(x.data);
-                return std::string("#") + tv.tag.name + " " + pp(*tv.inner, indent);
-            }
+            if (std::holds_alternative<tagged_value>(x.data)) {
+                const auto &tv = std::get<tagged_value>(x.data); return std::string("#")+tv.tag.name+" "+pp(*tv.inner, indent); }
             return std::string("<unknown>");
         };
         return pp(n, 0);

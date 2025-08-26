@@ -42,3 +42,9 @@ All notable changes will be documented here once releases begin.
 	- Opt-in pass pipeline gated by `EDN_ENABLE_PASSES` (disabled in golden tests).
 	- Closures (minimal): `(closure %dst (ptr <fn-type>) %fn [ %env ])` non-escaping single-capture; type checks (E143x) and emitter lowering to per-site thunk with private env global; test `phase4_closures_min_test.cpp` added.
 	- Panics (minimal): `(panic)` recognized by the checker (E1440 arity) and lowered to `llvm.trap` + `unreachable`; smoke and negative tests added.
+	- EDN-0001 (slot initialization & redundant add fix) cleanup:
+		- Normalized resolver operand ordering to prefer slot loads before alias/const forms.
+		- Removed temporary post-pass '.fixed' add rewrite (no more duplicate add instructions like `%op28` / `%op28.fixed`).
+		- Added lazy synthetic initializer backfill (const+bitcast) and single entry-block zero/literal initialization for promoted mutable vars.
+		- Added regression tests: complex lowering (.fixed absence) and lazy slot init (ensures single init + mutation path).
+		- Ensured environment-driven pre-hoist feature can be toggled without semantic drift; cleaned test harness env leakage.

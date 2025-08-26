@@ -1,6 +1,10 @@
 #include "edn/ir/memory_ops.hpp"
 #include "edn/ir/types.hpp"
 #include "edn/ir/di.hpp"
+// Forward declare resolver symbols to handle potential missing namespace errors
+// when stale PCH or partial rebuilds obscure the included header.
+namespace edn { namespace ir { namespace resolver { llvm::Value* get_value(builder::State&, const edn::node_ptr&); } } }
+#include "edn/ir/resolver.hpp" // added for resolver::get_value usage
 #include <llvm/IR/IRBuilder.h>
 
 namespace edn::ir::memory_ops {
@@ -13,19 +17,32 @@ bool handle_assign(builder::State& S, const std::vector<edn::node_ptr>& il){
     if(il.size()!=3) return false; if(!std::holds_alternative<edn::symbol>(il[0]->data) || std::get<edn::symbol>(il[0]->data).name!="assign") return false;
     std::string dst = trimPct(symName(il[1])); std::string src = trimPct(symName(il[2])); if(dst.empty()||src.empty()) return false;
     auto svIt = S.vmap.find(src); if(svIt==S.vmap.end()) return false; auto tyIt = S.vtypes.find(src); if(tyIt==S.vtypes.end()) return false; auto sty = tyIt->second;
-    // ensure slot
-    // replicate logic of ensureSlot inline: create alloca in function entry if missing
+    // ensure/promote slot (EDN-0001): if first time seeing dst, allocate slot and treat current assignment as initialization.
     if(!S.varSlots.count(dst)){
-        // Find entry block (assume builder has insertion block within function)
-        llvm::Function* F = S.builder.GetInsertBlock()->getParent();
-        llvm::IRBuilder<> eb(&*F->getEntryBlock().getFirstInsertionPt());
-        auto *slot = eb.CreateAlloca(S.map_type(sty), nullptr, dst+".slot");
-        S.varSlots[dst] = slot;
-        S.vtypes[dst] = sty; // type of stored value
+        llvm::Function* F = S.builder.GetInsertBlock() ? S.builder.GetInsertBlock()->getParent() : nullptr;
+        if(F){
+            llvm::IRBuilder<> eb(&*F->getEntryBlock().getFirstInsertionPt());
+            auto *slot = eb.CreateAlloca(S.map_type(sty), nullptr, dst+".slot");
+            S.varSlots[dst] = slot;
+            S.vtypes[dst] = sty;
+            // Fallback initializer (EDN-0001): if this variable corresponds to an (as %dst <ty> <const>)
+            // that was lowered away (synthetic const+bitcast) and we missed eager initialization, store 0/false
+            // now for integer/boolean types so first mutation behaves correctly.
+            if(const char* dbg = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][assign-promote] dst=%s tyId=%llu slot=%p (alloca)\n", dst.c_str(), (unsigned long long)sty, (void*)slot);
+            const edn::Type &T = S.tctx.at(sty);
+            bool isIntLike = (T.kind==edn::Type::Kind::Base && (T.base==edn::BaseType::I1 || T.base==edn::BaseType::I8 || T.base==edn::BaseType::I16 || T.base==edn::BaseType::I32 || T.base==edn::BaseType::I64 || T.base==edn::BaseType::U8 || T.base==edn::BaseType::U16 || T.base==edn::BaseType::U32 || T.base==edn::BaseType::U64));
+            if(isIntLike){
+                llvm::Value *zero = llvm::ConstantInt::get(S.map_type(sty), 0, true);
+                eb.CreateStore(zero, slot);
+                if(const char* dbg2 = std::getenv("EDN_DEBUG_AS")) fprintf(stderr, "[dbg][assign-promote][init-zero] dst=%s\n", dst.c_str());
+            }
+            // (second assign-promote debug omitted to reduce noise)
+        }
     }
     auto *slot = S.varSlots[dst];
-    S.builder.CreateStore(svIt->second, slot);
-    // Keep SSA map in sync with a load
+    llvm::Value* toStore = svIt->second;
+    // EDN-0001: removed temporary '.fixed' add rewrite; IR now relies on proper slot-first operand resolution.
+    S.builder.CreateStore(toStore, slot);
     auto *cur = S.builder.CreateLoad(S.map_type(sty), slot, dst);
     S.vmap[dst] = cur; S.vtypes[dst] = sty;
     return true;

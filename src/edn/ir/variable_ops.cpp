@@ -34,14 +34,38 @@ bool handle_as(builder::State& S, const std::vector<edn::node_ptr>& il,
     }
     if(!initV) initV = llvm::UndefValue::get(lty);
     auto *slot = ensureSlot(dst, ty, /*initFromCurrent=*/false);
-    S.builder.CreateStore(initV, slot);
+    if(const char* dbg = std::getenv("EDN_DEBUG_AS")){ (void)dbg; fprintf(stderr, "[dbg][as] dst=%s initV.kind=%u hasSlot=%d\n", dst.c_str(), (unsigned)initV->getType()->getTypeID(), slot?1:0); }
+
+    // Hoist initializer store to entry block to avoid per-iteration re-initialization when
+    // (as ...) appears textually inside a lowered loop body.
+    llvm::BasicBlock* curBB = S.builder.GetInsertBlock();
+    llvm::Function* curF = curBB ? curBB->getParent() : nullptr;
+    llvm::BasicBlock* entryBB = curF ? &curF->getEntryBlock() : nullptr;
+    if(entryBB && slot){
+        bool inEntry = (curBB == entryBB);
+        if(!inEntry){
+            // Insert the store immediately after the slot alloca for deterministic ordering.
+            llvm::IRBuilder<> eb(entryBB);
+            if(auto *next = slot->getNextNode()) eb.SetInsertPoint(next); else eb.SetInsertPoint(entryBB);
+            if(const char* dbg2 = std::getenv("EDN_DEBUG_AS")){
+                fprintf(stderr, "[dbg][as] hoisted-store dst=%s tyId=%llu slot=%p (from BB=%s)\n", dst.c_str(), (unsigned long long)ty, (void*)slot, curBB?curBB->getName().str().c_str():"<null>");
+            }
+            eb.CreateStore(initV, slot);
+        } else {
+            if(const char* dbg2 = std::getenv("EDN_DEBUG_AS")){
+                fprintf(stderr, "[dbg][as] entry-store dst=%s tyId=%llu slot=%p\n", dst.c_str(), (unsigned long long)ty, (void*)slot);
+            }
+            S.builder.CreateStore(initV, slot);
+        }
+    }
     S.vtypes[dst]=ty;
     auto *loaded = S.builder.CreateLoad(S.map_type(ty), slot, dst);
-    S.vmap[dst]=loaded;
+    S.vmap[dst]=loaded; // current SSA value
     if(std::holds_alternative<edn::symbol>(il[3]->data)){
         std::string initName = trimPct(symName(il[3]));
         if(!initName.empty()){
-            initAlias[initName]=dst; S.vmap[initName]=loaded; S.vtypes[initName]=ty;
+            initAlias[initName]=dst; // do not bind initializer symbol to loaded SSA; forces slot load later
+            S.vtypes[initName]=ty;
         }
     }
     if(enableDebugInfo && F && dbgMgr){

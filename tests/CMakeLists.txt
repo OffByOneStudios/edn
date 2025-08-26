@@ -7,6 +7,12 @@ option(EDN_BUILD_TESTS_PHASE3 "Build Phase 3 tests" ON)
 option(EDN_BUILD_TESTS_PHASE4 "Build Phase 4 tests (minimal main)" ON)
 option(EDN_BUILD_TESTS_PHASE4_FULL "Build Phase 4 full tests (includes optional JIT smokes)" ON)
 option(EDN_BUILD_TESTS_PHASE5 "Build Phase 5 tests" ON)
+option(EDN_BUILD_GTESTS "Build GoogleTest-based regression tests" ON)
+
+# If we are building any gtest-consuming targets, locate GTest once up front.
+if(EDN_BUILD_GTESTS)
+	find_package(GTest CONFIG REQUIRED)
+endif()
 
 # Core/unit tests runner (non-phase-prefixed files)
 set(EDN_TESTS_CORE
@@ -90,13 +96,42 @@ endif()
 
 # Phase 5 tests
 file(GLOB PHASE5_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase5_*.cpp")
+if(NOT EDN_BUILD_GTESTS)
+	# If gtests are disabled, exclude files that require GoogleTest headers/macros
+	list(FILTER PHASE5_SOURCES EXCLUDE REGEX ".*/phase5_complex_lowering_gtest\\.cpp$")
+	list(FILTER PHASE5_SOURCES EXCLUDE REGEX ".*/phase5_complex_lowering_regression\\.cpp$")
+endif()
 if(EDN_BUILD_TESTS_PHASE5)
 add_executable(edn_tests_phase5 ${PHASE5_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase5_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/test_env.cpp)
 target_link_libraries(edn_tests_phase5 PRIVATE edn)
+if(EDN_BUILD_GTESTS)
+	message(STATUS "Phase5: adding GTest::gtest to edn_tests_phase5 (sources=${PHASE5_SOURCES})")
+	target_link_libraries(edn_tests_phase5 PRIVATE GTest::gtest)
+else()
+	message(STATUS "Phase5: EDN_BUILD_GTESTS=OFF, gtest sources filtered out: ${PHASE5_SOURCES}")
+endif()
+get_target_property(_PHASE5_LINK_LIBS edn_tests_phase5 LINK_LIBRARIES)
+message(STATUS "Phase5: initial LINK_LIBRARIES=${_PHASE5_LINK_LIBS}")
 target_compile_features(edn_tests_phase5 PRIVATE cxx_std_20)
 target_compile_definitions(edn_tests_phase5 PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 if(NOT WIN32)
 	target_compile_options(edn_tests_phase5 PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/test_env.hpp)
 endif()
 add_test(NAME edn.phase5 COMMAND edn_tests_phase5)
+endif()
+
+# GoogleTest-based regression tests (optional, focuses on higher-level JIT behaviors)
+
+if(EDN_BUILD_GTESTS)
+	add_executable(edn_gtests
+		${CMAKE_CURRENT_SOURCE_DIR}/phase5_complex_lowering_gtest.cpp
+	)
+	target_link_libraries(edn_gtests PRIVATE GTest::gtest GTest::gtest_main edn)
+	target_compile_features(edn_gtests PRIVATE cxx_std_20)
+	target_compile_definitions(edn_gtests PRIVATE EDN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+	if(NOT WIN32)
+		target_compile_options(edn_gtests PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/test_env.hpp)
+	endif()
+	add_test(NAME edn.gtests.phase5.complex_lowering COMMAND edn_gtests --gtest_filter=ComplexLoweringGTest.ReturnsSix)
+	add_test(NAME edn.gtests.phase5.complex_lowering_fixedadd COMMAND edn_gtests --gtest_filter=ComplexLoweringGTest.ContainsSlotFixedAddOnce)
 endif()

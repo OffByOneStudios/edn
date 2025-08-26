@@ -1,5 +1,9 @@
 #include "edn/ir/cast_ops.hpp"
 #include "edn/ir/types.hpp"
+// Forward declare resolver namespace in case header visibility issues cause
+// the compiler to miss it (workaround for intermittent namespace lookup issue).
+namespace edn { namespace ir { namespace resolver { llvm::Value* get_value(builder::State&, const edn::node_ptr&); } } }
+#include "edn/ir/resolver.hpp" // ensure real declarations/definitions
 
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>

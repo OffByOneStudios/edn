@@ -1,4 +1,7 @@
 #include "edn/ir/compare_ops.hpp"
+// Forward declare resolver to mitigate intermittent header/PCH stale issues.
+namespace edn { namespace ir { namespace resolver { llvm::Value* get_value(builder::State&, const edn::node_ptr&); } } }
+#include "edn/ir/resolver.hpp" // added for resolver::get_value
 #include <llvm/IR/IRBuilder.h>
 
 namespace edn::ir::compare_ops {
