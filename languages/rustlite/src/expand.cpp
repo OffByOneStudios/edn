@@ -950,10 +950,67 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     edn::node_ptr expanded = tx.expand(module_ast);
 
     // Inject struct declarations for each used tuple arity if missing.
-    // NOTE: Placeholder field types are i32; this matches current tests using homogeneous i32 tuples.
+    // Attempt lightweight field type inference by scanning preceding const/as instructions
+    // for each struct-lit usage of a tuple. Fallback to i32 if any field ambiguous.
     if(expanded && std::holds_alternative<list>(expanded->data)){
         auto &modList = std::get<list>(expanded->data);
         if(!modList.elems.empty() && std::holds_alternative<symbol>(modList.elems[0]->data) && std::get<symbol>(modList.elems[0]->data).name=="module"){
+            // First pass: infer field types per arity
+            std::unordered_map<size_t, std::vector<node_ptr>> inferred;
+            std::unordered_map<size_t, std::vector<bool>> complete;
+            for(size_t ar : g_tupleArities){ inferred[ar] = std::vector<node_ptr>(ar, nullptr); complete[ar] = std::vector<bool>(ar, false); }
+            auto try_infer_from_symbol = [&](const std::vector<node_ptr>& body, size_t uptoIdx, const std::string& sym)->node_ptr{
+                // Scan backwards (excluding instruction at uptoIdx) for defining const / as of %sym.
+                if(uptoIdx == 0) return nullptr;
+                for(size_t i = uptoIdx; i-- > 0; ){ // i runs: uptoIdx-1 ... 0
+                    auto &n = body[i];
+                    if(!n || !std::holds_alternative<list>(n->data)) continue;
+                    auto &L = std::get<list>(n->data).elems;
+                    if(L.empty() || !std::holds_alternative<symbol>(L[0]->data)) continue;
+                    const std::string op = std::get<symbol>(L[0]->data).name;
+                    if(op=="const" && L.size()>=4 && std::holds_alternative<symbol>(L[1]->data) && std::get<symbol>(L[1]->data).name==sym){
+                        // (const %a <Ty> ...)
+                        return L[2];
+                    }
+                    if(op=="as" && L.size()>=4 && std::holds_alternative<symbol>(L[1]->data) && std::get<symbol>(L[1]->data).name==sym){
+                        // (as %a <Ty> ...)
+                        return L[2];
+                    }
+                }
+                return nullptr;
+            };
+            // Iterate module nodes to find fn/rfn forms
+            for(auto &top : modList.elems){
+                if(!top || !std::holds_alternative<list>(top->data)) continue;
+                auto &fnL = std::get<list>(top->data).elems; if(fnL.empty() || !std::holds_alternative<symbol>(fnL[0]->data)) continue;
+                std::string head = std::get<symbol>(fnL[0]->data).name; if(head!="fn" && head!="rfn") continue;
+                // locate :body vector
+                node_ptr bodyVec=nullptr;
+                for(size_t i=1;i+1<fnL.size(); i+=2){ if(!std::holds_alternative<keyword>(fnL[i]->data)) break; if(std::get<keyword>(fnL[i]->data).name=="body") { bodyVec=fnL[i+1]; break; } }
+                if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) continue;
+                auto &instrs = std::get<vector_t>(bodyVec->data).elems;
+                for(size_t idx=0; idx<instrs.size(); ++idx){
+                    auto &inst = instrs[idx]; if(!inst || !std::holds_alternative<list>(inst->data)) continue;
+                    auto &L = std::get<list>(inst->data).elems; if(L.size()!=4) continue;
+                    if(!std::holds_alternative<symbol>(L[0]->data)) continue;
+                    if(std::get<symbol>(L[0]->data).name!="struct-lit") continue;
+                    if(!std::holds_alternative<symbol>(L[2]->data)) continue;
+                    std::string sname = std::get<symbol>(L[2]->data).name; if(sname.rfind("__Tuple",0)!=0) continue;
+                    size_t arity = 0; try { arity = (size_t)std::stoul(sname.substr(8)); } catch(...) { continue; }
+                    if(!g_tupleArities.count(arity)) continue;
+                    if(!std::holds_alternative<vector_t>(L[3]->data)) continue; auto &fields = std::get<vector_t>(L[3]->data).elems;
+                    // fields vector pattern: _0 %a _1 %b ... pairs
+                    for(size_t fi=0, fieldIndex=0; fi+1<fields.size(); fi+=2, ++fieldIndex){
+                        if(fieldIndex>=arity) break;
+                        auto &valNode = fields[fi+1]; if(!valNode || !std::holds_alternative<symbol>(valNode->data)) continue;
+                        std::string vsym = std::get<symbol>(valNode->data).name;
+                        if(!inferred[arity][fieldIndex]){
+                            auto tyNode = try_infer_from_symbol(instrs, idx, vsym);
+                            if(tyNode){ inferred[arity][fieldIndex] = tyNode; complete[arity][fieldIndex]=true; }
+                        }
+                    }
+                }
+            }
             // Collect existing struct names
             std::unordered_set<std::string> existing;
             for(auto &n : modList.elems){
@@ -967,10 +1024,17 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
             for(size_t ar : g_tupleArities){
                 std::string sname = "__Tuple"+std::to_string(ar);
                 if(existing.count(sname)) continue;
-                // Build fields vector: [ (field :name _0 :type i32) ... ]
+                // Determine if we have complete inferred types
+                bool allResolved = true;
+                if(inferred.count(ar)){
+                    for(size_t i=0;i<ar;++i){ if(!complete[ar][i] || !inferred[ar][i]) { allResolved=false; break; } }
+                } else allResolved=false;
+                // Build fields vector: [ (field :name _i :type <Ty>) ... ]
                 vector_t fieldsV;
                 for(size_t i=0;i<ar;++i){
-                    list fld; fld.elems = { make_sym("field"), make_kw("name"), make_sym("_"+std::to_string(i)), make_kw("type"), make_sym("i32") };
+                    node_ptr tyNode = (allResolved? inferred[ar][i] : nullptr);
+                    if(!tyNode) tyNode = make_sym("i32"); // fallback
+                    list fld; fld.elems = { make_sym("field"), make_kw("name"), make_sym("_"+std::to_string(i)), make_kw("type"), tyNode };
                     fieldsV.elems.push_back(std::make_shared<node>( node{ fld, {} } ));
                 }
                 list structL; structL.elems.push_back(make_sym("struct"));

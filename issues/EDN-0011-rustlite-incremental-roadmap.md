@@ -70,7 +70,7 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - [x] [P1][F] Tuple macro forms `tuple` / `tget` + tests (`rustlite.tuple_basic`). Implemented with auto struct declaration injection for used arities (up to 16) and arity-aware `tget` resolution.
 - [x] [P1][F] Fixed array literal `arr` + reuse indexing, plus legacy `rarray` numeric-size path. Added direct lowering to core `array-lit` for initialized form and `(alloca (array ...))` for size form; added `rindex-addr`, `rindex-load`, `rindex-store` refactor.
 - [x] [P1][F] Literal macro restorations (`rcstr`, `rbytes`) with robust handling of parser-provided string nodes and interning conformity; all literal tests passing.
-- [ ] [P1][D] Docs: add Tuple & Array section + examples. (Pending – to update `docs/RUSTLITE.md`).
+- [x] [P1][D] Docs: add Tuple & Array section + examples. (Completed 2025-08-27)
 
 ### Phase B (Enums & Matching)
 - [ ] [P1][F] Enum surface macro `(enum :name ...)` + variant constructor forms.

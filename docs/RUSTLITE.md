@@ -128,7 +128,9 @@ Identical decoded string contents (excluding implicit terminator) or identical r
 | `rstruct :name S :fields [ (name Ty)* ]` | Struct type declaration | N/A |
 | `rget %dst StructType %obj field` | Load struct field | field type |
 | `rset %obj field %src` | Store to struct field | N/A |
-| `arr %dst Ty [ %v* ]` | Fixed-size array literal (alloca + stores) | `ptr (array Ty N)` |
+| `tuple %dst [ %v* ]` | Tuple literal (auto-declares `__TupleN`) | `__TupleN` |
+| `tget %dst Ty %t <idx>` | Tuple field access | `Ty` |
+| `arr %dst Ty [ %v* ]` | Fixed-size array literal (core `array-lit`) | `ptr (array Ty N)` |
 | `rindex %dst (ptr T) %base %idx` | Pointer to element (no load) | `ptr T` |
 | `rindex-load %dst T %base %idx` | Load element | `T` |
 | `rindex-store %base %idx %src` | Store element | N/A |
@@ -200,6 +202,40 @@ These diagnostics appear during the initial module struct collection phase so la
 ```
 `%base` is expected to be a pointer to the element type. Bounds are unchecked.
 
+### Tuples (`tuple`, `tget`)
+
+Positional tuples are modeled as synthetic structs named `__TupleN` with fields `_0 .. _{N-1}`. The `tuple` macro records arity and auto-injects a single struct declaration per distinct arity used in the module.
+
+```
+(tuple %t [ %a %b %c ]) ; arity 3 -> (struct-lit %t __Tuple3 [ _0 %a _1 %b _2 %c ])
+```
+
+Field type inference: each tuple struct field type is inferred (when possible) from a preceding defining `(const %sym <Ty> ...)` or `(as %sym <Ty> ...)` for the value symbol supplied. Unresolved fields fall back to `i32`. (Heuristic – future expansion may widen sources or require explicit typing.)
+
+Access:
+
+```
+(tget %x i32 %t 1) ; -> (member %x __Tuple3 %t _1)
+```
+
+Static out-of-range indices abort macro expansion (will surface as diagnostic E1601 once mapped). Maximum supported arity: 16.
+
+### Arrays (`arr`, legacy `rarray` numeric size)
+
+`arr` lowers directly to a core array literal form:
+
+```
+(arr %a i32 [ %x %y %z ]) ; -> (array-lit %a i32 3 [ %x %y %z ])
+```
+
+Legacy numeric-size path:
+
+```
+(rarray %buf i32 8) ; -> (alloca %buf (array :elem i32 :size 8))
+```
+
+No initialization is performed for the numeric form. Prefer `arr` when providing explicit element values. Future bounds checking (Phase D) will gate on `RUSTLITE_BOUNDS=1`.
+
 ### Closures (`rclosure`, `rcall-closure`)
 
 Rustlite closures list captured variables (by value copy). The macro builds a tiny struct `{ fnPtr, env }` plus a thunk receiving the environment pointer first.
@@ -242,6 +278,8 @@ Validates that the annotated pointer type matches the named function (diagnostic
 | `rustlite.closure_neg` | rclosure (capture omission diagnostic) |
 | `rustlite.option_result` | rsome, rnone, rok, rerr, rmatch, rif-let |
 | `rustlite.fnptr` | rfnptr, call-indirect |
+| `rustlite.tuple_basic` | tuple, tget |
+| `rustlite.index_addr` | rindex-addr, rindex-load, rindex-store |
 | `rustlite.tuple_array` | arr (array literal) |
 | `rustlite.trait_neg` | rtrait-call (wrong arity E1325) |
 | `rustlite.extern-globals` | rextern-global, rextern-const |
