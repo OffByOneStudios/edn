@@ -212,6 +212,46 @@ endif()
 target_compile_features(rustlite_enum_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.enum COMMAND rustlite_enum_driver)
 
+# enum surface macro driver (Phase B start)
+add_executable(rustlite_enum_surface_driver tools/rustlite_enum_surface_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_enum_surface_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_enum_surface_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.enum_surface COMMAND rustlite_enum_surface_driver)
+
+# ematch exhaustive driver
+add_executable(rustlite_ematch_exhaustive_driver tools/rustlite_ematch_exhaustive_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_ematch_exhaustive_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_ematch_exhaustive_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.ematch_exhaustive COMMAND rustlite_ematch_exhaustive_driver)
+
+# ematch non-exhaustive driver
+add_executable(rustlite_ematch_non_exhaustive_driver tools/rustlite_ematch_non_exhaustive_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_ematch_non_exhaustive_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_ematch_non_exhaustive_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.ematch_non_exhaustive COMMAND rustlite_ematch_non_exhaustive_driver)
+
+# ematch payload-binding driver
+add_executable(rustlite_ematch_payload_driver tools/rustlite_ematch_payload_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_ematch_payload_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_ematch_payload_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.ematch_payload COMMAND rustlite_ematch_payload_driver)
+
+# legacy non-exhaustive rmatch regression driver
+add_executable(rustlite_rmatch_non_exhaustive_legacy_driver tools/rustlite_rmatch_non_exhaustive_legacy_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_rmatch_non_exhaustive_legacy_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_rmatch_non_exhaustive_legacy_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rmatch_non_exhaustive_legacy COMMAND rustlite_rmatch_non_exhaustive_legacy_driver)
+
 # rmake-trait-obj focused driver
 add_executable(rustlite_make_trait_obj_driver tools/rustlite_make_trait_obj_driver.cpp)
 if(TARGET edn)

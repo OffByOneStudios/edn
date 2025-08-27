@@ -4,8 +4,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// Restored macros: rcstr, rbytes, rextern-global, rextern-const and refactored rindex* helper.
-// This comment also forces recompilation to ensure the latest expansion logic is picked up.
+// Restored macros: rcstr, rbytes, rextern-global, rextern-const, refactored rindex* helper, ematch metadata tagging.
+// (Build stamp v2) Adjusted to support E1600 non-exhaustive enum match diagnostic.
 
 using namespace edn;
 
@@ -17,7 +17,46 @@ static node_ptr make_i64(int64_t v){ return std::make_shared<node>( node{ v, {} 
 static std::string gensym(const std::string& base){ static uint64_t n=0; return "%__rl_" + base + "_" + std::to_string(++n); }
 
 edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
+    // Pre-walk: rewrite variant constructor surface forms of shape (Type::Variant %dst [payload*])
+    // to an internal generic macro form: (enum-ctor %dst Type Variant payload...)
+    // Assumption: destination SSA symbol always provided as first argument (unlike earlier prose examples
+    // which omitted it). This keeps lowering consistent with existing sum-new op which requires %dst.
+    std::function<void(node_ptr&)> prewalk;
+    prewalk = [&](node_ptr& n){
+        if(!n) return;
+        if(std::holds_alternative<vector_t>(n->data)){
+            for(auto &e : std::get<vector_t>(n->data).elems) prewalk(e);
+            return;
+        }
+        if(!std::holds_alternative<list>(n->data)) return;
+        auto &L = std::get<list>(n->data).elems;
+        if(L.empty() || !std::holds_alternative<symbol>(L[0]->data)){
+            for(auto &e : L) prewalk(e);
+            return;
+        }
+        std::string head = std::get<symbol>(L[0]->data).name;
+        auto pos = head.find("::");
+        if(pos!=std::string::npos && L.size()>=2 && std::holds_alternative<symbol>(L[1]->data) && std::get<symbol>(L[1]->data).name.rfind('%',0)==0){
+            std::string typeName = head.substr(0,pos);
+            std::string variantName = head.substr(pos+2);
+            // Build new list: enum-ctor %dst Type Variant <payload...>
+            list repl; repl.elems.push_back(make_sym("enum-ctor"));
+            repl.elems.push_back(L[1]);
+            repl.elems.push_back(make_sym(typeName));
+            repl.elems.push_back(make_sym(variantName));
+            for(size_t i=2;i<L.size();++i){ repl.elems.push_back(L[i]); }
+            n->data = repl; // replace in-place
+            // Recurse into payload forms if any
+            for(size_t i=4;i<repl.elems.size();++i) prewalk(repl.elems[i]);
+            return;
+        }
+        for(auto &e : L) prewalk(e);
+    };
+    auto ast_copy = module_ast; // operate on provided AST (shared_ptr semantics)
+    prewalk(ast_copy);
     Transformer tx;
+    // Enum variant count tracking for Phase B exhaustive match helper
+    std::unordered_map<std::string,size_t> g_enumVariantCounts;
     // Tuple tracking (auto struct declarations)
     std::unordered_map<std::string,size_t> g_tupleVarArity; // %var (with '%') -> arity
     std::unordered_set<size_t> g_tupleArities;              // distinct arities used
@@ -479,11 +518,14 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     });
 
     // renum (sum type): (renum :name Name :variants [ (None) (Some Ty) ... ]) → core sum/variant
-    tx.add_macro("renum", [](const list& form)->std::optional<node_ptr>{
+    tx.add_macro("renum", [&g_enumVariantCounts](const list& form)->std::optional<node_ptr>{
         auto& el = form.elems; if(el.size()<3) return std::nullopt;
         node_ptr nameN=nullptr; node_ptr variantsV=nullptr;
         for(size_t i=1;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="name") nameN=v; else if(kw=="variants") variantsV=v; }
         if(!nameN || !variantsV || !std::holds_alternative<vector_t>(variantsV->data)) return std::nullopt;
+        if(std::holds_alternative<symbol>(nameN->data)){
+            g_enumVariantCounts[ std::get<symbol>(nameN->data).name ] = std::get<vector_t>(variantsV->data).elems.size();
+        }
         vector_t outVars;
         for(auto &vn : std::get<vector_t>(variantsV->data).elems){
             if(std::holds_alternative<symbol>(vn->data)){
@@ -502,6 +544,64 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
         }
         list s; s.elems = { make_sym("sum"), make_kw("name"), nameN, make_kw("variants"), std::make_shared<node>( node{ outVars, {} } ) };
         return std::make_shared<node>( node{ s, form.elems.front()->metadata } );
+    });
+    // Phase B: enum surface macro alias
+    tx.add_macro("enum", [](const list& form)->std::optional<node_ptr>{
+        // (enum :name Name :variants [ (Var) (Var Ty) ... ]) -> (renum ...)
+        auto l = form; if(l.elems.size()<3) return std::nullopt; l.elems[0] = make_sym("renum");
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    // Exhaustive match helper: (ematch %dst <RetTy> EnumType %val :arms [ (arm Variant ...) ... ])
+    // Emits core (match ...) form. If non-exhaustive, leaves off :default to trigger E1600 diagnostic in type checker.
+    tx.add_macro("ematch", [&g_enumVariantCounts](const list& form)->std::optional<node_ptr>{
+        auto &el = form.elems; if(el.size()<6) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        node_ptr dst=el[1]; node_ptr retTy=el[2];
+        if(!std::holds_alternative<symbol>(el[3]->data)) return std::nullopt; // Enum type name
+        std::string enumName = std::get<symbol>(el[3]->data).name;
+        node_ptr scrut = el[4];
+        node_ptr armsV=nullptr;
+        for(size_t i=5;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; if(kw=="arms"||kw=="cases") armsV=el[i+1]; }
+        if(!armsV || !std::holds_alternative<vector_t>(armsV->data)) return std::nullopt;
+        size_t need = g_enumVariantCounts[enumName];
+        std::unordered_set<std::string> seen;
+        // Repurpose rmatch logic: we will construct (match ... :cases [...]) and omit :default if exhaustive.
+        vector_t outCases;
+        for(auto &armNode : std::get<vector_t>(armsV->data).elems){
+            if(!armNode || !std::holds_alternative<list>(armNode->data)) return std::nullopt; auto arm = std::get<list>(armNode->data);
+            if(arm.elems.empty() || !std::holds_alternative<symbol>(arm.elems[0]->data)) return std::nullopt;
+            auto head = std::get<symbol>(arm.elems[0]->data).name;
+            if(head!="arm" && head!="case") return std::nullopt;
+            if(arm.elems.size()<2 || !std::holds_alternative<symbol>(arm.elems[1]->data)) return std::nullopt;
+            std::string variant = std::get<symbol>(arm.elems[1]->data).name;
+            seen.insert(variant);
+            // Accept already-core case form or transform arm -> case like rmatch
+            if(head=="case"){ outCases.elems.push_back(armNode); continue; }
+            node_ptr bodyVec=nullptr; node_ptr bindsList=nullptr;
+            for(size_t i=2;i+1<arm.elems.size(); i+=2){ if(!std::holds_alternative<keyword>(arm.elems[i]->data)) break; auto kw=std::get<keyword>(arm.elems[i]->data).name; auto v=arm.elems[i+1]; if(kw=="body") bodyVec=v; else if(kw=="binds") bindsList=v; }
+            if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+            list caseL; caseL.elems = { make_sym("case"), make_sym(variant) };
+            if(bindsList){
+                if(!std::holds_alternative<vector_t>(bindsList->data)) return std::nullopt; vector_t bindsOut; size_t bidx=0; for(auto &b : std::get<vector_t>(bindsList->data).elems){ if(!std::holds_alternative<symbol>(b->data)) return std::nullopt; list bd; bd.elems={ make_sym("bind"), b, std::make_shared<node>( node{ (int64_t)bidx, {} } ) }; bindsOut.elems.push_back(std::make_shared<node>( node{ bd, {} } )); ++bidx; } caseL.elems.push_back(make_kw("binds")); caseL.elems.push_back(std::make_shared<node>( node{ bindsOut, {} } )); }
+            caseL.elems.push_back(make_kw("body")); caseL.elems.push_back(bodyVec);
+            outCases.elems.push_back(std::make_shared<node>( node{ caseL, {} } ));
+        }
+    bool exhaustive = (need>0 && seen.size()==need);
+    list matchL; matchL.elems = { make_sym("match"), dst, retTy, make_sym(enumName), scrut };
+    matchL.elems.push_back(make_kw("cases")); matchL.elems.push_back(std::make_shared<node>( node{ outCases, {} } ));
+    // Tag the match with metadata so the type checker can emit E1600 if non-exhaustive.
+    auto md = form.elems.front()->metadata; md["ematch"] = detail::make_node(true); if(exhaustive) md["ematch-exhaustive"] = detail::make_node(true);
+    return std::make_shared<node>( node{ matchL, md } );
+    });
+    // Phase B: enum-ctor lowering (enum-ctor %dst Type Variant payload...)
+    tx.add_macro("enum-ctor", [](const list& form)->std::optional<node_ptr>{
+        auto &el = form.elems; if(el.size()<4) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data) || !std::holds_alternative<symbol>(el[2]->data) || !std::holds_alternative<symbol>(el[3]->data)) return std::nullopt;
+        auto dst = el[1]; auto typeName = std::get<symbol>(el[2]->data).name; auto variantName = std::get<symbol>(el[3]->data).name;
+        vector_t vals;
+        for(size_t i=4;i<el.size();++i){ vals.elems.push_back(el[i]); }
+        list l; l.elems = { make_sym("sum-new"), dst, make_sym(typeName), make_sym(variantName), std::make_shared<node>( node{ vals, {} } ) };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
     });
 
     // rtypedef: alias to core typedef
@@ -947,7 +1047,7 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     });
 
     // First expand macros to Core-like EDN
-    edn::node_ptr expanded = tx.expand(module_ast);
+    edn::node_ptr expanded = tx.expand(ast_copy);
 
     // Inject struct declarations for each used tuple arity if missing.
     // Attempt lightweight field type inference by scanning preceding const/as instructions

@@ -808,7 +808,17 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         // Exhaustiveness: allow omitting :default if all variants are covered
         const size_t totalVariants = sit->second.variants.size();
         const bool exhaustive = (usedVariants.size() == totalVariants);
-        if(!haveDefault && !exhaustive){ error_code(r,*n,"E1415","match missing :default","add :default [ ... ] block or cover all variants"); r.success=false; }
+        if(!haveDefault && !exhaustive){
+            // Distinguish between core match (legacy) and ematch macro generated form (metadata tag ematch) for diagnostics.
+            bool isEmatch = n->metadata.count("ematch")>0;
+            if(isEmatch){
+                // Emit dedicated non-exhaustive diagnostic E1600 instead of generic E1415.
+                error_code(r,*n,"E1600","non-exhaustive enum match","add missing variant arms or provide :default");
+            } else {
+                error_code(r,*n,"E1415","match missing :default","add :default [ ... ] block or cover all variants");
+            }
+            r.success=false;
+        }
         // Default body may be vector (legacy) or a list of keywords including :body and optional :value
         std::vector<node_ptr> defaultBody; std::string defaultValueName; bool defaultHasValue=false;
         if(haveDefault){

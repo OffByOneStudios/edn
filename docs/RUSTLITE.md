@@ -52,7 +52,7 @@ This prints both the high-level EDN and the final IR.
 - Control flow: `(rif ...)`, `(rwhile ...)`, `(rloop ...)`, `(rbreak)`, `(rcontinue)`
 - Calls: `(rcall %dst <op-ty or ret-ty> callee args...)` with intrinsic rewrites
 
-See `design/rustlite.md` for background and roadmap.
+See `design/rustlite.md` for background and roadmap. See `docs/ENUMS_MATCHING.md` for detailed enum construction and exhaustive matching (`ematch`) semantics and diagnostics (E1600 for non-exhaustive `ematch`).
 
 ## Additional Macros (Selected)
 
@@ -121,6 +121,7 @@ Identical decoded string contents (excluding implicit terminator) or identical r
 | `rcstr %dst "lit"` | Interned C string literal (NUL added) | `ptr i8` |
 | `rbytes %dst [ b* ]` | Interned raw bytes | `ptr i8` |
 | `renum :name N :variants [ V* ]` | Enum (sum type) declaration | N/A |
+| `ematch %dst Ret EnumType %val :arms [...]` | Exhaustive enum match (diagnostic if non-exhaustive) | Ret |
 | `rextern-global ...` | External data symbol | N/A |
 | `rextern-const ...` | External data symbol (alias) | N/A |
 | `rfor :init [ ... ] :cond %c :step [ ... ] :body [ ... ]` | For loop sugar | N/A |
@@ -288,6 +289,11 @@ Validates that the annotated pointer type matches the named function (diagnostic
 | `rustlite.extern_global_init_neg` | rextern-const (const without :init E1227) |
 | `rustlite.cstr_unknown_escape` | rcstr (permissive unknown escape behavior) |
 | `rustlite.make_trait_obj` | rmake-trait-obj, rtrait-call |
+| `rustlite.enum_surface` | renum (enum surface) |
+| `rustlite.ematch_exhaustive` | ematch (all variants covered) |
+| `rustlite.ematch_non_exhaustive` | ematch (E1600 non-exhaustive diagnostic) |
+| `rustlite.ematch_payload` | ematch (payload binding) |
+| `rustlite.rmatch_non_exhaustive_legacy` | core match (legacy E1415) |
 
 Extend as additional drivers land (e.g., `rextern_global_init_neg`, `rmake_trait_obj`).
 

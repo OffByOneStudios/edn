@@ -73,10 +73,14 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - [x] [P1][D] Docs: add Tuple & Array section + examples. (Completed 2025-08-27)
 
 ### Phase B (Enums & Matching)
-- [ ] [P1][F] Enum surface macro `(enum :name ...)` + variant constructor forms.
-- [ ] [P1][T] Exhaustive variant-only match test (`rustlite.enum_match_exhaustive`).
-- [ ] [P2][T] Non-exhaustive match diagnostic test (`rustlite.enum_match_non_exhaustive`).
-- [ ] [P1][D] Docs update: Enum surface syntax + exhaustiveness rules.
+- [x] [P1][F] Enum surface macro `(enum :name ...)` + variant constructor pre-walk rewrite (to `enum-ctor`) – 2025-08-27.
+- [x] [P1][F] `ematch` macro (exhaustive enum match) replacing prior implicit-default behavior – 2025-08-27.
+- [x] [P1][T] Exhaustive enum match test (`rustlite.ematch_exhaustive`).
+- [x] [P2][T] Non-exhaustive enum match diagnostic test (`rustlite.ematch_non_exhaustive`) – emits E1600.
+- [x] [P1][D] Docs: Added `docs/ENUMS_MATCHING.md` + cross-link & quick reference updates in `docs/RUSTLITE.md`.
+- [x] [P2][T] Payload-binding enum match test (variant with data) (`rustlite.ematch_payload`) – ensure bind + exhaustiveness interplay – 2025-08-27.
+- [x] [P2][T] Legacy plain `rmatch` / core match non-exhaustive regression test (expects E1415) (`rustlite.rmatch_non_exhaustive_legacy`) – 2025-08-27.
+- [x] [P3][D] Extend `ENUMS_MATCHING.md` with payload-binding example & contrast `rmatch` vs `ematch` diagnostics – 2025-08-27.
 
 ### Phase C (Control Flow Ergonomics)
 - [ ] [P1][F] `rtry` macro for `?` operator semantics (Result path).
@@ -109,14 +113,14 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 
 ## Acceptance Criteria
 - All P1 tasks implemented, documented, and tests passing.
-- Enum match exhaustiveness: passing exhaustive test and failing non-exhaustive test (diagnostic code reserved, e.g., `E1600`).
+- Enum match exhaustiveness: passing exhaustive test and failing non-exhaustive test (diagnostic `E1600` implemented).
 - Bounds checking mode demonstrably traps or errors on OOB in test; disabled mode behavior unchanged.
 - `rtry` yields identical IR shape to explicit match early-return form.
 - Bitwise / remainder ops produce valid IR and interact with existing precedence rules.
 - Documentation sections updated (Tuples, Arrays, Enums, ?, while-let, Operators, Ranges, Feature Flags).
 
 ## Diagnostics (Proposed New Codes)
-- E1600: Non-exhaustive enum match.
+- E1600: Non-exhaustive enum match. (Implemented 2025-08-27)
 - E1601: Tuple index out of range (static).
 - E1602: Array literal size mismatch (internal invariant / reserved for future).
 - E1603: `rtry` used with non-Result/Option sum.
@@ -146,11 +150,21 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - 2025-08-27: Implemented `arr` macro lowering directly to core `array-lit` and enhanced `rarray` for numeric size allocation; added array indexing test driver (`rustlite.index_addr`) passing after driver alignment to core compare op shape.
 - 2025-08-27: Hardened `rcstr` macro to wrap raw string nodes, preserving quotes & escape semantics; all literal/extern global tests pass.
 - 2025-08-27: Added arity tracking in expansion for precise `tget` lowering (removed earlier `__Tuple16` placeholder assumption).
+- 2025-08-27: Phase B kickoff: implemented `enum` alias to `renum`, pre-walk rewrite of `Type::Variant` surface constructors to `enum-ctor`, driver `rustlite.enum_surface` added.
+- 2025-08-27: Added `ematch` macro generating match without synthesized default; metadata tagging (`ematch` / `ematch-exhaustive`) enables new diagnostic path.
+- 2025-08-27: Type checker updated: emits E1600 for non-exhaustive `ematch` (legacy `rmatch` retains E1415). Removed synthesized panic default path.
+- 2025-08-27: Added drivers `rustlite.ematch_exhaustive` (passes) and `rustlite.ematch_non_exhaustive` (asserts E1600) verifying exhaustiveness logic.
+- 2025-08-27: Authored `docs/ENUMS_MATCHING.md` (enum declaration, constructors, `ematch`, diagnostic behavior) and cross-linked from `docs/RUSTLITE.md` (quick reference + test matrix updated).
+- 2025-08-27: Added payload-binding `ematch` driver (`rustlite.ematch_payload`) covering variant field binds + result value path.
+- 2025-08-27: Added legacy non-exhaustive core match regression driver (`rustlite.rmatch_non_exhaustive_legacy`) verifying E1415 still emitted (distinct from E1600 path).
+- 2025-08-27: Extended `ENUMS_MATCHING.md` with payload-binding example and ematch vs rmatch comparison table.
 
-### Current Status (Phase A)
-Functional macros in place and validated by drivers/tests: tuples, arrays, indexing (address, load, store), literals, extern globals. Documentation updates for tuples/arrays still pending. Placeholder field type strategy (i32) for tuple auto-decls flagged for future refinement.
+### Current Status (Phase A & B Progress)
+Phase A complete (tuples, arrays, indexing refinements, literals, extern globals) with docs merged. Phase B core implemented: enum surface alias, variant constructor rewrite, `ematch` macro, E1600 diagnostic, exhaustive / non-exhaustive tests, and enum docs integration. Remaining Phase B items focus on payload-binding tests and legacy regression coverage.
 
 ### Immediate Next Actions
-1. Documentation: add Tuple & Array sections with examples and note placeholder typing / future type inference improvement.
-2. Decide on tuple field type inference approach (defer, or track constructor operand types post type-check pass in a future enhancement issue).
-3. Begin Phase B planning (enum surface) once docs merged.
+1. Add payload-binding enum test (`rustlite.ematch_payload`) exercising a variant carrying a value and ensuring exhaustive coverage + binding.
+2. Add legacy `rmatch` non-exhaustive regression test expecting E1415 to guard divergence from `ematch` path.
+3. Extend `ENUMS_MATCHING.md` with payload-binding example and explicit comparison table: `rmatch` vs `ematch` (defaults, diagnostics, use-cases).
+4. (Optional) Explore tuple field type inference enhancement or defer to separate issue.
+5. Plan `rtry` macro design sketch (control flow sugar Phase C) while enum momentum context is fresh.
