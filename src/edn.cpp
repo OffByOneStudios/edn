@@ -46,6 +46,7 @@
 #include "edn/ir/pointer_func_ops.hpp"
 #include "edn/ir/const_ops.hpp"
 #include "edn/ir/variable_ops.hpp"
+#include "edn/ir/literal_ops.hpp"
 #include "edn/ir/phi_ops.hpp"
 #include "edn/ir/coro_ops.hpp"
 #include "edn/ir/exception_ops.hpp"
@@ -608,6 +609,8 @@ static bool installFatalHandlerIfRequested() {
 							edn::ir::memory_ops::handle_load(S, il) ||
 							edn::ir::memory_ops::handle_index(S, il) ||
 							edn::ir::memory_ops::handle_array_lit(S, il) ||
+							edn::ir::literal_ops::handle_cstr(S, il) ||
+							edn::ir::literal_ops::handle_bytes(S, il) ||
 							edn::ir::memory_ops::handle_struct_lit(S, il, struct_field_index_, struct_field_types_) ||
 							edn::ir::memory_ops::handle_member(S, il, struct_types_, struct_field_index_, struct_field_types_) ||
 							edn::ir::memory_ops::handle_member_addr(S, il, struct_types_, struct_field_index_, struct_field_types_) ||

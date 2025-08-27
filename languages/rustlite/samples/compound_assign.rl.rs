@@ -1,8 +1,8 @@
 fn main() {
-  let x: i32 = 1;
+  let mut x: i32 = 1;
   x += 2;
   x *= 3;
   x -= 4;
   x /= 5;
-  return x;
+  // result in x unused (parser exercise)
 }

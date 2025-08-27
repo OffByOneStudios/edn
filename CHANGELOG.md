@@ -18,6 +18,13 @@ All notable changes will be documented here once releases begin.
 	- Member vs member-addr pointer distinction
 	- Negative type checking tests
 - vcpkg port scaffold
+### Added (Rustlite Macros & Literals)
+- Rustlite enum macro `renum` test driver.
+- Literal convenience macros `rcstr` / `rbytes` backed by new core ops `cstr` / `bytes` emitting private interned constant globals (string escape decoding + deduplication).
+- Negative literals test covering malformed usages and byte range validation.
+- Extern data sugar macros `rextern-global` / `rextern-const`.
+### Internals
+- Literal emission now interns identical strings/byte sequences to a single LLVM global, reducing duplication.
 ### Added (Phase 2 Progress)
 - Unsigned integer types (u8/u16/u32/u64) and associated arithmetic/division and comparison predicates.
 - Canonical `(icmp ...)` and `(fcmp ...)` predicate-based comparison instructions.

@@ -2,6 +2,9 @@
 #include "edn/transform.hpp"
 #include <string>
 
+// Restored macros: rcstr, rbytes, rextern-global, rextern-const and refactored rindex* helper.
+// This comment also forces recompilation to ensure the latest expansion logic is picked up.
+
 using namespace edn;
 
 namespace rustlite {
@@ -13,6 +16,57 @@ static std::string gensym(const std::string& base){ static uint64_t n=0; return 
 
 edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     Transformer tx;
+    // ---------------------------------------------------------------------
+    // Literal convenience macros (restored): rcstr / rbytes
+    //  (rcstr %dst "literal")  -> (cstr %dst "literal") with escape decoding retained in core op
+    //  (rbytes %dst [ b* ])     -> (bytes %dst [ b* ])
+    // We still rely on core type checker & emitter for validation / interning; macro just validates shape.
+    tx.add_macro("rcstr", [](const list& form)->std::optional<node_ptr>{
+        auto &el = form.elems; if(el.size()!=3) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        // Accept either a symbol token representing a quoted literal (parser responsibility) or a raw string node if introduced later.
+        if(!std::holds_alternative<symbol>(el[2]->data)) return std::nullopt; // "literal"
+        list l; l.elems = { make_sym("cstr"), el[1], el[2] };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+    tx.add_macro("rbytes", [](const list& form)->std::optional<node_ptr>{
+        auto &el = form.elems; if(el.size()!=3) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
+        if(!std::holds_alternative<vector_t>(el[2]->data)) return std::nullopt; // [ ints ]
+        // Light validation: ensure each element is an int literal node variant or symbol convertible later; deeper range checks done in type checker.
+        for(auto &b : std::get<vector_t>(el[2]->data).elems){
+            if(!(std::holds_alternative<int64_t>(b->data) || std::holds_alternative<symbol>(b->data))){
+                return std::nullopt;
+            }
+        }
+        list l; l.elems = { make_sym("bytes"), el[1], el[2] };
+        return std::make_shared<node>( node{ l, form.elems.front()->metadata } );
+    });
+
+    // ---------------------------------------------------------------------
+    // External data sugar (restored): rextern-global / rextern-const
+    //  (rextern-global :name X :type T) -> (global :name X :type T :external true)
+    //  (rextern-const  :name X :type T) -> same (alias; future differentiation possible)
+    auto extern_global_macro = [](const list& form)->std::optional<node_ptr>{
+        auto &el = form.elems; if(el.size()<3) return std::nullopt;
+        node_ptr nameN=nullptr; node_ptr typeN=nullptr; node_ptr constN=nullptr; node_ptr initN=nullptr; node_ptr externalN=nullptr;
+        for(size_t i=1;i+1<el.size(); i+=2){
+            if(!std::holds_alternative<keyword>(el[i]->data)) break;
+            auto kw = std::get<keyword>(el[i]->data).name; auto v = el[i+1];
+            if(kw=="name") nameN=v; else if(kw=="type") typeN=v; else if(kw=="const") constN=v; else if(kw=="init") initN=v; else if(kw=="external") externalN=v;
+        }
+        if(!nameN || !typeN) return std::nullopt;
+        list g; g.elems.push_back(make_sym("global"));
+        g.elems.push_back(make_kw("name")); g.elems.push_back(nameN);
+        g.elems.push_back(make_kw("type")); g.elems.push_back(typeN);
+        if(constN){ g.elems.push_back(make_kw("const")); g.elems.push_back(constN); }
+        if(initN){ g.elems.push_back(make_kw("init")); g.elems.push_back(initN); }
+        // Force :external true if not already specified
+        g.elems.push_back(make_kw("external")); g.elems.push_back(std::make_shared<node>( node{ true, {} } ));
+        return std::make_shared<node>( node{ g, form.elems.front()->metadata } );
+    };
+    tx.add_macro("rextern-global", extern_global_macro);
+    tx.add_macro("rextern-const", extern_global_macro);
     // rlet / rmut macros: (rlet <type> %name %init :body [ ... ])
     // Lower to a block with a simple definition using 'as' to set the SSA var's type, then emit the body.
     // We wrap in a (block :body [ ... ]) so the macro expands to a single list-form instruction,
@@ -765,39 +819,20 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     });
 
     // Array indexing sugar
-    // rindex-addr: (rindex-addr %dst <ElemType> %base %idx) -> (index %dst <ElemType> %base %idx)
+    // rindex-family refactored to shared helper to reduce duplication.
+    auto index_load_block = [](node_ptr dst, node_ptr elemTy, node_ptr base, node_ptr idx, bool doLoad)->node_ptr{
+        vector_t body; auto p = make_sym(gensym("elem"));
+        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
+        if(doLoad){ list ld; ld.elems = { make_sym("load"), dst, elemTy, p }; body.elems.push_back(std::make_shared<node>( node{ ld, {} } )); }
+        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, {} } );
+    };
     tx.add_macro("rindex-addr", [](const list& form)->std::optional<node_ptr>{
-        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
-        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
-        list ix; ix.elems = { make_sym("index"), el[1], el[2], el[3], el[4] };
-        return std::make_shared<node>( node{ ix, form.elems.front()->metadata } );
-    });
-    // rindex: (rindex %dst <ElemType> %base %idx)
-    // Lowers to block:
-    //   (index %p <ElemType> %base %idx)
-    //   (load %dst <ElemType> %p)
-    tx.add_macro("rindex", [](const list& form)->std::optional<node_ptr>{
-        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
-        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; // %dst
-        node_ptr dst=el[1], elemTy=el[2], base=el[3], idx=el[4];
-        vector_t body; auto p = make_sym(gensym("elem"));
-        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
-        { list ld; ld.elems = { make_sym("load"), dst, elemTy, p }; body.elems.push_back(std::make_shared<node>( node{ ld, {} } )); }
-        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
-        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
-    });
-
-    // rindex-load: (rindex-load %dst <ElemType> %base %idx) -> index + load
-    tx.add_macro("rindex-load", [](const list& form)->std::optional<node_ptr>{
-        auto& el=form.elems; if(el.size()!=5) return std::nullopt;
-        if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt;
-        node_ptr dst=el[1], elemTy=el[2], base=el[3], idx=el[4];
-        vector_t body; auto p = make_sym(gensym("elem"));
-        { list ix; ix.elems = { make_sym("index"), p, elemTy, base, idx }; body.elems.push_back(std::make_shared<node>( node{ ix, {} } )); }
-        { list ld; ld.elems = { make_sym("load"), dst, elemTy, p }; body.elems.push_back(std::make_shared<node>( node{ ld, {} } )); }
-        list blockL; blockL.elems = { make_sym("block"), make_kw("body"), std::make_shared<node>( node{ body, {} } ) };
-        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
-    });
+        auto &el=form.elems; if(el.size()!=5) return std::nullopt; if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; list ix; ix.elems={ make_sym("index"), el[1], el[2], el[3], el[4] }; return std::make_shared<node>( node{ ix, form.elems.front()->metadata } ); });
+    tx.add_macro("rindex", [index_load_block](const list& form)->std::optional<node_ptr>{
+        auto &el=form.elems; if(el.size()!=5) return std::nullopt; if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; return index_load_block(el[1], el[2], el[3], el[4], true); });
+    tx.add_macro("rindex-load", [index_load_block](const list& form)->std::optional<node_ptr>{
+        auto &el=form.elems; if(el.size()!=5) return std::nullopt; if(!std::holds_alternative<symbol>(el[1]->data)) return std::nullopt; return index_load_block(el[1], el[2], el[3], el[4], true); });
 
     // rindex-store: (rindex-store <ElemType> %base %idx %val)
     // Lowers to block:

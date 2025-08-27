@@ -1,4 +1,4 @@
 // Empty call statement
-fn main() {
-    foo();
-}
+fn foo() {}
+
+fn main() { foo(); }

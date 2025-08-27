@@ -6,6 +6,7 @@ void run_phase3_addr_deref_tests();
 void run_phase3_fnptr_tests();
 int run_phase3_typedef_tests();
 int run_phase3_enum_tests();
+int run_phase3_struct_decl_tests();
 void phase3_for_continue_tests();
 void run_phase3_switch_tests();
 int run_phase3_union_tests();
@@ -22,6 +23,7 @@ int main(){
     run_phase3_fnptr_tests();
     (void)run_phase3_typedef_tests();
     (void)run_phase3_enum_tests();
+    (void)run_phase3_struct_decl_tests();
     phase3_for_continue_tests();
     run_phase3_switch_tests();
     (void)run_phase3_union_tests();

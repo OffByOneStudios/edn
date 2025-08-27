@@ -220,7 +220,43 @@ inline TypeId TypeChecker::parse_type_node(const node_ptr& n, TypeCheckResult& r
         if(it!=typedefs_.end()) return it->second;
     }
     try { return ctx_.parse_type(n); } catch(const parse_error& e){ r.success=false; error(r,*n,e.what()); return ctx_.get_base(BaseType::I32);} }
-inline bool TypeChecker::parse_struct(TypeCheckResult& r, const node_ptr& n){ if(!n||!std::holds_alternative<list>(n->data)) return false; auto &l=std::get<list>(n->data).elems; if(l.empty()) return false; if(!std::holds_alternative<symbol>(l[0]->data)||std::get<symbol>(l[0]->data).name!="struct") return false; std::string name; std::vector<FieldInfo> fields; std::unordered_set<std::string> names; for(size_t i=1;i<l.size(); ++i){ if(!l[i]||!std::holds_alternative<keyword>(l[i]->data)) break; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i]; if(kw=="name"){ if(std::holds_alternative<symbol>(val->data)) name=std::get<symbol>(val->data).name; else if(std::holds_alternative<std::string>(val->data)) name=std::get<std::string>(val->data); else { r.success=false; error(r,*val,"struct :name expects symbol or string"); } } else if(kw=="fields"){ if(!val||!std::holds_alternative<vector_t>(val->data)){ r.success=false; error(r,*val,":fields expects vector"); continue; } auto &vec=std::get<vector_t>(val->data).elems; size_t idx=0; for(auto &f: vec){ if(!f||!std::holds_alternative<list>(f->data)){ r.success=false; error(r,*val,"field entry must be list"); continue; } auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){ if(fl[k] && std::holds_alternative<keyword>(fl[k]->data)){ std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k]; if(fkw=="name"){ if(std::holds_alternative<symbol>(v->data)) fname=std::get<symbol>(v->data).name; else { r.success=false; error(r,*v,"field :name expects symbol"); } } else if(fkw=="type"){ fty=parse_type_node(v,r); } } } if(fname.empty()){ r.success=false; error(r,*f,"field missing name"); continue;} if(names.count(fname)){ r.success=false; error(r,*f,"duplicate field"); continue;} names.insert(fname); fields.push_back(FieldInfo{fname,fty,idx++}); } } } if(name.empty()){ r.success=false; error(r,*n,"struct missing :name"); return true; } if(structs_.count(name)){ r.success=false; error(r,*n,"duplicate struct name"); } StructInfo si; si.name=name; si.fields=std::move(fields); for(auto &f: si.fields) si.field_map[f.name]=&f; structs_[name]=std::move(si); return true; }
+inline bool TypeChecker::parse_struct(TypeCheckResult& r, const node_ptr& n){
+    // Recognize (struct :name S :fields [ (field :name x :type i32) ... ])
+    if(!n||!std::holds_alternative<list>(n->data)) return false; auto &l=std::get<list>(n->data).elems; if(l.empty()) return false; if(!std::holds_alternative<symbol>(l[0]->data)||std::get<symbol>(l[0]->data).name!="struct") return false;
+    std::string name; bool haveFields=false; std::vector<FieldInfo> fields; std::unordered_set<std::string> names;
+    for(size_t i=1;i<l.size(); ++i){
+        if(!l[i] || !std::holds_alternative<keyword>(l[i]->data)) break; std::string kw=std::get<keyword>(l[i]->data).name; if(++i>=l.size()) break; auto val=l[i];
+        if(kw=="name"){
+            if(std::holds_alternative<symbol>(val->data)) name=std::get<symbol>(val->data).name;
+            else if(std::holds_alternative<std::string>(val->data)) name=std::get<std::string>(val->data);
+            else { error_code(r,*val,"E1400","struct missing :name","provide (struct :name S :fields [...])"); r.success=false; }
+        } else if(kw=="fields"){
+            haveFields=true; if(!val||!std::holds_alternative<vector_t>(val->data)){ error_code(r,*val,"E1401","struct missing :fields","add :fields [ (field :name a :type i32) ... ]"); r.success=false; continue; }
+            auto &vec=std::get<vector_t>(val->data).elems; size_t idx=0; if(vec.empty()){ error_code(r,*val,"E1407","struct empty :fields","add at least one field"); r.success=false; }
+            for(auto &f: vec){
+                if(!f||!std::holds_alternative<list>(f->data)){ error_code(r,*val,"E1402","struct field malformed","use (field :name a :type i32)"); r.success=false; continue; }
+                auto &fl=std::get<list>(f->data).elems; std::string fname; TypeId fty=0; for(size_t k=0;k<fl.size(); ++k){
+                    if(fl[k] && std::holds_alternative<keyword>(fl[k]->data)){
+                        std::string fkw=std::get<keyword>(fl[k]->data).name; if(++k>=fl.size()) break; auto v=fl[k];
+                        if(fkw=="name"){
+                            if(std::holds_alternative<symbol>(v->data)) fname=std::get<symbol>(v->data).name; else { error_code(r,*v,"E1403","struct field missing name","field :name expects symbol"); r.success=false; }
+                        } else if(fkw=="type"){
+                            fty=parse_type_node(v,r); if(!fty){ error_code(r,*v,"E1404","struct field type invalid","fix :type form"); r.success=false; }
+                        }
+                    }
+                }
+                if(fname.empty()){ error_code(r,*f,"E1403","struct field missing name","add (field :name a :type i32)"); r.success=false; continue; }
+                if(names.count(fname)){ error_code(r,*f,"E1405","struct duplicate field","rename field"); r.success=false; continue; }
+                names.insert(fname);
+                if(!fty){ error_code(r,*f,"E1404","struct field type invalid","add :type <type>"); r.success=false; }
+                fields.push_back(FieldInfo{fname,fty,idx++});
+            }
+        }
+    }
+    if(name.empty()){ error_code(r,*n,"E1400","struct missing :name","provide (struct :name S :fields [...])"); r.success=false; return true; }
+    if(!haveFields){ error_code(r,*n,"E1401","struct missing :fields","add :fields [ (field :name a :type i32) ... ]"); r.success=false; }
+    if(structs_.count(name)){ error_code(r,*n,"E1406","struct redefinition","choose unique struct name"); r.success=false; }
+    StructInfo si; si.name=name; si.fields=std::move(fields); for(auto &f: si.fields) si.field_map[f.name]=&f; structs_[name]=std::move(si); return true; }
 inline bool TypeChecker::parse_function_header(TypeCheckResult& r, const node_ptr& fn, FunctionInfoTC& out_fn){ if(!fn||!std::holds_alternative<list>(fn->data)) return false; auto &fl=std::get<list>(fn->data).elems; if(fl.empty()) return false; if(!std::holds_alternative<symbol>(fl[0]->data)||std::get<symbol>(fl[0]->data).name!="fn") return false; std::string name; TypeId ret=ctx_.get_base(BaseType::Void); std::vector<ParamInfoTC> params; bool variadic=false; bool external=false; for(size_t i=1;i<fl.size(); ++i){ if(fl[i] && std::holds_alternative<keyword>(fl[i]->data)){ std::string kw=std::get<keyword>(fl[i]->data).name; if(++i>=fl.size()) break; auto val=fl[i]; if(kw=="name"){ if(std::holds_alternative<std::string>(val->data)) name=std::get<std::string>(val->data); } else if(kw=="ret"){ ret=parse_type_node(val,r); } else if(kw=="params"){ if(val && std::holds_alternative<vector_t>(val->data)){ for(auto &p: std::get<vector_t>(val->data).elems){ if(!p||!std::holds_alternative<list>(p->data)) continue; auto &pl=std::get<list>(p->data).elems; if(pl.size()==3 && std::holds_alternative<symbol>(pl[0]->data) && std::get<symbol>(pl[0]->data).name=="param"){ TypeId pty=parse_type_node(pl[1],r); std::string v; if(std::holds_alternative<symbol>(pl[2]->data)){ v=std::get<symbol>(pl[2]->data).name; if(!v.empty()&&v[0]=='%') v.erase(0,1);} params.push_back(ParamInfoTC{v,pty}); } } } } else if(kw=="vararg"){ if(val && std::holds_alternative<bool>(val->data)) variadic=std::get<bool>(val->data); else { error(r,*val,":vararg expects bool"); r.success=false; } } else if(kw=="external"){ if(val && std::holds_alternative<bool>(val->data)) external=std::get<bool>(val->data); else { error(r,*val,":external expects bool"); r.success=false; } } } } if(name.empty()){ r.success=false; error(r,*fn,"function missing :name"); } out_fn.name=name; out_fn.ret=ret; out_fn.params=std::move(params); out_fn.variadic=variadic; out_fn.external=external; return true; }
 inline void TypeChecker::collect_structs(TypeCheckResult& r, const std::vector<node_ptr>& elems){ for(size_t i=1;i<elems.size(); ++i) parse_struct(r, elems[i]); }
 inline void TypeChecker::collect_functions_headers(TypeCheckResult& r, const std::vector<node_ptr>& elems){ for(size_t i=1;i<elems.size(); ++i){ FunctionInfoTC fi; if(parse_function_header(r, elems[i], fi)){ if(functions_.count(fi.name)){ error(r,*elems[i],"duplicate function name"); r.success=false; } else functions_[fi.name]=fi; } } }
@@ -252,7 +288,7 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
             auto noteDef=[&](const std::string& s){ if(!s.empty()&&s[0]=='%') defined.insert(s.substr(1)); };
             if(!reachable){ rep.emit_warning(rep.make_warning("W1402","unreachable code","code cannot execute after terminator", line(*n), col(*n))); }
             // Collect defs/uses for a few ops
-            if(op=="const"||op=="alloca"||op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="icmp"||op=="fcmp"||op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv"||op=="load"||op=="phi"||op=="member"||op=="member-addr"||op=="sum-new"||op=="sum-is"||op=="sum-get"||op=="array-lit"||op=="struct-lit"||op=="call"||op=="call-indirect"||op=="addr"||op=="deref"||op=="index"||op=="gload"||op=="va-start"||op=="va-arg"||op=="panic"){
+            if(op=="const"||op=="alloca"||op=="add"||op=="sub"||op=="mul"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="icmp"||op=="fcmp"||op=="fadd"||op=="fsub"||op=="fmul"||op=="fdiv"||op=="load"||op=="phi"||op=="member"||op=="member-addr"||op=="sum-new"||op=="sum-is"||op=="sum-get"||op=="array-lit"||op=="struct-lit"||op=="call"||op=="call-indirect"||op=="addr"||op=="deref"||op=="index"||op=="gload"||op=="va-start"||op=="va-arg"||op=="panic"||op=="cstr"||op=="bytes"){
                 if(il.size()>=2) noteDef(symAt(1));
                 for(size_t k=2;k<il.size();++k){ if(std::holds_alternative<symbol>(il[k]->data)) noteUse(std::get<symbol>(il[k]->data).name); }
             } else if(op=="assign"){ if(il.size()>=3){ noteUse(symAt(2)); noteUse(symAt(1)); } }
@@ -867,13 +903,28 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1316","redefinition of variable","rename destination"); r.success=false; }
         var_types_[dst.substr(1)]=annot; attach(n,annot); continue; }
     if(op=="deref"){ // (deref %dst <T> %ptr)
-        if(il.size()!=4){ error_code(r,*n,"E1317","deref arity","expected (deref %dst <type> %ptr)"); r.success=false; continue; }
+        if(il.size()!=4){ error_code(r,*n,"E1317","deref arity","expected (deref %dst <type> %ptr)" ); r.success=false; continue; }
         std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1318","deref dst must be %var","prefix destination with %"); r.success=false; continue; }
         TypeId ty=parse_type_node(il[2],r); std::string ptr=sym(3); if(ptr.empty()||ptr[0] != '%'){ error_code(r,*n,"E1319","deref ptr must be %var","prefix pointer with %"); r.success=false; continue; }
         auto pt=get_var(ptr.substr(1)); if(pt==(TypeId)-1){ error_code(r,*n,"E1319","deref ptr must be %var","pointer var undefined"); r.success=false; }
-    else { const Type& PT=ctx_.at(pt); if(PT.kind!=Type::Kind::Pointer || PT.pointee!=ty){ if(PT.kind==Type::Kind::Pointer) type_mismatch(r,*n,"E1319","deref ptr",ty,PT.pointee); else error_code(r,*n,"E1319","deref ptr type mismatch","pointer pointee must match <type>"); r.success=false; } }
+        else { const Type& PT=ctx_.at(pt); if(PT.kind!=Type::Kind::Pointer || PT.pointee!=ty){ if(PT.kind==Type::Kind::Pointer) type_mismatch(r,*n,"E1319","deref ptr",ty,PT.pointee); else error_code(r,*n,"E1319","deref ptr type mismatch","pointer pointee must match <type>"); r.success=false; } }
         if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1316","redefinition of variable","rename destination"); r.success=false; }
         var_types_[dst.substr(1)]=ty; attach(n,ty); continue; }
+    if(op=="cstr"){ // (cstr %dst "literal") => %dst : (ptr i8)
+        if(il.size()!=3){ error_code(r,*n,"E1500","cstr arity","expected (cstr %dst \"literal\")"); r.success=false; continue; }
+        std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1501","cstr dst must be %var","prefix destination with %"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1502","cstr dst already defined","use fresh SSA name"); r.success=false; }
+        if(!std::holds_alternative<symbol>(il[2]->data)){ error_code(r,*n,"E1503","cstr literal must be symbol","string literal token expected"); r.success=false; continue; }
+        std::string lit = std::get<symbol>(il[2]->data).name; if(lit.size()<2 || lit.front()!='"' || lit.back()!='"'){ error_code(r,*n,"E1504","cstr literal malformed","wrap in quotes"); r.success=false; }
+        TypeId pI8 = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); var_types_[dst.substr(1)] = pI8; attach(n,pI8); continue; }
+    if(op=="bytes"){ // (bytes %dst [ ints ]) => %dst : (ptr i8)
+        if(il.size()!=3){ error_code(r,*n,"E1510","bytes arity","expected (bytes %dst [ i8* ])"); r.success=false; continue; }
+        std::string dst=sym(1); if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1511","bytes dst must be %var","prefix destination with %"); r.success=false; continue; }
+        if(var_types_.count(dst.substr(1))){ error_code(r,*n,"E1512","bytes dst already defined","use fresh SSA name"); r.success=false; }
+        if(!std::holds_alternative<vector_t>(il[2]->data)){ error_code(r,*n,"E1513","bytes expects vector","wrap values in [ ]"); r.success=false; continue; }
+        auto &vec = std::get<vector_t>(il[2]->data).elems; if(vec.empty()){ error_code(r,*n,"E1514","bytes vector empty","provide at least one element"); r.success=false; }
+        for(auto &v : vec){ if(!v || !std::holds_alternative<int64_t>(v->data)){ error_code(r,*n,"E1515","bytes element must be int","use integer 0..255"); r.success=false; break; } else { auto val = std::get<int64_t>(v->data); if(val<0 || val>255){ error_code(r,*n,"E1516","bytes element out of range","values must be 0..255"); r.success=false; break; } } }
+        TypeId pI8 = ctx_.get_pointer(ctx_.get_base(BaseType::I8)); var_types_[dst.substr(1)] = pI8; attach(n,pI8); continue; }
     // --- Phase 3.3 Function Pointers & Indirect Call ---
     if(op=="fnptr"){ // (fnptr %dst (ptr (fn-type ...)) FunctionName)
         if(il.size()!=4){ error_code(r,*n,"E1329","fnptr arity","expected (fnptr %dst (ptr (fn-type ...)) Name)"); r.success=false; continue; }

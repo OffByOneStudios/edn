@@ -34,7 +34,7 @@ if(TARGET edn)
 endif()
 target_compile_features(rustlite_minidriver PRIVATE cxx_std_20)
 add_test(NAME rustlite.fields_index COMMAND rustlite_minidriver)
-set_tests_properties(rustlite.fields_index PROPERTIES DISABLED TRUE)
+set_tests_properties(rustlite.fields_index PROPERTIES DISABLED FALSE)
 
 add_executable(rustlite_negdriver tools/rustlite_negdriver.cpp)
 if(TARGET edn)
@@ -88,6 +88,97 @@ endif()
 target_compile_features(rustlite_logicdriver PRIVATE cxx_std_20)
 add_test(NAME rustlite.logic COMMAND rustlite_logicdriver)
 
+# rfor driver (macro coverage for for-loop lowering)
+add_executable(rustlite_rfor_driver tools/rustlite_rfor_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_rfor_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_rfor_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rfor COMMAND rustlite_rfor_driver)
+
+# struct fields dedicated driver
+add_executable(rustlite_struct_fields_driver tools/rustlite_struct_fields_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_struct_fields_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_struct_fields_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.struct_fields COMMAND rustlite_struct_fields_driver)
+
+# indexing dedicated driver
+add_executable(rustlite_indexing_driver tools/rustlite_indexing_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_indexing_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_indexing_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.indexing COMMAND rustlite_indexing_driver)
+
+# tuple/array (Phase A) smoke driver
+add_executable(rustlite_tuple_array_driver tools/rustlite_tuple_array_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_tuple_array_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_tuple_array_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_array COMMAND rustlite_tuple_array_driver)
+
+# tuple basic driver
+add_executable(rustlite_tuple_basic_driver tools/rustlite_tuple_basic_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_tuple_basic_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_tuple_basic_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_basic COMMAND rustlite_tuple_basic_driver)
+
+# closure positive driver
+add_executable(rustlite_closure_driver tools/rustlite_closure_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_closure_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_closure_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.closure COMMAND rustlite_closure_driver)
+
+# closure negative driver
+add_executable(rustlite_closure_negdriver tools/rustlite_closure_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_closure_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_closure_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.closure_neg COMMAND rustlite_closure_negdriver)
+set_tests_properties(rustlite.closure_neg PROPERTIES LABELS "rustlite-neg")
+
+# option/result dedicated driver
+add_executable(rustlite_option_result_driver tools/rustlite_option_result_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_option_result_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_option_result_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.option_result COMMAND rustlite_option_result_driver)
+
+# fnptr driver
+add_executable(rustlite_fnptr_driver tools/rustlite_fnptr_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_fnptr_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_fnptr_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.fnptr COMMAND rustlite_fnptr_driver)
+
+# trait negative arity driver
+add_executable(rustlite_trait_negdriver tools/rustlite_trait_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_trait_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_trait_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.trait_neg COMMAND rustlite_trait_negdriver)
+set_tests_properties(rustlite.trait_neg PROPERTIES LABELS "rustlite-neg")
+
+# extern-global missing init negative (const extern without :init)
+add_executable(rustlite_extern_global_init_negdriver tools/rustlite_extern_global_init_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_extern_global_init_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_extern_global_init_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.extern_global_init_neg COMMAND rustlite_extern_global_init_negdriver)
+set_tests_properties(rustlite.extern_global_init_neg PROPERTIES LABELS "rustlite-neg")
+
 # rwhile-let driver
 add_executable(rustlite_rwhilelet_driver tools/rustlite_rwhilelet_driver.cpp)
 if(TARGET edn)
@@ -111,6 +202,32 @@ if(TARGET edn)
 endif()
 target_compile_features(rustlite_rdot_negdriver PRIVATE cxx_std_20)
 add_test(NAME rustlite.rdot_neg COMMAND rustlite_rdot_negdriver)
+set_tests_properties(rustlite.rdot_neg PROPERTIES LABELS "rustlite-neg")
+
+# renum + rmatch demo driver
+add_executable(rustlite_enum_driver tools/rustlite_enum_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_enum_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_enum_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.enum COMMAND rustlite_enum_driver)
+
+# rmake-trait-obj focused driver
+add_executable(rustlite_make_trait_obj_driver tools/rustlite_make_trait_obj_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_make_trait_obj_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_make_trait_obj_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.make_trait_obj COMMAND rustlite_make_trait_obj_driver)
+
+# rcstr unknown escape permissive behavior driver
+add_executable(rustlite_cstr_unknown_escape_driver tools/rustlite_cstr_unknown_escape_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_cstr_unknown_escape_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_cstr_unknown_escape_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.cstr_unknown_escape COMMAND rustlite_cstr_unknown_escape_driver)
+
 
 # Parser library (OBJECT for now to keep compile scoping simple)
 add_library(rustlite_parser OBJECT
@@ -157,6 +274,7 @@ add_test(NAME rustlite.cli_fn_params COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DI
 add_test(NAME rustlite.cli_compound_assign COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/compound_assign.rl.rs)
 add_test(NAME rustlite.cli_let_mut COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/let_mut.rl.rs)
 add_test(NAME rustlite.cli_complex_lowering COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/complex_lowering.rl.rs)
+add_test(NAME rustlite.cli_enum_basic COMMAND rustlitec ${CMAKE_CURRENT_SOURCE_DIR}/samples/enum_basic.rl.rs)
 
 # End-to-end driver: parse Rustlite source -> EDN -> expand -> typecheck -> emit IR
 add_executable(rustlite_e2e_driver tools/rustlite_e2e_driver.cpp $<TARGET_OBJECTS:rustlite_parser>)
@@ -187,3 +305,52 @@ set_tests_properties(rustlite.jit_return_debug PROPERTIES PASS_REGULAR_EXPRESSIO
 add_test(NAME rustlite.jit_complex_debug COMMAND rustlite_jit_driver ${CMAKE_CURRENT_SOURCE_DIR}/samples/complex_lowering.rl.rs --debug)
 set_tests_properties(rustlite.jit_complex_debug PROPERTIES PASS_REGULAR_EXPRESSION "=== Rust Source ===.*=== Frontend EDN ===.*=== Lowered Core EDN ===.*=== JIT Result ===")
 set_tests_properties(rustlite.jit_complex_debug PROPERTIES DISABLED TRUE)
+
+# literals demo driver
+add_executable(rustlite_literals_driver tools/rustlite_literals_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_literals_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_literals_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.literals COMMAND rustlite_literals_driver)
+
+# extern globals + literal interning reuse driver
+add_executable(rustlite_extern_globals_driver tools/rustlite_extern_globals_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_extern_globals_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_extern_globals_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.extern_globals COMMAND rustlite_extern_globals_driver)
+
+# extern globals negative driver
+add_executable(rustlite_extern_globals_negdriver tools/rustlite_extern_globals_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_extern_globals_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_extern_globals_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.extern_globals_neg COMMAND rustlite_extern_globals_negdriver)
+set_tests_properties(rustlite.extern_globals_neg PROPERTIES LABELS "rustlite-neg")
+
+# literals alias/interning audit
+add_executable(rustlite_literals_alias_audit_driver tools/rustlite_literals_alias_audit_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_literals_alias_audit_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_literals_alias_audit_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.literals_alias_audit COMMAND rustlite_literals_alias_audit_driver)
+
+# literals negative driver
+add_executable(rustlite_literals_negdriver tools/rustlite_literals_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_literals_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_literals_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.literals_neg COMMAND rustlite_literals_negdriver)
+set_tests_properties(rustlite.literals_neg PROPERTIES LABELS "rustlite-neg")
+
+# rustlite_index_addr_driver driver
+add_executable(rustlite_index_addr_driver tools/rustlite_index_addr_driver.cpp)
+  target_link_libraries(rustlite_index_addr_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_index_addr_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.index_addr COMMAND rustlite_index_addr_driver)
+

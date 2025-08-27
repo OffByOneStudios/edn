@@ -37,6 +37,7 @@ Status: Initial extraction on 2025-08-14. Keep this file in sync when adding / r
 | E137x    | For loop construct                      |
 | E138x    | Continue statement                      |
 | E139x    | Switch construct                        |
+| E140x    | Struct declarations                      |
 | E13Ax    | Cast sugar `(as ...)`                   |
 | E143x    | Closures & captures `(closure ...)`      |
 
@@ -408,6 +409,18 @@ Form: `(switch %expr :cases [ (case <int> [ ... ])* ] :default [ ... ])`
 | E1397 | switch missing :default   | No `:default` section or malformed vector      | add `:default [ ... ]` |
 | E1398 | (reserved)                | —                                              | — |
 | E1399 | (reserved)                | —                                              | — |
+
+### E140x – Struct Declarations
+| Code  | Title                        | Condition                                   | Hint |
+|-------|------------------------------|---------------------------------------------|------|
+| E1400 | struct missing :name         | No :name keyword / invalid name node        | provide `(struct :name S :fields [...])` |
+| E1401 | struct missing :fields       | No :fields vector present                   | add `:fields [ (field :name a :type i32) ... ]` |
+| E1402 | struct field malformed       | Field entry not list / wrong shape          | use `(field :name a :type i32)` |
+| E1403 | struct field missing name    | Field missing :name symbol                  | add `:name <sym>` |
+| E1404 | struct field type invalid    | Parse/type form error or missing :type      | supply valid `:type <type>` |
+| E1405 | struct duplicate field       | Repeated field name within struct           | rename field |
+| E1406 | struct redefinition          | Struct name already declared                | choose unique struct name |
+| E1407 | struct empty :fields         | :fields vector empty                        | add at least one field |
 
 ---
 
