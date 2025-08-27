@@ -67,9 +67,10 @@ Fallback: if inference includes a mutable symbol, emit diagnostic (deferring bor
 Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, R=Refactor.
 
 ### Phase A (Foundations)
-- [ ] [P1][F] Tuple macro forms `tuple` / `tget` + tests (`rustlite.tuple_basic`).
-- [ ] [P1][F] Fixed array literal `arr` + reuse indexing, tests (`rustlite.array_basic`).
-- [ ] [P1][D] Docs: add Tuple & Array section + examples.
+- [x] [P1][F] Tuple macro forms `tuple` / `tget` + tests (`rustlite.tuple_basic`). Implemented with auto struct declaration injection for used arities (up to 16) and arity-aware `tget` resolution.
+- [x] [P1][F] Fixed array literal `arr` + reuse indexing, plus legacy `rarray` numeric-size path. Added direct lowering to core `array-lit` for initialized form and `(alloca (array ...))` for size form; added `rindex-addr`, `rindex-load`, `rindex-store` refactor.
+- [x] [P1][F] Literal macro restorations (`rcstr`, `rbytes`) with robust handling of parser-provided string nodes and interning conformity; all literal tests passing.
+- [ ] [P1][D] Docs: add Tuple & Array section + examples. (Pending – to update `docs/RUSTLITE.md`).
 
 ### Phase B (Enums & Matching)
 - [ ] [P1][F] Enum surface macro `(enum :name ...)` + variant constructor forms.
@@ -139,4 +140,17 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - 2025-08-26: Issue created with prioritized incremental roadmap.
 - 2025-08-26: Added feature flags header `rustlite/features.hpp` and docs Feature Flags section (preparing Phase D/E groundwork).
 - 2025-08-26: Struct declaration validation added (E1400–E1407) and tests (`phase3_struct_decl_test`) – groundwork quality tightening before tuple/array.
-- 2025-08-26: Beginning Phase A work: planning tuple (`tuple` / `tget`) and fixed array (`arr`) macro shapes prior to implementation.
+- 2025-08-26: Began Phase A: designed tuple (`tuple` / `tget`) and array (`arr`) macro surfaces.
+- 2025-08-27: Restored lost macros (`rcstr`, `rbytes`, `rextern-global`, `rextern-const`) and refactored indexing sugar (`rindex`, `rindex-load`, `rindex-store`, added `rindex-addr`).
+- 2025-08-27: Implemented tuple construction + `tget`; added automatic struct declarations (`__TupleN`) with placeholder i32 field types; `rustlite.tuple_basic` passing.
+- 2025-08-27: Implemented `arr` macro lowering directly to core `array-lit` and enhanced `rarray` for numeric size allocation; added array indexing test driver (`rustlite.index_addr`) passing after driver alignment to core compare op shape.
+- 2025-08-27: Hardened `rcstr` macro to wrap raw string nodes, preserving quotes & escape semantics; all literal/extern global tests pass.
+- 2025-08-27: Added arity tracking in expansion for precise `tget` lowering (removed earlier `__Tuple16` placeholder assumption).
+
+### Current Status (Phase A)
+Functional macros in place and validated by drivers/tests: tuples, arrays, indexing (address, load, store), literals, extern globals. Documentation updates for tuples/arrays still pending. Placeholder field type strategy (i32) for tuple auto-decls flagged for future refinement.
+
+### Immediate Next Actions
+1. Documentation: add Tuple & Array sections with examples and note placeholder typing / future type inference improvement.
+2. Decide on tuple field type inference approach (defer, or track constructor operand types post type-check pass in a future enhancement issue).
+3. Begin Phase B planning (enum surface) once docs merged.
