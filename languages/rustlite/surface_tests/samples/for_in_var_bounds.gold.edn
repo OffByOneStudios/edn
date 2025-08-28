@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (const %__rl_c1 i32 1) (as %start i32 %__rl_c1) (const %__rl_c2 i32 4) (as %end i32 %__rl_c2) (rfor %i %start %end :body []) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

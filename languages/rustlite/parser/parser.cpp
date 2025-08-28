@@ -103,8 +103,9 @@ struct stmt : sor< if_stmt, while_stmt, loop_stmt, for_in_stmt, return_stmt, bre
 // Padded braces so we can hook actions reliably
 struct lb_padded : ws< lbrace > {};
 struct rb_padded : ws< rbrace > {};
-// Tail expression (no trailing semicolon) allowed at end of block
-struct tail_expr : ws< cond_expr > {};
+// Tail expression (no trailing semicolon) allowed at end of block. Accept arbitrary expression text until '}' to allow operators.
+struct tail_expr_raw : until< at< rb_padded >, any > {};
+struct tail_expr : ws< tail_expr_raw > {};
 struct block_rule : seq< lb_padded,
                                      star< space_or_comment >,
                                      star< stmt >,
@@ -594,8 +595,11 @@ template<>
 struct action< tail_expr > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-    auto* fn = ensure_fn(st); if(!fn) return; if(fn->saw_ret) return; // already have explicit return
+        auto* fn = ensure_fn(st); if(!fn) return; if(fn->saw_ret) return;
         std::string expr = in.string();
+        // Trim whitespace
+        size_t a=0; while(a<expr.size() && isspace((unsigned char)expr[a])) ++a; size_t b=expr.size(); while(b>0 && isspace((unsigned char)expr[b-1])) --b; if(b>a) expr = expr.substr(a,b-a); else expr.clear();
+        if(expr.empty()) return;
         auto [ty, sym] = lower_simple_expr_into(*fn, expr);
         auto rty = (fn->ret_type.empty()? std::string("i32") : fn->ret_type);
         if(ty != rty){
@@ -665,16 +669,19 @@ struct action< for_in_stmt > {
         auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; bool inclusive=false; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ inclusive=true; ++after; }
         auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
         std::string left = trim(rangeExpr.substr(0,dots)); std::string right = trim(rangeExpr.substr(after));
-        size_t li=0; auto lnum = parse_number(left, li); size_t ri=0; auto rnum = parse_number(right, ri); if(lnum.empty()||rnum.empty()) return;
-    // Emit start const (not assigned to loopVar) then end const, then rfor matches golden style: separate const for loop var init not reused as as/cast.
-    // Ensure separate consts for loop start and end; do not reuse existing ones.
-    auto startTmp = fn->gensym("c"); fn->sink().push_back("(const " + startTmp + " i32 " + lnum + ")");
-    auto endTmp = fn->gensym("c"); fn->sink().push_back("(const " + endTmp + " i32 " + rnum + ")");
-    // Do not emit separate (as %i ...) before rfor; golden expects rfor directly after consts.
-    // Serialize body vector (already lowered)
+        // Determine start and end symbols (numeric literal -> const; identifier -> reuse)
+        std::string startSym; std::string endSym; bool haveStart=false; bool haveEnd=false;
+        size_t li=0; auto lnum = parse_number(left, li);
+        if(!lnum.empty()) { startSym = fn->gensym("c"); fn->sink().push_back("(const " + startSym + " i32 " + lnum + ")"); haveStart=true; }
+        else { size_t lj=0; auto lid=parse_ident(left, lj); if(!lid.empty()){ if(lid[0] != '%') lid = std::string("%") + lid; startSym=lid; haveStart=true; } }
+        size_t ri=0; auto rnum = parse_number(right, ri);
+        if(!rnum.empty()) { endSym = fn->gensym("c"); fn->sink().push_back("(const " + endSym + " i32 " + rnum + ")"); haveEnd=true; }
+        else { size_t rj=0; auto rid=parse_ident(right, rj); if(!rid.empty()){ if(rid[0] != '%') rid = std::string("%") + rid; endSym=rid; haveEnd=true; } }
+        if(!haveStart || !haveEnd) return;
+        // Serialize body vector (already lowered)
         std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : body){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]";
         // rfor currently expects exclusive end; inclusive not yet modeled here (future extension could adjust)
-    fn->sink().push_back("(rfor " + loopVar + " " + startTmp + " " + endTmp + " :body " + bv.str() + ")");
+    fn->sink().push_back("(rfor " + loopVar + " " + startSym + " " + endSym + " :body " + bv.str() + ")");
     }
 };
 
