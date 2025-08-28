@@ -1,6 +1,7 @@
 #include "parser.hpp"
 #include <tao/pegtl.hpp>
 #include <sstream>
+// Removed debug logging that previously used std::cerr; avoid conditional <iostream> include.
 using namespace tao::pegtl;
 
 namespace rustlite {
@@ -51,6 +52,7 @@ struct comma : one<','> {};
 // forward decls so we can reference before definitions
 struct signed_int;
 struct paren_expr;
+struct array_lit; // forward
 struct arg_expr : sor< ws< signed_int >, ws< ident >, ws< paren_expr > > {};
 struct call_args_inner : seq< ws< arg_expr >, star< seq< ws< comma >, ws< arg_expr > > > > {};
 struct call_args : seq< ws< lparen >, opt< call_args_inner >, ws< rparen > > {};
@@ -66,7 +68,7 @@ struct expr_text : until< at< semi >, any > {};
 struct return_stmt : seq< ws< kw_return >, opt< ws< expr_text > >, ws< semi > > {};
 // if-statement: if <cond> block (else if <cond> block)* (else block)?
 struct block_rule; // forward declaration
-struct cond_expr : tao::pegtl::sor< paren_expr, signed_int, ident_or_call > {};
+struct cond_expr : tao::pegtl::sor< paren_expr, array_lit, signed_int, ident_or_call > {};
 // Looser textual condition: consume until the next block begins. This allows operators like &&, || without full expr grammar.
 struct cond_text : until< at< lbrace >, any > {};
 // Wrap condition positions so actions can capture them distinctly
@@ -97,9 +99,23 @@ struct plus_equal : seq< plus_tok, equal > {};
 struct minus_equal : seq< minus, equal > {};
 struct star_equal : seq< star_tok, equal > {};
 struct slash_equal : seq< slash_tok, equal > {};
-struct compound_assign_stmt : seq< ws< ident >, ws< sor< plus_equal, minus_equal, star_equal, slash_equal > >, ws< expr_text >, ws< semi > > {};
+struct amp_tok : one<'&'> {};
+struct pipe_tok : one<'|'> {};
+struct caret_tok : one<'^'> {};
+struct amp_equal : seq< amp_tok, equal > {};
+struct pipe_equal : seq< pipe_tok, equal > {};
+struct caret_equal : seq< caret_tok, equal > {};
+struct compound_assign_stmt : seq< ws< ident >, ws< sor< plus_equal, minus_equal, star_equal, slash_equal, amp_equal, pipe_equal, caret_equal > >, ws< expr_text >, ws< semi > > {};
+// Added: brackets + index assignment statement
+struct lbracket : one<'['> {};
+struct rbracket : one<']'> {};
+struct array_lit_inner : until< at< rbracket >, any > {};
+struct array_lit : seq< lbracket, opt< array_lit_inner >, rbracket > {};
+// Index assignment grammar previously consumed too much for the index expression (used expr_text which runs to ';').
+struct index_expr_text : until< at< rbracket >, any > {}; // capture raw inside brackets
+struct index_assign_stmt : seq< ws< ident >, ws< lbracket >, ws< index_expr_text >, ws< rbracket >, ws< equal >, ws< expr_text >, ws< semi > > {};
 struct for_in_stmt; // forward
-struct stmt : sor< if_stmt, while_stmt, loop_stmt, for_in_stmt, return_stmt, break_stmt, continue_stmt, let_stmt, compound_assign_stmt, assign_stmt, block_rule, expr_stmt > {};
+struct stmt : sor< if_stmt, while_stmt, loop_stmt, for_in_stmt, return_stmt, break_stmt, continue_stmt, let_stmt, compound_assign_stmt, index_assign_stmt, assign_stmt, block_rule, expr_stmt > {};
 // Padded braces so we can hook actions reliably
 struct lb_padded : ws< lbrace > {};
 struct rb_padded : ws< rbrace > {};
@@ -228,6 +244,25 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
     };
     s = peel_parens(s);
     size_t si=0; ltrim(s,si);
+    // If trimming advanced, shrink s accordingly (avoid leading spaces confusing scans)
+    if(si>0) s = s.substr(si);
+    // Remove any trailing whitespace again after potential shrink
+    while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+    // Early array literal detection: [a, b, c]
+    if(!s.empty() && s.front()=='[' && s.back()==']'){
+        int depth_arr=0; bool balanced_arr=false; for(size_t ak=0; ak<s.size(); ++ak){ char c=s[ak]; if(c=='[') ++depth_arr; else if(c==']'){ --depth_arr; if(depth_arr==0 && ak==s.size()-1) balanced_arr=true; } }
+        if(balanced_arr){
+            std::string inner = s.substr(1, s.size()-2);
+            std::vector<std::string> elems; size_t start=0; int dpar=0; int dbr=0; for(size_t k=0;k<=inner.size(); ++k){ if(k==inner.size() || (inner[k]==',' && dpar==0 && dbr==0)){ std::string part = inner.substr(start, k-start); size_t a2=0; ltrim(part,a2); part = part.substr(a2); size_t b2=part.size(); while(b2>0 && isspace((unsigned char)part[b2-1])) --b2; part = part.substr(0,b2); if(!part.empty()) elems.push_back(part); start=k+1; } else { char cc=inner[k]; if(cc=='(') ++dpar; else if(cc==')') --dpar; else if(cc=='[') ++dbr; else if(cc==']') --dbr; } }
+            std::vector<std::string> elemSyms; elemSyms.reserve(elems.size()); for(const auto& e : elems){ auto p = lower_simple_expr_into(fn, e); elemSyms.push_back(p.second); }
+            auto dst = fn.gensym("arr"); std::ostringstream aoss; aoss << "(rcall " << dst << " i32 array"; for(const auto& es : elemSyms) aoss << ' ' << es; aoss << ')'; fn.sink().push_back(aoss.str()); return {"i32", dst};
+        }
+    }
+    // Early numeric literal detection (handles plain and negative integers) before operator splitting.
+    if(!s.empty()){
+        size_t ni=0; auto num=parse_number(s, ni);
+    if(!num.empty() && ni==s.size() && s.find("..")==std::string::npos){ auto sym=fn.gensym("c"); fn.sink().push_back("(const " + sym + " i32 " + num + ")"); return {"i32", sym}; }
+    }
     // Operator precedence tiers (lowest to highest)
     // 0: logical OR with short-circuit
     {
@@ -284,6 +319,31 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             std::ostringstream rif; rif << "(rif " << lhs << " :then " << serialize(then_body) << " :else " << serialize(else_body) << ")";
             fn.sink().push_back(rif.str());
             return {"i1", res};
+        }
+    }
+    // 0.6: bitwise OR |
+    {
+        int depth=0; for(size_t i=s.size(); i-- > 0;){ char c=s[i]; if(c==')') ++depth; else if(c=='('){ if(depth>0) --depth; }
+            if(depth!=0) continue; if(c=='|'){
+                // skip if part of '||'
+                if(i>0 && s[i-1]=='|') continue; if(i+1<s.size() && s[i+1]=='|') continue;
+                std::string L = s.substr(0,i); std::string R = s.substr(i+1); auto lv = lower_simple_expr_into(fn, L).second; auto rv = lower_simple_expr_into(fn, R).second; auto dst = fn.gensym("bor"); std::ostringstream oss; oss << "(rcall " << dst << " i32 bor " << lv << " " << rv << ")"; fn.sink().push_back(oss.str()); return {"i32", dst}; }
+        }
+    }
+    // 0.65: bitwise XOR ^
+    {
+        int depth=0; for(size_t i=s.size(); i-- > 0;){ char c=s[i]; if(c==')') ++depth; else if(c=='('){ if(depth>0) --depth; }
+            if(depth!=0) continue; if(c=='^'){
+                std::string L = s.substr(0,i); std::string R = s.substr(i+1); auto lv = lower_simple_expr_into(fn, L).second; auto rv = lower_simple_expr_into(fn, R).second; auto dst = fn.gensym("bxor"); std::ostringstream oss; oss << "(rcall " << dst << " i32 bxor " << lv << " " << rv << ")"; fn.sink().push_back(oss.str()); return {"i32", dst}; }
+        }
+    }
+    // 0.7: bitwise AND &
+    {
+        int depth=0; for(size_t i=s.size(); i-- > 0;){ char c=s[i]; if(c==')') ++depth; else if(c=='('){ if(depth>0) --depth; }
+            if(depth!=0) continue; if(c=='&'){
+                // skip if part of '&&'
+                if(i+1<s.size() && s[i+1]=='&') continue; if(i>0 && s[i-1]=='&') continue;
+                std::string L = s.substr(0,i); std::string R = s.substr(i+1); auto lv = lower_simple_expr_into(fn, L).second; auto rv = lower_simple_expr_into(fn, R).second; auto dst = fn.gensym("band"); std::ostringstream oss; oss << "(rcall " << dst << " i32 band " << lv << " " << rv << ")"; fn.sink().push_back(oss.str()); return {"i32", dst}; }
         }
     }
     // 1: equality
@@ -366,42 +426,27 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             }
         }
     }
-    // Try number
+    // Try number / ident etc. (with indexing enhancement)
     {
-        size_t j=si; auto num = parse_number(s, j);
-        if(!num.empty()){
-            auto tmp = fn.gensym("c");
-            fn.sink().push_back("(const " + tmp + " i32 " + num + ")");
-            return {"i32", tmp};
-        }
-    }
-    // Try ident
-    {
-        size_t j=si; auto id = parse_ident(s, j);
-        if(!id.empty()){
-            // Range literal starting with ident? allow ident..ident patterns later if needed
-            // boolean literals
-            if(id == "true" || id == "false"){
-                auto tmp = fn.gensym("c");
-                fn.sink().push_back(std::string("(const ") + tmp + " i1 " + (id=="true"? "1" : "0") + ")");
-                return {"i1", tmp};
-            }
-            // Check for call form ident(...)
-            size_t k=j; while(k<s.size() && isspace((unsigned char)s[k])) ++k;
-            if(k<s.size() && s[k]=='('){
-                // parse args inside matching paren
+        size_t j=si; auto id = parse_ident(s, j); if(!id.empty()){
+            if(id=="true"||id=="false"){ auto tmp=fn.gensym("c"); fn.sink().push_back(std::string("(const ")+tmp+" i1 "+(id=="true"?"1":"0")+")"); return {"i1", tmp}; }
+            size_t k=j; while(k<s.size() && isspace((unsigned char)s[k])) ++k; if(k<s.size() && s[k]=='('){ // parse args inside matching paren
                 int depth=0; size_t m=k; for(; m<s.size(); ++m){ char c=s[m]; if(c=='(') ++depth; else if(c==')'){ --depth; if(depth==0) break; } }
                 std::string inner = (k+1<=m)? s.substr(k+1, m-(k+1)) : std::string();
                 auto args = split_args_commas(inner);
                 std::vector<std::string> argSyms; argSyms.reserve(args.size());
                 for(const auto& a : args){ if(a.empty()) continue; auto p = lower_simple_expr_into(fn, a); argSyms.push_back(p.second); }
                 auto dst = fn.gensym("call");
-                std::ostringstream oss; oss << "(rcall " << dst << " i32 " << id; for(const auto& as : argSyms) oss << " " << as; oss << ")";
+                // emit: (rcall %dst i32 <callee> argSyms...)
+                std::ostringstream oss; oss << "(rcall " << dst << " i32 " << id;
+                for(const auto& as : argSyms) oss << " " << as;
+                oss << ")";
                 fn.sink().push_back(oss.str());
                 return {"i32", dst};
             } else {
-                if(id[0] != '%') id = std::string("%") + id;
-                return {"i32", id}; // default i32 for now
+                size_t k2=k; while(k2<s.size() && isspace((unsigned char)s[k2])) ++k2; if(k2<s.size() && s[k2]=='['){ int depth2=0; size_t m2=k2; for(; m2<s.size(); ++m2){ char c2=s[m2]; if(c2=='[') ++depth2; else if(c2==']'){ --depth2; if(depth2==0) break; } } if(m2<s.size()&&s[m2]==']'){ std::string inner2 = s.substr(k2+1, m2-(k2+1)); auto idxP = lower_simple_expr_into(fn, inner2); if(id[0] != '%') id = std::string("%")+id; auto dst = fn.gensym("idx"); std::ostringstream oss; oss << "(rcall " << dst << " i32 idx " << id << " " << idxP.second << ")"; fn.sink().push_back(oss.str()); return {"i32", dst}; } }
+                if(id[0] != '%') id = std::string("%")+id;
+                return {"i32", id};
             }
         }
     }
@@ -415,6 +460,30 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
         return {"i1", dst};
     }
     // Fallback: synth zero and return it
+    // Late numeric literal retry (defensive): if earlier detection missed a plain integer, emit it now instead of zero.
+    {
+        // Array literal missed earlier (e.g., due to grammar capture path); retry using original expr_src
+        if(!expr_src.empty()){
+            size_t ai=0; while(ai<expr_src.size() && isspace((unsigned char)expr_src[ai])) ++ai; size_t bj=expr_src.size(); while(bj>ai && isspace((unsigned char)expr_src[bj-1])) --bj; if(bj>ai){
+                std::string orig = expr_src.substr(ai, bj-ai);
+                if(orig.size()>=2 && orig.front()=='[' && orig.back()==']'){
+                    // Parse elements (shallow, same logic as early path)
+                    std::string inner = orig.substr(1, orig.size()-2);
+                    std::vector<std::string> elems; size_t start=0; int dpar=0; int dbr=0; for(size_t k=0;k<=inner.size(); ++k){ if(k==inner.size() || (inner[k]==',' && dpar==0 && dbr==0)){ std::string part = inner.substr(start, k-start); size_t a2=0; ltrim(part,a2); part = part.substr(a2); size_t b2=part.size(); while(b2>0 && isspace((unsigned char)part[b2-1])) --b2; part = part.substr(0,b2); if(!part.empty()) elems.push_back(part); start=k+1; } else { char cc=inner[k]; if(cc=='(') ++dpar; else if(cc==')') --dpar; else if(cc=='[') ++dbr; else if(cc==']') --dbr; } }
+                    std::vector<std::string> elemSyms; elemSyms.reserve(elems.size());
+                    for(const auto& e : elems){ auto p = lower_simple_expr_into(fn, e); elemSyms.push_back(p.second); }
+                    auto dst = fn.gensym("arr"); std::ostringstream aoss; aoss << "(rcall " << dst << " i32 array"; for(const auto& es : elemSyms) aoss << ' ' << es; aoss << ')'; fn.sink().push_back(aoss.str());
+                    return std::pair<std::string,std::string>{"i32", dst};
+                }
+            }
+        }
+        std::string t=s; size_t a=0; while(a<t.size() && isspace((unsigned char)t[a])) ++a; size_t b=t.size(); while(b>a && isspace((unsigned char)t[b-1])) --b; t = (b>a)? t.substr(a,b-a): std::string();
+        if(!t.empty()){
+            size_t ni=0; auto num=parse_number(t, ni); if(!num.empty() && ni==t.size()){
+                auto sym=fn.gensym("c"); fn.sink().push_back("(const " + sym + " i32 " + num + ")"); return {"i32", sym};
+            }
+        }
+    }
     if(!fn.has_zero){ fn.sink().push_back("(const " + fn.zero_sym + " i32 0)"); fn.has_zero=true; }
     return {"i32", fn.zero_sym};
 }
@@ -449,15 +518,24 @@ struct action< let_stmt > {
         // optional type
         std::string ty = "i32";
         if(i<s.size() && s[i]==':'){ ++i; ltrim(s,i); auto tname = parse_ident(s,i); if(!tname.empty()) ty = tname; ltrim(s,i); }
-        // '='
-        if(i>=s.size() || s[i] != '=') return; ++i; ltrim(s,i);
-    // rest is expr; lower into a temporary buffer, then emit before the declaration
-    auto expr = s.substr(i);
+    // '='
+    if(i>=s.size() || s[i] != '=') return; ++i; ltrim(s,i);
+    // rest is expr; trim and lower via standard expression lowering path
+    std::string expr = s.substr(i);
+    size_t a=0; ltrim(expr,a); expr = expr.substr(a); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+        // Remove a stray trailing semicolon (expr_text may have included it if parse slicing was broad)
+        if(!expr.empty() && expr.back()==';') { expr.pop_back(); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back(); }
+        // Direct array literal lowering (handles [a,b,c]) to ensure proper construction before generic fallback
+        if(expr.size()>=2 && expr.front()=='[' && expr.back()==']'){
+            std::string inner = expr.substr(1, expr.size()-2);
+            std::vector<std::string> elems; size_t start=0; int dpar=0; int dbr=0; for(size_t k=0;k<=inner.size(); ++k){ if(k==inner.size() || (inner[k]==',' && dpar==0 && dbr==0)){ std::string part = inner.substr(start, k-start); size_t x=0; ltrim(part,x); part = part.substr(x); size_t y=part.size(); while(y>0 && isspace((unsigned char)part[y-1])) --y; part = part.substr(0,y); if(!part.empty()) elems.push_back(part); start=k+1; } else { char c=inner[k]; if(c=='(') ++dpar; else if(c==')') --dpar; else if(c=='[') ++dbr; else if(c==']') --dbr; } }
+            std::vector<std::string> elemSyms; elemSyms.reserve(elems.size());
+            for(const auto& e : elems){ auto [ety2, sym2] = lower_simple_expr_into(*fn, e); elemSyms.push_back(sym2); }
+            auto dst = fn->gensym("arr"); std::ostringstream arr; arr << "(rcall " << dst << " i32 array"; for(const auto& es : elemSyms) arr << ' ' << es; arr << ')'; fn->sink().push_back(arr.str()); fn->sink().push_back(std::string("(as ") + name + " " + ty + " " + dst + ")"); return; }
     fn->block_stack.emplace_back();
     auto [ety, val] = lower_simple_expr_into(*fn, expr);
     auto expr_insts = std::move(fn->block_stack.back()); fn->block_stack.pop_back();
     for(const auto& ins : expr_insts){ fn->sink().push_back(ins); }
-    // Directly declare the variable with 'as' (mut handled at higher levels; EDN core doesn't enforce immutability)
     fn->sink().push_back(std::string("(as ") + name + " " + ty + " " + val + ")");
     }
 };
@@ -492,6 +570,9 @@ struct action< compound_assign_stmt > {
             else if(s[i]=='-') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "sub"; } }
             else if(s[i]=='*') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "mul"; } }
             else if(s[i]=='/') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "div"; } }
+            else if(s[i]=='&') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "band"; } }
+            else if(s[i]=='|') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "bor"; } }
+            else if(s[i]=='^') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "bxor"; } }
         }
         if(op.empty()) return; ltrim(s,i);
         auto expr = s.substr(i);
@@ -502,6 +583,11 @@ struct action< compound_assign_stmt > {
         fn->sink().push_back("(assign " + name + " " + tmp + ")");
     }
 };
+
+// index assignment lowering
+template<> struct action< index_assign_stmt > { template<typename Input> static void apply(const Input& in, build_state& st){ auto* fn = ensure_fn(st); if(!fn) return; std::string s=in.string(); if(!s.empty() && s.back()==';') s.pop_back(); size_t i=0; ltrim(s,i); auto base=parse_ident(s,i); if(base.empty()) return; if(base[0] != '%') base = std::string("%") + base; ltrim(s,i); if(i>=s.size()||s[i]!='[') return; ++i; size_t idxStart=i; int depth=1; for(; i<s.size(); ++i){ char c=s[i]; if(c=='[') ++depth; else if(c==']'){ --depth; if(depth==0) break; } } if(depth!=0) return; size_t idxEnd=i; std::string idxExpr = s.substr(idxStart, idxEnd-idxStart); ++i; ltrim(s,i); if(i>=s.size()||s[i] != '=') return; ++i; ltrim(s,i); std::string valExpr = s.substr(i); // Trim whitespace from idxExpr
+    size_t ia=0; ltrim(idxExpr, ia); idxExpr = idxExpr.substr(ia); while(!idxExpr.empty() && isspace((unsigned char)idxExpr.back())) idxExpr.pop_back();
+    auto idxP = lower_simple_expr_into(*fn, idxExpr); auto valP = lower_simple_expr_into(*fn, valExpr); fn->sink().push_back("(ridx_set " + base + " " + idxP.second + " " + valP.second + ")"); } };
 
 // return [expr];
 template<>
@@ -551,11 +637,9 @@ struct action< expr_stmt > {
         auto args = split_args_commas(inner);
         std::vector<std::string> argSyms; argSyms.reserve(args.size());
         for(const auto& a : args){ if(a.empty()) continue; auto p = lower_simple_expr_into(*fn, a); argSyms.push_back(p.second); }
-        auto dst = fn->gensym("call");
-        // ensure callee is symbol name, not % prefixed (calls use raw symbol for function name)
-        std::string calleeSym = callee;
-        // emit: (rcall %dst i32 callee argSyms...)
-        std::ostringstream oss; oss << "(rcall " << dst << " i32 " << calleeSym;
+    auto dst = fn->gensym("call");
+    // emit: (rcall %dst i32 callee argSyms...)
+    std::ostringstream oss; oss << "(rcall " << dst << " i32 " << callee;
         for(const auto& as : argSyms) oss << " " << as;
         oss << ")";
         fn->sink().push_back(oss.str());
@@ -665,8 +749,8 @@ struct action< for_in_stmt > {
         // Range expression runs until '{'
         auto bracePos = src.find('{', i);
         std::string rangeExpr = (bracePos==std::string::npos)? src.substr(i) : src.substr(i, bracePos - i);
-        // Support numeric ranges a..b and a..=b
-        auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; bool inclusive=false; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ inclusive=true; ++after; }
+    // Support numeric ranges a..b and a..=b
+    auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; bool inclusive=false; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ inclusive=true; ++after; }
         auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
         std::string left = trim(rangeExpr.substr(0,dots)); std::string right = trim(rangeExpr.substr(after));
         // Determine start and end symbols (numeric literal -> const; identifier -> reuse)

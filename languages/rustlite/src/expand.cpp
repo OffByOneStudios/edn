@@ -22,7 +22,7 @@ namespace rustlite {
 
 using rustlite::rl_make_sym; using rustlite::rl_make_kw; using rustlite::rl_make_i64; using rustlite::rl_gensym;
 
-// (Previous inline fallback removed; single source of truth is features.hpp)
+// Single source of truth for feature flags lives in features.hpp (no local fallbacks here).
 
 edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     // Pre-walk: rewrite variant constructor surface forms of shape (Type::Variant %dst [payload*])

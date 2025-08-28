@@ -53,10 +53,18 @@ languages/rustlite/surface_tests/
 - [x] [P1] Add CTest registration via CMake glob with per-sample compare.
 - [x] [P2] Add `UPDATE_RUSTLITE_GOLDENS=1` env to regenerate goldens.
 - [x] [P2] Seed initial & extended tests (see Coverage below).
-- [ ] [P2] Add advanced samples: arrays, enum match (ematch), rtry Result/Option forms, rwhile-let, rfor-range tuple form, closure capture inference (flag on/off), bounds index load with flag on, bitwise ops.
-- [ ] [P2] Add negative surface tests covering: ematch non-exhaustive (E1600), rtry wrong sum (E1603), tuple index OOB (E1601), bounds OOB, closure capture inference disabled scenario.
+- [x] [P2] Advanced samples: arrays (literal, read, write) & indexing support.
+- [x] [P2] Advanced samples: bitwise ops + precedence + compound assignments.
+- [ ] [P2] Advanced samples: enum match (ematch) (exhaustive, payload, non-exhaustive negative).
+- [ ] [P2] Advanced samples: rtry Result / Option forms (success + error path; wrong sum negative E1603).
+- [ ] [P2] Advanced samples: rwhile-let loop construct.
+- [ ] [P2] Advanced samples: rfor-range tuple form (exclusive + inclusive variants) & degenerate ranges.
+- [ ] [P2] Advanced samples: closure syntax & capture inference (flag on/off) + negative when disabled.
+- [ ] [P2] Advanced samples: bounds index load with flag on & bounds OOB negative.
+- [ ] [P2] Advanced samples: shift operators (<< >>) and compound assignments.
+- [ ] [P2] Negative surface tests: ematch non-exhaustive (E1600), rtry wrong sum (E1603), tuple index OOB (E1601), bounds OOB, closure capture inference disabled scenario, malformed range (0.. / ..5), bad for header, unterminated block comment, keyword as identifier, missing semicolon.
 - [ ] [P3] Documentation: update `docs/RUSTLITE.md` with section on test layering & adding tests.
-- [ ] [P3] CI integration verification note (ensure included in pipeline doc) .
+- [ ] [P3] CI integration verification note (ensure included in pipeline doc).
 
 ## Risks & Mitigations
 | Risk | Mitigation |
@@ -74,7 +82,13 @@ languages/rustlite/surface_tests/
 ## Current Coverage Snapshot (2025-08-28)
 Implemented passing surface tests (positive unless prefixed `neg_`):
 ```
+array_expr_only
+array_index_read
+array_index_write
+array_literal
 assign_stmt
+bitwise_compound
+bitwise_ops
 break_continue
 call_args
 compound_assign
@@ -98,6 +112,7 @@ neg_invalid_token (negative)
 neg_unmatched_brace (negative)
 nested_blocks
 paren_exprs
+precedence_bitwise_mix
 range_for
 range_inclusive
 range_literal
@@ -107,38 +122,32 @@ unary_minus
 unary_not
 while_loop
 ```
-Count: 33 samples (including 3 negative).
-
-Recently added in this iteration:
-- eq_ne_ops
-- for_in_inclusive
-- for_in_var_bounds
-- mixed_precedence
-- implicit_tail_return (tail expression return support added)
+Count: 39 samples (including 3 negative). Arrays & indexing now fully lowered (no placeholders).
 
 Remaining planned surface feature areas (not yet covered by tests):
-- Arrays / indexing read & write (+ bounds flag on case)
-- Tuple index out-of-bounds negative
 - Enum match / pattern (ematch) positive & non-exhaustive negative
 - rtry with Result / Option forms (success & error paths; error codes E1600/E1603 variants)
 - rwhile-let loop construct
-- rfor-range tuple form (using rrange + rfor-range) inclusive & exclusive
+- rfor-range tuple form (using rrange + rfor-range) inclusive & exclusive + degenerate ranges
 - Closure syntax & capture inference flag on/off; negative when capturing disabled
-- Bitwise operators (& | ^ << >>) and compound assignments for them if supported
-- Inclusive for-in semantics (currently parser ignores inclusive, need semantic test once implemented)
-- Identifier-based inclusive ranges (a..=b) once supported
-- Empty range / degenerate (5..5, 5..=5) expected behavior
-- Additional negative syntax cases: malformed range (0..), (..5), bad for header, unterminated block comment, missing semicolon diagnostics, keyword as identifier
+- Bounds index load with flag on & bounds OOB negative
+- Shift operators (<< >>) and their compound assignments
+- Inclusive for-in semantics semantic test (parser support follow-up) & identifier-based inclusive ranges (a..=b) once supported
+- Tuple index out-of-bounds negative
+- Additional negative syntax cases: malformed range (0..), (..5), bad for header, unterminated block comment, keyword as identifier, missing semicolon diagnostics
 
 ## Next Steps
-1. Implement/extend parser & lowering for: bitwise ops, arrays/indexing, rfor-range tuple form.
+1. Implement/extend parser & lowering for: arrays/indexing, rfor-range tuple form (bitwise tier complete; potential future addition: shifts).
 2. Add tests for rrange + rfor-range tuple usage (positive & inclusive variant once semantics defined).
 3. Introduce ematch & rtry surface samples (positive + negative diagnostics).
 4. Closure & capture inference samples gated by feature flag.
-5. Add remaining negative diagnostics (malformed range, bad for, unterminated comment, keyword ident, missing semicolon).
+5. Add remaining negative diagnostics (malformed range, bad for, unterminated comment, keyword ident, missing semicolon, tuple index OOB, non-exhaustive ematch, rtry wrong sum code).
 6. Update documentation once major gaps filled.
 
-Progress metric: 33 current / ~55 projected initial comprehensive set (~60% complete).
+Progress metric: 39 current / ~55 projected initial comprehensive set (~71% complete). (Arrays/indexing done; upcoming adds likely to raise target slightly if shifts & extra negatives expand scope.)
+
+### Notes on Bitwise Precedence
+Current lowering precedence (lowest to higher among newly added tiers): `|` < `^` < `&` < equality/relational < additive < multiplicative. The golden for `precedence_bitwise_mix` reflects this, ensuring additive and subtractive expressions bind before surrounding bitwise ops, and confirming correct left-associative reconstruction.
 
 ## Follow-Ups (Future)
 - Consider JSON diff output for easier tooling.
