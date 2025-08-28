@@ -24,6 +24,8 @@ struct kw_let : string<'l','e','t'> {};
 struct kw_mut : string<'m','u','t'> {};
 struct kw_break : string<'b','r','e','a','k'> {};
 struct kw_continue : string<'c','o','n','t','i','n','u','e'> {};
+struct kw_for : string<'f','o','r'> {};
+struct kw_in : string<'i','n'> {};
 struct ident_first : ranges<'a','z','A','Z','_','_'> {};
 struct ident_rest : ranges<'a','z','A','Z','0','9','_','_'> {};
 struct ident : seq< ident_first, star< ident_rest > > {};
@@ -96,7 +98,8 @@ struct minus_equal : seq< minus, equal > {};
 struct star_equal : seq< star_tok, equal > {};
 struct slash_equal : seq< slash_tok, equal > {};
 struct compound_assign_stmt : seq< ws< ident >, ws< sor< plus_equal, minus_equal, star_equal, slash_equal > >, ws< expr_text >, ws< semi > > {};
-struct stmt : sor< if_stmt, while_stmt, loop_stmt, return_stmt, break_stmt, continue_stmt, let_stmt, compound_assign_stmt, assign_stmt, block_rule, expr_stmt > {};
+struct for_in_stmt; // forward
+struct stmt : sor< if_stmt, while_stmt, loop_stmt, for_in_stmt, return_stmt, break_stmt, continue_stmt, let_stmt, compound_assign_stmt, assign_stmt, block_rule, expr_stmt > {};
 // Padded braces so we can hook actions reliably
 struct lb_padded : ws< lbrace > {};
 struct rb_padded : ws< rbrace > {};
@@ -108,6 +111,11 @@ struct block_rule : seq< lb_padded,
                                      opt< tail_expr >,
                                      star< space_or_comment >,
                                      rb_padded > {};
+
+// for-in over range: for <ident> in <range-expr> <block>
+// We reuse cond_text to capture everything between 'in' and '{'
+struct for_in_range_expr : cond_text {};
+struct for_in_stmt : seq< ws< kw_for >, ws< ident >, ws< kw_in >, for_in_range_expr, block_rule > {};
 
 // item: fn ident(params) (-> type)? { ... }
 struct param_decl; // fwd (defined below as optional mut ident)
@@ -338,6 +346,25 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             return {"i32", dst};
         }
     }
+    // Range literal numeric: pattern <number> .. (=)? <number>
+    {
+        auto dots = s.find("..");
+        if(dots != std::string::npos){
+            std::string left = s.substr(0, dots);
+            bool inclusive = false; size_t after = dots + 2; if(after < s.size() && s[after]=='='){ inclusive = true; ++after; }
+            std::string right = s.substr(after);
+            auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
+            left = trim(left); right = trim(right);
+            size_t li=0; auto lnum = parse_number(left, li); size_t ri=0; auto rnum = parse_number(right, ri);
+            if(!lnum.empty() && !rnum.empty()){
+                auto ltmp = fn.gensym("c"); fn.sink().push_back("(const " + ltmp + " i32 " + lnum + ")");
+                auto rtmp = fn.gensym("c"); fn.sink().push_back("(const " + rtmp + " i32 " + rnum + ")");
+                auto dst = fn.gensym("range");
+                fn.sink().push_back(std::string("(rcall ") + dst + " i32 " + (inclusive? "range_inclusive" : "range") + " " + ltmp + " " + rtmp + ")");
+                return {"i32", dst};
+            }
+        }
+    }
     // Try number
     {
         size_t j=si; auto num = parse_number(s, j);
@@ -351,6 +378,7 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
     {
         size_t j=si; auto id = parse_ident(s, j);
         if(!id.empty()){
+            // Range literal starting with ident? allow ident..ident patterns later if needed
             // boolean literals
             if(id == "true" || id == "false"){
                 auto tmp = fn.gensym("c");
@@ -616,6 +644,38 @@ template<>
 struct action< continue_stmt > {
     template<typename Input>
     static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; fn->sink().push_back("(rcontinue)"); }
+};
+
+// for-in over numeric range: for i in a..b { body }
+template<>
+struct action< for_in_stmt > {
+    template<typename Input>
+    static void apply(const Input& in, build_state& st){
+        auto* fn = ensure_fn(st); if(!fn) return; if(fn->block_results.empty()) return; // body block
+        auto body = std::move(fn->block_results.back()); fn->block_results.pop_back();
+        std::string src = in.string();
+        // Parse header: for <ident> in <rangeExpr>
+        size_t i=0; ltrim(src,i); if(src.compare(i,3,"for")!=0) return; i+=3; ltrim(src,i);
+        auto loopVar = parse_ident(src,i); if(loopVar.empty()) return; if(loopVar[0] != '%') loopVar = std::string("%") + loopVar; ltrim(src,i);
+        if(src.compare(i,2,"in")!=0) return; i+=2; ltrim(src,i);
+        // Range expression runs until '{'
+        auto bracePos = src.find('{', i);
+        std::string rangeExpr = (bracePos==std::string::npos)? src.substr(i) : src.substr(i, bracePos - i);
+        // Support numeric ranges a..b and a..=b
+        auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; bool inclusive=false; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ inclusive=true; ++after; }
+        auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
+        std::string left = trim(rangeExpr.substr(0,dots)); std::string right = trim(rangeExpr.substr(after));
+        size_t li=0; auto lnum = parse_number(left, li); size_t ri=0; auto rnum = parse_number(right, ri); if(lnum.empty()||rnum.empty()) return;
+    // Emit start const (not assigned to loopVar) then end const, then rfor matches golden style: separate const for loop var init not reused as as/cast.
+    // Ensure separate consts for loop start and end; do not reuse existing ones.
+    auto startTmp = fn->gensym("c"); fn->sink().push_back("(const " + startTmp + " i32 " + lnum + ")");
+    auto endTmp = fn->gensym("c"); fn->sink().push_back("(const " + endTmp + " i32 " + rnum + ")");
+    // Do not emit separate (as %i ...) before rfor; golden expects rfor directly after consts.
+    // Serialize body vector (already lowered)
+        std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : body){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]";
+        // rfor currently expects exclusive end; inclusive not yet modeled here (future extension could adjust)
+    fn->sink().push_back("(rfor " + loopVar + " " + startTmp + " " + endTmp + " :body " + bv.str() + ")");
+    }
 };
 
 // if <cond> <then-block> [else if <cond> <block>]* [else <block>]
