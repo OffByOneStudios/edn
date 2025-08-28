@@ -1,6 +1,6 @@
 # EDN-0013: Rustlite Surface vs Macro Test Plan
 
-Status: Open
+Status: In Progress
 Created: 2025-08-28
 Owner: (unassigned)
 
@@ -47,17 +47,16 @@ languages/rustlite/surface_tests/
 ```
 
 ## Implementation Tasks
-- [ ] [P1] Create directory scaffold `languages/rustlite/surface_tests` with CMake integration.
-- [ ] [P1] Decide and document file extension (`.rl` or `.rustlite`) and normalization rules.
-- [ ] [P1] Implement small normalization utility (`rustlite_surface_norm` executable) that:
-  - Reads surface file, invokes existing parser entry (TBD hook), outputs EDN macro form.
-  - Optionally sorts keyword pairs for deterministic output.
-- [ ] [P1] Add CMake function to register each sample pair as a CTest (compare produced EDN vs golden; diff on mismatch).
-- [ ] [P2] Add `--update-goldens` env or CTest property to rewrite goldens.
-- [ ] [P2] Seed initial tests: tuples, arrays, enum + ematch exhaustive, rtry Result + Option, rwhile-let, range literal + inclusive, rfor-range with range value, closure capture inference (flag on/off), bounds index load (flag on), compound assign + bitwise ops.
-- [ ] [P2] Add negative surface tests: ematch non-exhaustive (E1600), rtry wrong sum (E1603), tuple index OOB (E1601), bounds OOB expansion path parsing mismatch if any, closure capture inference disabled (no :captures inserted).
-- [ ] [P3] Documentation: update `docs/RUSTLITE.md` with section on test layering & how to add surface tests.
-- [ ] [P3] CI integration note: ensure new tests run in existing workflow.
+- [x] [P1] Create directory scaffold `languages/rustlite/surface_tests` with CMake integration.
+- [x] [P1] Decide and document file extension (`.rl.rs`) and normalization rules (semantic equality fallback via structural EDN compare).
+- [x] [P1] Implement normalization utility (`rustlite_surface_norm`) invoking parser and emitting EDN macro form.
+- [x] [P1] Add CTest registration via CMake glob with per-sample compare.
+- [x] [P2] Add `UPDATE_RUSTLITE_GOLDENS=1` env to regenerate goldens.
+- [x] [P2] Seed initial & extended tests (see Coverage below).
+- [ ] [P2] Add advanced samples: arrays, enum match (ematch), rtry Result/Option forms, rwhile-let, rfor-range tuple form, closure capture inference (flag on/off), bounds index load with flag on, bitwise ops.
+- [ ] [P2] Add negative surface tests covering: ematch non-exhaustive (E1600), rtry wrong sum (E1603), tuple index OOB (E1601), bounds OOB, closure capture inference disabled scenario.
+- [ ] [P3] Documentation: update `docs/RUSTLITE.md` with section on test layering & adding tests.
+- [ ] [P3] CI integration verification note (ensure included in pipeline doc) .
 
 ## Risks & Mitigations
 | Risk | Mitigation |
@@ -71,6 +70,75 @@ languages/rustlite/surface_tests/
 - Running with an intentionally altered surface file causes a failing diff.
 - Setting update env var regenerates golden and test passes again.
 - Documentation updated with contributor instructions.
+
+## Current Coverage Snapshot (2025-08-28)
+Implemented passing surface tests (positive unless prefixed `neg_`):
+```
+assign_stmt
+break_continue
+call_args
+compound_assign
+empty_call
+enum_basic
+eq_ne_ops
+fn_call
+fn_params
+for_in_inclusive
+for_in_var_bounds
+if_else
+implicit_tail_return
+let_mut
+let_stmt
+let_typed
+logical_ops
+loop_stmt
+mixed_precedence
+neg_incomplete_if (negative)
+neg_invalid_token (negative)
+neg_unmatched_brace (negative)
+nested_blocks
+paren_exprs
+range_for
+range_inclusive
+range_literal
+rel_ops
+tuple_basic
+unary_minus
+unary_not
+while_loop
+```
+Count: 33 samples (including 3 negative).
+
+Recently added in this iteration:
+- eq_ne_ops
+- for_in_inclusive
+- for_in_var_bounds
+- mixed_precedence
+- implicit_tail_return (tail expression return support added)
+
+Remaining planned surface feature areas (not yet covered by tests):
+- Arrays / indexing read & write (+ bounds flag on case)
+- Tuple index out-of-bounds negative
+- Enum match / pattern (ematch) positive & non-exhaustive negative
+- rtry with Result / Option forms (success & error paths; error codes E1600/E1603 variants)
+- rwhile-let loop construct
+- rfor-range tuple form (using rrange + rfor-range) inclusive & exclusive
+- Closure syntax & capture inference flag on/off; negative when capturing disabled
+- Bitwise operators (& | ^ << >>) and compound assignments for them if supported
+- Inclusive for-in semantics (currently parser ignores inclusive, need semantic test once implemented)
+- Identifier-based inclusive ranges (a..=b) once supported
+- Empty range / degenerate (5..5, 5..=5) expected behavior
+- Additional negative syntax cases: malformed range (0..), (..5), bad for header, unterminated block comment, missing semicolon diagnostics, keyword as identifier
+
+## Next Steps
+1. Implement/extend parser & lowering for: bitwise ops, arrays/indexing, rfor-range tuple form.
+2. Add tests for rrange + rfor-range tuple usage (positive & inclusive variant once semantics defined).
+3. Introduce ematch & rtry surface samples (positive + negative diagnostics).
+4. Closure & capture inference samples gated by feature flag.
+5. Add remaining negative diagnostics (malformed range, bad for, unterminated comment, keyword ident, missing semicolon).
+6. Update documentation once major gaps filled.
+
+Progress metric: 33 current / ~55 projected initial comprehensive set (~60% complete).
 
 ## Follow-Ups (Future)
 - Consider JSON diff output for easier tooling.
