@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (const %__rl_c1 i32 0) (as %i i32 %__rl_c1) (rloop :body [(const %__rl_c2 i32 1) (rcall %__rl_add3 i32 add %i %__rl_c2) (assign %i %__rl_add3) (const %__rl_c4 i32 3) (rcall %__rl_cmp5 i32 eq %i %__rl_c4) (rif %__rl_cmp5 :then [(rbreak)] :else [])]) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

@@ -1,0 +1,1 @@
+(module (fn :name "add" :ret i32 :params [ (param i32 %a) (param i32 %b) ] :body [ (rcall %__rl_add1 i32 add %a %b) (ret i32 %__rl_add1) ]))

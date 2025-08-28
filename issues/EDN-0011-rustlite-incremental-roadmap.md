@@ -1,6 +1,6 @@
 # EDN-0011: Rustlite Incremental Roadmap (Post EDN-0010)
 
-Status: Open
+Status: Closed
 Target Release: Phase 5 follow-on (incremental drops)
 Owner: (unassigned)
 Created: 2025-08-26
@@ -83,33 +83,43 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - [x] [P3][D] Extend `ENUMS_MATCHING.md` with payload-binding example & contrast `rmatch` vs `ematch` diagnostics – 2025-08-27.
 
 ### Phase C (Control Flow Ergonomics)
-- [ ] [P1][F] `rtry` macro for `?` operator semantics (Result path).
-- [ ] [P1][T] `rustlite.rtry_result` test (Ok path + early Err short-circuit).
-- [ ] [P2][F] Extend `rtry` to Option (None short-circuit) if type matches Option*.
-- [ ] [P2][T] `rustlite.rtry_option` test.
-- [ ] [P2][F] `rwhile-let` macro.
-- [ ] [P2][T] `rustlite.rwhile_let` loop test.
-- [ ] [P2][D] Docs: `?` and `while let` sections.
+ [x] [P1][F] `rtry` macro for `?` operator semantics (Result path) – implemented 2025-08-28 (pointer-to-value return fix via `rderef`).
+ [x] [P1][T] `rustlite.rtry_result` test (Ok path + early Err short-circuit) – passing 2025-08-28.
+ [x] [P2][F] Extend `rtry` to Option (None short-circuit) if type matches Option*.
+ [x] [P2][T] `rustlite.rtry_option` test.
+ [x] [P2][F] `rwhile-let` macro.
+ 2025-08-28: Implemented `rtry` macro initial version; resolved return type mismatch (E1012) by inserting `rderef` of sum pointer before early `ret`.
+ 2025-08-28: Added driver `rustlite_rtry_driver` and test `rustlite.rtry_result` (Ok path composition + early Err short-circuit) – passing.
+ 2025-08-28: Phase B fully validated; moved focus to Phase C (control flow ergonomics). Next: Option support for `rtry` and documentation.
+ 2025-08-28: Implemented Option path for `rtry`; added driver & test `rustlite.rtry_option` (passing). Macro detects `Option*` prefix to map Some/None.
+ 2025-08-28: Verified existing `rwhile-let` macro via driver `rustlite.rwhilelet` (loop variant binding) – passing.
+ 2025-08-28: Added documentation sections for `rtry` (`?` semantics) and `rwhile-let` in `docs/RUSTLITE.md`.
+ [x] [P2][D] Docs: `?` and `while let` sections.
 
 ### Phase D (Safety & Operators)
-- [ ] [P1][F] Bounds checking flag integration for `rindex*` (env `RUSTLITE_BOUNDS`).
-- [ ] [P1][T] `rustlite.index_bounds_ok` / `rustlite.index_bounds_oob_neg` tests.
-- [ ] [P1][P] Parser support for `%` remainder + bitwise ops & shifts.
-- [ ] [P1][T] `rustlite.bitwise_ops` test driver.
-- [ ] [P2][F] Compound assign macros (or generic `rassign-op`).
-- [ ] [P2][T] `rustlite.compound_assign` test.
-- [ ] [P2][D] Docs: Operator table update.
+ [x] [P1][F] Bounds checking flag integration for `rindex*` (env `RUSTLITE_BOUNDS`).
+ [x] [P1][T] `rustlite.index_bounds_ok` / `rustlite.index_bounds_oob_expand` tests.
+ [x] [P1][P] Parser support for `%` remainder + bitwise ops & shifts.
+ [x] [P1][T] `rustlite.bitwise_ops` test driver.
+ [x] [P2][F] Compound assign macro (generic `rassign-op`).
+ [x] [P2][T] `rustlite.compound_assign` test.
+ [x] [P2][D] Docs: Operator table + `rassign-op` section update.
+2025-08-28: Implemented bounds checking in `rindex-load` / `rindex-store` with optional `:len %sym`, length inference from `arr` / `rarray`, and validation assertion when both provided. Added drivers `rustlite.index_bounds_ok` (in-bounds) and `rustlite.index_bounds_oob_expand` (panic path present). Disabled mode unaffected (legacy tests still pass).
+2025-08-28: Extended intrinsic operator mapping (`rcall`) with remainder, bitwise, and shift ops; added parser tokens for `%` and bitwise/shift; created driver & passing test `rustlite.bitwise_ops`.
+2025-08-28: Added compound assignment macro `rassign-op` (block expansion with temporary + assign); created driver & passing test `rustlite.compound_assign`; documented usage in `docs/RUSTLITE.md`.
+2025-08-28: Implemented bounds checking in `rindex-load` / `rindex-store` with optional `:len %sym`, length inference from `arr` / `rarray`, and validation assertion when both provided. Added drivers `rustlite.index_bounds_ok` (in-bounds) and `rustlite.index_bounds_oob_expand` (panic path present). Disabled mode unaffected (legacy tests still pass).
 
 ### Phase E (Ranges & Closure Polish)
-- [ ] [P2][F] Range literal `rrange` and `rfor-range` adapter.
-- [ ] [P2][T] `rustlite.range_for` test (iterates expected counts).
-- [ ] [P3][F] Closure capture inference (flag gated) + fallback diagnostics.
-- [ ] [P3][T] `rustlite.closure_infer` test (flag on) & `rustlite.closure_infer_disabled` (flag off).
-- [ ] [P3][D] Docs: flags reference.
+- [x] [P2][F] Range literal `rrange` + `rfor-range` (direct and tuple forms) – tuple form extracts start/end; literal form honors `:inclusive true` via `le` comparison. 2025-08-28.
+- [x] [P2][T] `rustlite.range_for` + `rustlite.range_literal` tests (counted loop sugar & literal integration). 2025-08-28.
+- [x] [P2][T] `rustlite.range_inclusive` test validating `:inclusive true` uses `le` comparison. 2025-08-28.
+- [x] [P3][F] Closure capture inference (flag gated) – heuristic previous-const capture (Phase E minimal) 2025-08-28.
+- [x] [P3][T] `rustlite.closure_infer` (flag on) & `rustlite.closure_infer_disabled` (flag off) tests.
+- [x] [P3][D] Docs: flags reference update (capture inference) – completed 2025-08-28 (Feature Flags section + inference & inclusive range notes in `docs/RUSTLITE.md`).
 
 ### Cross-Cutting
-- [ ] [P2][R] Centralize feature flags in a single header `rustlite/features.hpp` with helper queries.
-- [ ] [P2][D] Add "Feature Flags" doc section (bounds, capture inference).
+- [x] [P2][R] Centralize feature flags in a single header `rustlite/features.hpp` with helper queries. (Header created 2025-08-26; all uses consolidated 2025-08-28.)
+- [x] [P2][D] Add "Feature Flags" doc section (bounds, capture inference). (Implemented & expanded 2025-08-28.)
 
 ## Acceptance Criteria
 - All P1 tasks implemented, documented, and tests passing.
@@ -158,6 +168,7 @@ Legend: [P#] Priority (1 = highest), Type: F=Feature, P=Parser, T=Test, D=Docs, 
 - 2025-08-27: Added payload-binding `ematch` driver (`rustlite.ematch_payload`) covering variant field binds + result value path.
 - 2025-08-27: Added legacy non-exhaustive core match regression driver (`rustlite.rmatch_non_exhaustive_legacy`) verifying E1415 still emitted (distinct from E1600 path).
 - 2025-08-27: Extended `ENUMS_MATCHING.md` with payload-binding example and ematch vs rmatch comparison table.
+- 2025-08-28: Phase E completed (ranges inclusive literal, closure capture inference) and Feature Flags & capture inference docs added; all roadmap tasks now closed.
 
 ### Current Status (Phase A & B Progress)
 Phase A complete (tuples, arrays, indexing refinements, literals, extern globals) with docs merged. Phase B core implemented: enum surface alias, variant constructor rewrite, `ematch` macro, E1600 diagnostic, exhaustive / non-exhaustive tests, and enum docs integration. Remaining Phase B items focus on payload-binding tests and legacy regression coverage.

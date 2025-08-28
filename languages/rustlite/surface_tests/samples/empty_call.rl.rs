@@ -1,0 +1,2 @@
+// empty function call
+foo();

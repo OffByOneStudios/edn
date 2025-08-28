@@ -45,7 +45,15 @@ void register_call_macros(edn::Transformer& tx, const std::shared_ptr<MacroConte
                 list out; out.elems = { rl_make_sym(bop), dst, retTy, args[0], args[1] };
                 return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
             };
-            if(op=="add"||op=="sub"||op=="mul"||op=="div"||op=="eq"||op=="ne"||op=="lt"||op=="le"||op=="gt"||op=="ge") return bin(op);
+            // Extend recognized direct binary ops (Phase D operator support):
+            // Existing surface forms used signed division via generic name "div"; map that to sdiv.
+            // New operators: unsigned division udiv, signed/unsigned remainder srem/urem, bitwise and/or/xor, shifts shl/lshr/ashr.
+            auto mapDiv = [&](const std::string& d){
+                if(d=="div") return std::string("sdiv");
+                return d; };
+            if(op=="add"||op=="sub"||op=="mul"||op=="div"||op=="sdiv"||op=="udiv"||op=="srem"||op=="urem"||op=="and"||op=="or"||op=="xor"||op=="shl"||op=="lshr"||op=="ashr"||op=="eq"||op=="ne"||op=="lt"||op=="le"||op=="gt"||op=="ge"){
+                return bin(mapDiv(op));
+            }
             if(op=="not"){
                 if(args.size()!=1) return std::nullopt;
                 vector_t body;
@@ -83,6 +91,23 @@ void register_call_macros(edn::Transformer& tx, const std::shared_ptr<MacroConte
         vector_t thenV; { list oneC; oneC.elems={ rl_make_sym("const"), rl_make_sym(rl_gensym("t")), rl_make_sym("i1"), rl_make_i64(1) }; auto oneN=std::make_shared<node>( node{ oneC, {} } ); thenV.elems.push_back(oneN); auto oneSym=std::get<list>(oneN->data).elems[1]; list asg; asg.elems={ rl_make_sym("assign"), dst, oneSym }; thenV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
         list ifL; ifL.elems = { rl_make_sym("if"), a, std::make_shared<node>( node{ thenV, {} } ) };
         body.elems.push_back(std::make_shared<node>( node{ ifL, {} } ));
+        list blockL; blockL.elems = { rl_make_sym("block"), edn::n_kw("body"), std::make_shared<node>( node{ body, {} } ) };
+        return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
+
+    // Compound assignment sugar: (rassign-op %var Ty op %rhs)
+    // Expands to block containing (op %tmp Ty %var %rhs) then (assign %var %tmp)
+    tx.add_macro("rassign-op", [](const list& form)->std::optional<node_ptr>{
+        auto &e=form.elems; if(e.size()!=5) return std::nullopt; // rassign-op %v Ty op %rhs
+        if(!std::holds_alternative<symbol>(e[1]->data) || !std::holds_alternative<symbol>(e[2]->data) || !std::holds_alternative<symbol>(e[3]->data) || !std::holds_alternative<symbol>(e[4]->data)) return std::nullopt;
+        node_ptr varSym = e[1]; node_ptr tySym = e[2]; std::string op = std::get<symbol>(e[3]->data).name; node_ptr rhs = e[4];
+        auto valid = [&](const std::string& o){ return o=="add"||o=="sub"||o=="mul"||o=="div"||o=="sdiv"||o=="udiv"||o=="srem"||o=="urem"||o=="and"||o=="or"||o=="xor"||o=="shl"||o=="lshr"||o=="ashr"; };
+        if(!valid(op)) return std::nullopt;
+        if(op=="div") op="sdiv"; // treat generic div as signed
+        auto tmp = rl_make_sym(rl_gensym("cassn"));
+        vector_t body;
+        { list opL; opL.elems = { rl_make_sym(op), tmp, tySym, varSym, rhs }; body.elems.push_back(std::make_shared<node>( node{ opL, {} } )); }
+        { list asg; asg.elems = { rl_make_sym("assign"), varSym, tmp }; body.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
         list blockL; blockL.elems = { rl_make_sym("block"), edn::n_kw("body"), std::make_shared<node>( node{ body, {} } ) };
         return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
     });

@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (rcall %__rl_call1 i32 foo) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

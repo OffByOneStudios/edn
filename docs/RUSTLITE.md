@@ -39,18 +39,59 @@ To lower Rustlite → EDN → expand → typecheck → LLVM IR:
 This prints both the high-level EDN and the final IR.
 
 ## Grammar subset (current)
-- Items: `fn ident(params) (-> RetTy)? { ... }`
-- Blocks: `{ ... }`
-- Statements: `let` / `let mut`, `return`, `break`, `continue`, assignment, expression statements (ident, calls)
-- Control flow: `if` / `else if` / `else`, `while`, `loop`
-- Expressions: integers, identifiers, calls, `!` not, unary `-`, binary ops with precedence, comparisons, `&&` / `||` with short-circuit; parentheses allowed as primaries
 
-## Lowering overview
-- Locals: `(rlet ...)` and `(rmut ...)` with `:body [ ]` stubs
-- Assign: `(assign %name %val)`
-- Return: `(ret <fn-ret-ty> %val)`; bare `return;` casts zero to the function’s declared return type
-- Control flow: `(rif ...)`, `(rwhile ...)`, `(rloop ...)`, `(rbreak)`, `(rcontinue)`
+### Integer / Bitwise Operators (Phase D Incremental)
+
+Rustlite currently surfaces arithmetic, comparison, and logical operations by emitting explicit `rcall` forms with the operator symbol. Phase D extends the recognized intrinsic binary set so these names lower directly without additional macro wrappers:
+
+Arithmetic / division / remainder:
+  add sub mul div (alias for signed sdiv) sdiv udiv srem urem
+
+Bitwise and shifts:
+  and or xor shl lshr ashr
+
+Comparisons (unchanged):
+  eq ne lt le gt ge
+
+Example forms:
+```
+(rcall %q i32 and %mask %val)
+(rcall %r i32 shl %x %shift)
+(rcall %s i32 urem %a %b)
+```
+All division/rem ops require the operand types to be integer base types; `div` maps to `sdiv`. Unsigned variants must be explicitly requested via `udiv` / `urem`.
+
+Precedence-aware infix parsing for these operators in the high-level `.rl.rs` surface grammar is still pending; at present they must appear as explicit `rcall` invocations in EDN macro form.
+
 - Calls: `(rcall %dst <op-ty or ret-ty> callee args...)` with intrinsic rewrites
+
+### Compound Assignment Sugar (Phase D Incremental)
+
+Rustlite adds a small macro `rassign-op` to express a read-modify-write sequence without manually introducing a temporary. Pattern:
+
+```
+(rassign-op %var Ty op %rhs)
+```
+
+Expands to a two-step block:
+
+```
+(block :body [
+  (op %__rl_cassn.N Ty %var %rhs)
+  (assign %var %__rl_cassn.N)
+])
+```
+
+Supported `op` names are the same intrinsic binary operator symbols recognized by `rcall` (see previous section). `div` is treated as an alias for signed `sdiv` just like in direct calls. The macro does not itself perform type inference; you must supply the correct operand/result type `Ty`.
+
+Example:
+
+```
+(rassign-op %x i32 add %one) ; %x += 1
+(rassign-op %mask i32 and %flag)
+```
+
+The generated temporary symbol is gensym'd and not reusable outside the macro expansion.
 
 See `design/rustlite.md` for background and roadmap. See `docs/ENUMS_MATCHING.md` for detailed enum construction and exhaustive matching (`ematch`) semantics and diagnostics (E1600 for non-exhaustive `ematch`).
 
@@ -124,7 +165,10 @@ Identical decoded string contents (excluding implicit terminator) or identical r
 | `ematch %dst Ret EnumType %val :arms [...]` | Exhaustive enum match (diagnostic if non-exhaustive) | Ret |
 | `rextern-global ...` | External data symbol | N/A |
 | `rextern-const ...` | External data symbol (alias) | N/A |
+| `rassign-op %v Ty op %rhs` | Compound assignment sugar (`%v = (%v op %rhs)`) | N/A |
 | `rfor :init [ ... ] :cond %c :step [ ... ] :body [ ... ]` | For loop sugar | N/A |
+| `rfor-range %i Ty <start> <end> :body [ ... ]` | Counted range loop (expands to `rfor`) | N/A |
+| `rrange %dst Ty <start> <end> :inclusive <bool>` | Range literal tuple (start,end,inclusive) | tuple type |
 | `rassign %dst %src` | Alias for core mutation | N/A |
 | `rstruct :name S :fields [ (name Ty)* ]` | Struct type declaration | N/A |
 | `rget %dst StructType %obj field` | Load struct field | field type |
@@ -144,16 +188,52 @@ Identical decoded string contents (excluding implicit terminator) or identical r
 | `rerr %dst SumType %val` | Construct Err | SumType |
 | `rmatch %dst Ret SumType %val :arms [...] :else [...]` | Match sum | Ret |
 | `rif-let %dst Ret SumType Variant %val ...` | Conditional extract | Ret |
+| `rtry %dst ResultType %sum` | Unwrap or early-return (Err / None) | binds payload |
+| `rwhile-let SumType Variant %sum :bind %x :body [ ... ]` | Loop while variant holds | N/A |
 
 Diagnostic ranges: literals use E150x (cstr) and E151x (bytes).
 
 ---
 
-### Loop Sugar: `rfor`
+### Loop Sugar: `rfor` and `rfor-range`
 
 ```
 (rfor :init [ <init forms>* ] :cond %condSym :step [ <step forms>* ] :body [ <body forms>* ])
+
+(rfor-range %i Ty <start-int> <end-int> :body [ <body forms>* ])
+; expands to a counted (for ...) with init: %i=<start>, limit=<end>, one=1, cond=%i < limit
 ```
+
+`rfor-range` is a convenience for the exceedingly common counted loop pattern. Example (direct literal bounds):
+
+```
+(rfor-range %i i32 0 4 :body [ (add %tmp i32 %i %i) ])
+```
+
+Expands (conceptually) into:
+
+```
+(for :init [ (const %i i32 0)
+       (const %__rl.end.N i32 4)
+       (const %__rl.one.N i32 1)
+       (lt %__rl.cond.N i1 %i %__rl.end.N) ]
+     :cond %__rl.cond.N
+     :step [ (add %__rl.next.N i32 %i %__rl.one.N)
+       (assign %i %__rl.next.N)
+       (lt %__rl.cond.N i1 %i %__rl.end.N) ]
+     :body [ (add %tmp i32 %i %i) ])
+```
+
+All internal temporaries are gensym'd; only `%i` is user-visible/mutable.
+
+Range literal + adapter (tuple form):
+
+```
+(rrange %r i32 0 4 :inclusive false)
+(rfor-range %i i32 %r :body [ (add %tmp i32 %i %i) ])
+```
+
+`rrange` constructs a tuple `[start end inclusive]` (the `inclusive` flag is reserved; current `rfor-range` ignores it and treats ranges as half-open). The adapter form detects a tuple argument and emits initialization by extracting fields with `tget`.
 
 Expands directly to core `(for ...)`. You maintain the condition symbol (e.g. recompute `%cond` inside `:step`).
 
@@ -260,6 +340,78 @@ Thin sugar over sum construction + match patterns. Canonical `OptionT` / `Result
 (rif-let %r2 i32 OptionI32 Some %o :bind %x :then [ :value %x ] :else [ (const %zero i32 0) :value %zero ])
 ```
 
+### Early Return Sugar (`rtry` – `?` semantics)
+
+`rtry` unwraps a `Result*` / `Option*` value or performs an early return with the error / none variant (analogous to Rust's `?`). It is currently an explicit macro (surface `?` sugar may later desugar to this form).
+
+Form:
+```
+(rtry %bindVar ResultI32 %sumSym)
+```
+
+Behavior:
+- `%sumSym` must be a symbol of a sum type whose name starts with `Result` or `Option`.
+- Result: `Err(e)` => early `(ret ResultI32 e)`; `Ok(v)` => bind payload to `%bindVar` and continue.
+- Option: `None` => early return of that `None`; `Some(v)` => bind `%bindVar`.
+
+Implementation detail: sum constructors yield a pointer to the sum value; the macro inserts an internal `(rderef ...)` before returning so the function sees the expected value type (not pointer) (see EDN-0011 Phase C notes). Driver code still dereferences the final success construction before the outer `ret`.
+
+Simplified expansion (Result case):
+```
+(rmatch %__flag i1 ResultI32 %sumSym :arms [
+  (arm Ok :binds [ %bindVar ] :body [ (const %true i1 1) :value %true ])
+] :else [
+  (rderef %__tmp ResultI32 %sumSym)
+  (ret ResultI32 %__tmp)
+  (const %false i1 0) :value %false
+])
+```
+
+Ok path example:
+```
+(const %forty i32 40)
+(rok %r1 ResultI32 %forty)
+(rtry %x ResultI32 %r1)
+(const %two i32 2)
+(add %sum i32 %x %two)
+(rok %out ResultI32 %sum)
+(rderef %rv ResultI32 %out)
+(ret ResultI32 %rv)
+```
+
+Err short‑circuit:
+```
+(const %five i32 5)
+(rerr %e ResultI32 %five)
+(rtry %x ResultI32 %e) ; returns here
+```
+
+Option behaves analogously with `rsome` / `rnone` and `Some` / `None` variant names.
+
+### Loop Pattern Matching (`rwhile-let`)
+
+Loop while an expression evaluates to a specific variant, binding its payload each iteration.
+
+Form:
+```
+(rwhile-let SumType Variant %expr :bind %x :body [ ... ])
+```
+
+Expansion outline:
+1. Evaluate `%expr` at loop head.
+2. `rmatch` on the sum value.
+3. On matching `Variant`, bind payload(s), execute `:body`, then continue.
+4. Else branch triggers a `break`.
+
+Example (conceptual):
+```
+(rwhile-let OptionI32 Some %opt :bind %v :body [
+  (add %acc i32 %acc %v)
+  ; refresh %opt here (omitted)
+])
+```
+Driver `rustlite.rwhilelet` covers a basic lowering case.
+
 ### Function Pointers (`rfnptr`)
 
 Validates that the annotated pointer type matches the named function (diagnostics E1323/E1324/E1329 for mismatches) and yields a typed pointer usable with `call-indirect`.
@@ -294,16 +446,42 @@ Validates that the annotated pointer type matches the named function (diagnostic
 | `rustlite.ematch_non_exhaustive` | ematch (E1600 non-exhaustive diagnostic) |
 | `rustlite.ematch_payload` | ematch (payload binding) |
 | `rustlite.rmatch_non_exhaustive_legacy` | core match (legacy E1415) |
+| `rustlite.rtry_result` | rtry (Result Ok / Err) |
+| `rustlite.rtry_option` | rtry (Option Some / None) |
+| `rustlite.rwhilelet` | rwhile-let loop variant binding |
 
 Extend as additional drivers land (e.g., `rextern_global_init_neg`, `rmake_trait_obj`).
 
-## Feature Flags (Planned / Early Introduction)
+## Feature Flags
+> Test Strategy Note: Surface-vs-macro layered tests are tracked in issue EDN-0013 to ensure parser output remains aligned with macro expectations.
 
-Two environment flags are reserved for incremental roadmap features (see issue EDN-0011):
+Environment flags gate incremental / experimental behavior. Recognized flags (see issue EDN-0011 for roadmap context):
 
-| Env Var | Purpose | Default |
-|---------|---------|---------|
-| `RUSTLITE_BOUNDS` | Enable bounds checks in future array / indexing macros (emit compare + panic on OOB). | Off (unset/0) |
-| `RUSTLITE_INFER_CAPS` | Enable closure capture inference prototype (auto-detect free symbols if explicit list omitted). | Off |
+| Env Var | Purpose | Default | Status |
+|---------|---------|---------|--------|
+| `RUSTLITE_BOUNDS` | Enable bounds checks in (future) rindex / array related macros (emit compare + panic on OOB). | Off (unset/0) | Planned (not yet honored) |
+| `RUSTLITE_INFER_CAPS` | Enable closure capture inference prototype when an `rclosure` omits explicit `:captures`. | Off | Implemented (heuristic) |
 
-Implementation status: header `rustlite/features.hpp` provides helpers but macros have not yet begun honoring these flags (tracked in EDN-0011 Phase D/E). Using them now has no effect.
+### Closure Capture Inference (`RUSTLITE_INFER_CAPS`)
+
+When set (any non-empty / non-"0" value), a pre-expansion pass scans vector sequences for `(rclosure %c callee ...)` forms lacking a `:captures` keyword. If the *immediately preceding* instruction defines a symbol via `(const %sym Ty ...)` or `(as %sym Ty ...)`, that symbol is inferred and the form is rewritten to:
+
+```
+(rclosure %c callee :captures [ %sym ] ...)
+```
+
+Notes / Limitations:
+* Only a single prior symbol is captured (no multi-symbol or deep free-variable analysis yet).
+* Explicit `:captures` always wins; no inference occurs if provided.
+* Disabled tests (`rustlite.closure_infer_disabled`) ensure no rewrite when the flag is off.
+* Future work may generalize to scanning free symbols inside the closure body.
+
+### Inclusive Range Literal Sugar
+
+Literal `rfor-range` loops now support an inclusive upper bound via a `:inclusive true` keyword when using the literal form:
+
+```
+(rfor-range %i :from 0 :to 4 :inclusive true :body [ ... ])
+```
+
+This lowers using a `<=` comparison instead of `<`. Currently only the literal form (`:from` / `:to` integers) accepts `:inclusive`; the tuple / symbol form still uses exclusive semantics.

@@ -45,21 +45,27 @@ void register_tuple_array_macros(edn::Transformer& tx, const std::shared_ptr<Mac
         return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
     });
     // (arr %dst <ElemTy> [ %v0 %v1 ... ]) -> (array-lit %dst <ElemTy> N [ %v0 %v1 ... ])
-    tx.add_macro("arr", [](const list& form)->std::optional<node_ptr>{
+    tx.add_macro("arr", [ctx](const list& form)->std::optional<node_ptr>{
         auto &e=form.elems; if(e.size()!=4) return std::nullopt;
         if(!std::holds_alternative<symbol>(e[1]->data)) return std::nullopt; // %dst
         auto elemTy = e[2];
         if(!std::holds_alternative<vector_t>(e[3]->data)) return std::nullopt;
         auto &vec = std::get<vector_t>(e[3]->data).elems;
+        // Record length for bounds inference
+        std::string dstName = std::get<symbol>(e[1]->data).name;
+        if(!dstName.empty() && dstName[0]=='%') ctx->arrayLengths[dstName.substr(1)] = vec.size();
         vector_t copy; for(auto &v: vec) copy.elems.push_back(v);
         list out; out.elems = { rl_make_sym("array-lit"), e[1], elemTy, rl_make_i64((int64_t)vec.size()), std::make_shared<node>( node{ copy, {} } ) };
         return std::make_shared<node>( node{ out, form.elems.front()->metadata } );
     });
     // (rarray %dst <ElemTy> <size-int>) -> (alloca %dst (array :elem <ElemTy> :size <size-int>))
-    tx.add_macro("rarray", [](const list& form)->std::optional<node_ptr>{
+    tx.add_macro("rarray", [ctx](const list& form)->std::optional<node_ptr>{
         auto &e=form.elems; if(e.size()!=4) return std::nullopt;
         if(!std::holds_alternative<symbol>(e[1]->data)) return std::nullopt;
         if(!std::holds_alternative<int64_t>(e[3]->data)) return std::nullopt;
+        // Record declared size
+        std::string dstName = std::get<symbol>(e[1]->data).name;
+        if(!dstName.empty() && dstName[0]=='%') ctx->arrayLengths[dstName.substr(1)] = (size_t)std::get<int64_t>(e[3]->data);
         list arrTy; arrTy.elems = { rl_make_sym("array"), rl_make_kw("elem"), e[2], rl_make_kw("size"), e[3] };
         list out; out.elems = { rl_make_sym("alloca"), e[1], std::make_shared<node>( node{ arrTy, {} } ) };
         return std::make_shared<node>( node{ out, form.elems.front()->metadata } );

@@ -15,6 +15,16 @@ if(TARGET fmt::fmt)
 endif()
 ## Inherit LLVM linkage transitively via edn
 
+# Rustlite feature showcase example
+add_executable(edn_rustlite_feature_showcase rustlite_feature_showcase.cpp)
+set_target_properties(edn_rustlite_feature_showcase PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)
+target_link_libraries(edn_rustlite_feature_showcase PRIVATE edn rustlite)
+target_include_directories(edn_rustlite_feature_showcase PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../languages/rustlite/include)
+if(TARGET fmt::fmt)
+	target_link_libraries(edn_rustlite_feature_showcase PRIVATE fmt::fmt)
+endif()
+## Inherit LLVM linkage transitively via edn
+
 # Generics example
 add_executable(edn_generics_example generics_example.cpp)
 set_target_properties(edn_generics_example PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES)

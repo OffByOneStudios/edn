@@ -204,6 +204,22 @@ endif()
 target_compile_features(rustlite_rdot_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.rdot COMMAND rustlite_rdot_driver)
 
+# rtry driver
+add_executable(rustlite_rtry_driver tools/rustlite_rtry_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_rtry_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_rtry_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rtry_result COMMAND rustlite_rtry_driver)
+
+# rtry option driver
+add_executable(rustlite_rtry_option_driver tools/rustlite_rtry_option_driver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_rtry_option_driver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_rtry_option_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rtry_option COMMAND rustlite_rtry_option_driver)
+
 # rdot negative driver
 add_executable(rustlite_rdot_negdriver tools/rustlite_rdot_negdriver.cpp)
 if(TARGET edn)
@@ -402,4 +418,73 @@ add_executable(rustlite_index_addr_driver tools/rustlite_index_addr_driver.cpp)
   target_link_libraries(rustlite_index_addr_driver PRIVATE rustlite edn)
 target_compile_features(rustlite_index_addr_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.index_addr COMMAND rustlite_index_addr_driver)
+
+# rustlite_bounds_driver (bounds checking demonstration)
+add_executable(rustlite_bounds_driver tools/rustlite_bounds_driver.cpp)
+  target_link_libraries(rustlite_bounds_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_bounds_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.bounds_expand COMMAND rustlite_bounds_driver)
+
+# Bounds OK / OOB focused drivers
+add_executable(rustlite_index_bounds_ok_driver tools/rustlite_index_bounds_ok_driver.cpp)
+  target_link_libraries(rustlite_index_bounds_ok_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_index_bounds_ok_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.index_bounds_ok COMMAND rustlite_index_bounds_ok_driver)
+
+add_executable(rustlite_index_bounds_oob_driver tools/rustlite_index_bounds_oob_driver.cpp)
+  target_link_libraries(rustlite_index_bounds_oob_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_index_bounds_oob_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.index_bounds_oob_expand COMMAND rustlite_index_bounds_oob_driver)
+
+# Phase D operator support test driver
+add_executable(rustlite_bitwise_ops_driver tools/rustlite_bitwise_ops_driver.cpp)
+target_link_libraries(rustlite_bitwise_ops_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_bitwise_ops_driver PRIVATE cxx_std_20)
+target_include_directories(rustlite_bitwise_ops_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.bitwise_ops COMMAND rustlite_bitwise_ops_driver)
+
+# Compound assignment driver
+add_executable(rustlite_compound_assign_driver tools/rustlite_compound_assign_driver.cpp)
+target_link_libraries(rustlite_compound_assign_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_compound_assign_driver PRIVATE cxx_std_20)
+target_include_directories(rustlite_compound_assign_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.compound_assign COMMAND rustlite_compound_assign_driver)
+
+# Range for driver
+add_executable(rustlite_range_for_driver tools/rustlite_range_for_driver.cpp)
+target_link_libraries(rustlite_range_for_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_range_for_driver PRIVATE cxx_std_20)
+target_include_directories(rustlite_range_for_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.range_for COMMAND rustlite_range_for_driver)
+
+# Range literal driver
+add_executable(rustlite_range_literal_driver tools/rustlite_range_literal_driver.cpp)
+target_link_libraries(rustlite_range_literal_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_range_literal_driver PRIVATE cxx_std_20)
+target_include_directories(rustlite_range_literal_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.range_literal COMMAND rustlite_range_literal_driver)
+
+# Range inclusive literal driver
+add_executable(rustlite_range_inclusive_driver tools/rustlite_range_inclusive_driver.cpp)
+target_link_libraries(rustlite_range_inclusive_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_range_inclusive_driver PRIVATE cxx_std_20)
+target_include_directories(rustlite_range_inclusive_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.range_inclusive COMMAND rustlite_range_inclusive_driver)
+
+# Closure capture inference (enabled)
+add_executable(rustlite_closure_infer_driver tools/rustlite_closure_infer_driver.cpp)
+target_link_libraries(rustlite_closure_infer_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_closure_infer_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.closure_infer COMMAND rustlite_closure_infer_driver)
+set_tests_properties(rustlite.closure_infer PROPERTIES ENVIRONMENT "RUSTLITE_INFER_CAPS=1")
+
+# Closure capture inference (disabled)
+add_executable(rustlite_closure_infer_disabled_driver tools/rustlite_closure_infer_disabled_driver.cpp)
+target_link_libraries(rustlite_closure_infer_disabled_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_closure_infer_disabled_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.closure_infer_disabled COMMAND rustlite_closure_infer_disabled_driver)
+
+
+# Surface tests (parser golden comparisons)
+add_subdirectory(surface_tests)
 

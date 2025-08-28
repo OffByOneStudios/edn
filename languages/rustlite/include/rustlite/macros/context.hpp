@@ -11,6 +11,8 @@ struct MacroContext {
     std::unordered_map<std::string,size_t> enumVariantCounts; // for ematch exhaustiveness
     std::unordered_map<std::string,size_t> tupleVarArity;     // %var -> arity for tuple members
     std::unordered_set<size_t> tupleArities;                  // distinct tuple arities encountered
+    // Array length tracking: %var (without leading %) -> element count for arr/rarray constructions.
+    std::unordered_map<std::string,size_t> arrayLengths;      // used for bounds checks when enabled
 };
 
 // Grouped registration functions. Each installs a related set of macros.

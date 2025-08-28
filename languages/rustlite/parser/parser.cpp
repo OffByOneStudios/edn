@@ -121,7 +121,8 @@ struct param_mut : kw_mut {};
 struct param_decl : seq< opt< ws< param_mut > >, ws< ident >, opt< seq< ws< colon >, type_name > > > {};
 struct fn_item : seq< ws< kw_fn >, ws< fn_name >, params_list, opt< ret_type_rule >, block_rule > {};
 
-struct module_rule : must< star< space_or_comment >, star< fn_item >, star< space_or_comment >, eof > {};
+// Updated module rule: allow interleaving of function items and free statements (snippets).
+struct module_rule : must< star< space_or_comment >, star< sor< fn_item, stmt > >, star< space_or_comment >, eof > {};
 
 // State carried during parsing to collect high-level info for lowering
 struct build_state {
@@ -389,12 +390,20 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
     return {"i32", fn.zero_sym};
 }
 
+// Helper to ensure a current function (for snippet mode)
+static inline build_state::fn_emit* ensure_fn(build_state& st){
+    if(!st.current()){
+        build_state::fn_emit f; f.name = "__surface"; st.fns.push_back(std::move(f));
+    }
+    return st.current();
+}
+
 // let statement lowering: let <name> (: type)? = <expr>;
 template<>
 struct action< let_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return;
+        auto* fn = ensure_fn(st); if(!fn) return;
         std::string s = in.string();
         // strip trailing ';'
         if(!s.empty() && s.back()==';') s.pop_back();
@@ -429,7 +438,7 @@ template<>
 struct action< assign_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return;
+    auto* fn = ensure_fn(st); if(!fn) return;
         std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
         size_t i=0; ltrim(s,i); auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i); if(i>=s.size()||s[i]!='=') return; ++i; ltrim(s,i);
         auto expr = s.substr(i);
@@ -443,7 +452,7 @@ template<>
 struct action< compound_assign_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return;
+    auto* fn = ensure_fn(st); if(!fn) return;
         std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
         size_t i=0; ltrim(s,i);
         auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i);
@@ -470,7 +479,7 @@ template<>
 struct action< return_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return;
+    auto* fn = ensure_fn(st); if(!fn) return;
     fn->saw_ret = true;
         std::string s = in.string(); // includes 'return' and ';'
         size_t i=0; ltrim(s,i);
@@ -498,7 +507,7 @@ template<>
 struct action< expr_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return;
+    auto* fn = ensure_fn(st); if(!fn) return;
         std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
         size_t i=0; ltrim(s,i);
         // parse leading ident
@@ -528,12 +537,12 @@ struct action< expr_stmt > {
 template<>
 struct action< lb_padded > {
     template<typename Input>
-    static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; fn->block_stack.emplace_back(); }
+    static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; fn->block_stack.emplace_back(); }
 };
 template<>
 struct action< rb_padded > {
     template<typename Input>
-    static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; if(fn->block_stack.empty()) return; auto blk = std::move(fn->block_stack.back()); fn->block_stack.pop_back(); fn->block_results.push_back(std::move(blk)); }
+    static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; if(fn->block_stack.empty()) return; auto blk = std::move(fn->block_stack.back()); fn->block_stack.pop_back(); fn->block_results.push_back(std::move(blk)); }
 };
 
 // Completed block_rule: when closing a function's top-level block, if no explicit return emitted
@@ -557,7 +566,7 @@ template<>
 struct action< tail_expr > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
-        auto* fn = st.current(); if(!fn) return; if(fn->saw_ret) return; // already have explicit return
+    auto* fn = ensure_fn(st); if(!fn) return; if(fn->saw_ret) return; // already have explicit return
         std::string expr = in.string();
         auto [ty, sym] = lower_simple_expr_into(*fn, expr);
         auto rty = (fn->ret_type.empty()? std::string("i32") : fn->ret_type);
@@ -575,7 +584,7 @@ struct action< tail_expr > {
 template<>
 struct action< while_stmt > {
     template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; if(fn->block_results.empty()) return; auto bodyVec = std::move(fn->block_results.back()); fn->block_results.pop_back();
+    static void apply(const Input& in, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; if(fn->block_results.empty()) return; auto bodyVec = std::move(fn->block_results.back()); fn->block_results.pop_back();
         // Prefer captured condition from action<while_cond>, fallback to substring parse
         std::string condSym;
         if(!fn->cond_results.empty()){ condSym = std::move(fn->cond_results.back()); fn->cond_results.pop_back(); }
@@ -594,26 +603,26 @@ struct action< while_stmt > {
 template<>
 struct action< loop_stmt > {
     template<typename Input>
-    static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; if(fn->block_results.empty()) return; auto bodyVec = std::move(fn->block_results.back()); fn->block_results.pop_back(); std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : bodyVec){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; fn->sink().push_back(std::string("(rloop :body ") + bv.str() + ")"); }
+    static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; if(fn->block_results.empty()) return; auto bodyVec = std::move(fn->block_results.back()); fn->block_results.pop_back(); std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : bodyVec){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; fn->sink().push_back(std::string("(rloop :body ") + bv.str() + ")"); }
 };
 
 // break/continue
 template<>
 struct action< break_stmt > {
     template<typename Input>
-    static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; fn->sink().push_back("(rbreak)"); }
+    static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; fn->sink().push_back("(rbreak)"); }
 };
 template<>
 struct action< continue_stmt > {
     template<typename Input>
-    static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; fn->sink().push_back("(rcontinue)"); }
+    static void apply(const Input&, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; fn->sink().push_back("(rcontinue)"); }
 };
 
 // if <cond> <then-block> [else if <cond> <block>]* [else <block>]
 template<>
 struct action< if_stmt > {
     template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; std::string s=in.string();
+    static void apply(const Input& in, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; std::string s=in.string();
         // Count branches via source text so we know how many blocks/conds to pop.
         size_t count_else_if = 0; size_t pos_search = 0; while(true){ auto p = s.find("else if", pos_search); if(p==std::string::npos) break; ++count_else_if; pos_search = p + 1; }
         bool hasElse = s.find(" else ") != std::string::npos || s.rfind("else{", std::string::npos) != std::string::npos;
@@ -654,17 +663,17 @@ struct action< if_stmt > {
 template<>
 struct action< if_cond > {
     template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
+    static void apply(const Input& in, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
 };
 template<>
 struct action< else_if_cond > {
     template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
+    static void apply(const Input& in, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
 };
 template<>
 struct action< while_cond > {
     template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
+    static void apply(const Input& in, build_state& st){ auto* fn=ensure_fn(st); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
 };
 
 // Capture function name

@@ -69,6 +69,12 @@ namespace edn
         std::map<std::string, node_ptr> metadata;
     };
 
+    // Parse a single EDN form (entire input) into a node tree.
+    node_ptr parse_one(std::string_view src);
+
+    // Structural deep equality of two EDN nodes. If ignore_metadata is true, metadata maps are ignored.
+    bool equal(const node_ptr& a, const node_ptr& b, bool ignore_metadata = true);
+
     namespace detail
     {
         struct reader

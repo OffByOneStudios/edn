@@ -5,10 +5,13 @@
 #include "rustlite/expand.hpp"
 #include "rustlite/macros/context.hpp"
 #include "rustlite/macros/helpers.hpp"
+#include "rustlite/features.hpp" // feature flags (bounds checks, capture inference)
 #include "edn/transform.hpp"
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+
+// (Capture inference gating via rustlite::infer_captures_enabled from features.hpp)
 
 // Restored macros: rcstr, rbytes, rextern-global, rextern-const, refactored rindex* helper, ematch metadata tagging.
 // (Build stamp v2) Adjusted to support E1600 non-exhaustive enum match diagnostic.
@@ -18,6 +21,8 @@ using namespace edn;
 namespace rustlite {
 
 using rustlite::rl_make_sym; using rustlite::rl_make_kw; using rustlite::rl_make_i64; using rustlite::rl_gensym;
+
+// (Previous inline fallback removed; single source of truth is features.hpp)
 
 edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     // Pre-walk: rewrite variant constructor surface forms of shape (Type::Variant %dst [payload*])
@@ -57,6 +62,60 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     };
     auto ast_copy = module_ast; // operate on provided AST (shared_ptr semantics)
     prewalk(ast_copy);
+
+    // Optional pre-expansion rewrite: closure capture inference.
+    // If RUSTLITE_INFER_CAPS=1 and an (rclosure %c callee ...) form lacks a :captures vector,
+    // heuristically capture the symbol defined immediately prior in the same block (vector sequence).
+    if(rustlite::infer_captures_enabled()){
+        std::function<void(node_ptr&)> closure_walk;
+        closure_walk = [&](node_ptr &n){
+            if(!n) return;
+            if(std::holds_alternative<vector_t>(n->data)){
+                auto &vec = std::get<vector_t>(n->data);
+                // Walk with index to inspect previous sibling
+                for(size_t i=0;i<vec.elems.size(); ++i){
+                    auto &elem = vec.elems[i];
+                    if(elem && std::holds_alternative<list>(elem->data)){
+                        auto &L = std::get<list>(elem->data).elems;
+                        if(!L.empty() && std::holds_alternative<symbol>(L[0]->data) && std::get<symbol>(L[0]->data).name=="rclosure"){
+                            bool hasCaptures=false; for(size_t j=1;j+1<L.size(); j+=2){ if(std::holds_alternative<keyword>(L[j]->data) && std::get<keyword>(L[j]->data).name=="captures"){ hasCaptures=true; break; } else if(!std::holds_alternative<keyword>(L[j]->data)) break; }
+                            if(!hasCaptures){
+                                // candidate: previous sibling list defines symbol via (const %sym Ty ...) or (as %sym Ty ...)
+                                std::string capSymName;
+                                if(i>0){
+                                    auto &prev = vec.elems[i-1];
+                                    if(prev && std::holds_alternative<list>(prev->data)){
+                                        auto &PL = std::get<list>(prev->data).elems;
+                                        if(PL.size()>=4 && std::holds_alternative<symbol>(PL[0]->data)){
+                                            std::string op = std::get<symbol>(PL[0]->data).name;
+                                            if((op=="const"||op=="as") && std::holds_alternative<symbol>(PL[1]->data)) capSymName = std::get<symbol>(PL[1]->data).name;
+                                        }
+                                    }
+                                }
+                                if(!capSymName.empty()){
+                                    // Insert :captures [ %sym ] just after callee symbol (expected order: head %dst callee ...)
+                                    // Form: (rclosure %c callee :captures [ %capt ])
+                                    // Find insertion point before first keyword argument.
+                                    size_t insertPos = L.size();
+                                    for(size_t k=1;k<L.size(); ++k){ if(std::holds_alternative<keyword>(L[k]->data)){ insertPos = k; break; } }
+                                    vector_t capVec; capVec.elems.push_back(rustlite::rl_make_sym(capSymName));
+                                    auto capVecNode = std::make_shared<node>( node{ capVec, {} } );
+                                    auto it = std::next(L.begin(), static_cast<long>(insertPos));
+                                    it = L.insert(it, rl_make_kw("captures"));
+                                    L.insert(std::next(it), capVecNode);
+                                }
+                            }
+                        }
+                    }
+                    if(vec.elems[i]) closure_walk(vec.elems[i]);
+                }
+                return;
+            }
+            if(std::holds_alternative<list>(n->data)){
+                auto &L = std::get<list>(n->data).elems; for(auto &c : L) closure_walk(c); return; }
+        };
+        closure_walk(ast_copy);
+    }
     Transformer tx;
     // Shared macro context (enum counts, tuple arities, etc.)
     auto macroCtx = std::make_shared<MacroContext>();

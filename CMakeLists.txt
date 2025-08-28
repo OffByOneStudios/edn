@@ -26,6 +26,7 @@ add_library(edn STATIC
     src/edn.cpp
     src/type_check.cpp
     src/diagnostics_json.cpp
+    src/edn_equal.cpp
     # Modular IR emitter (planned split; see src/edn/ir/README.md)
     src/edn/ir/context.cpp
     src/edn/ir/types.cpp
