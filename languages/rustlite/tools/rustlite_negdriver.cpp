@@ -20,7 +20,8 @@ int main(){
      .end_module();
 
     auto ast = parse(b.build().edn_text);
-    auto expanded = rustlite::expand_rustlite(expand_traits(ast));
+    // Order fix: expand rustlite macros first, then trait/vtable lowering so trait-call forms are rewritten.
+    auto expanded = expand_traits(rustlite::expand_rustlite(ast));
     TypeContext tctx; TypeChecker tc(tctx);
     auto tcres = tc.check_module(expanded);
     if(tcres.success){ std::cerr << "[rustlite-neg] expected type check failures but passed" << std::endl; return 1; }

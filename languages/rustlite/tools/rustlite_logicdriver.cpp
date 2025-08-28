@@ -28,6 +28,16 @@ int main(){
     auto prog = b.build();
     auto ast = parse(prog.edn_text);
     auto expanded = rustlite::expand_rustlite(ast);
+    // DEBUG: scan for any residual macro heads beginning with 'r' that should have been expanded
+    std::function<void(const edn::node_ptr&)> scan = [&](const edn::node_ptr& n){
+        if(!n) return; if(std::holds_alternative<edn::vector_t>(n->data)){ for(auto &e: std::get<edn::vector_t>(n->data).elems) scan(e); return; }
+        if(!std::holds_alternative<edn::list>(n->data)) return; auto &L = std::get<edn::list>(n->data).elems; if(L.empty()) return; if(std::holds_alternative<edn::symbol>(L[0]->data)){
+            auto head = std::get<edn::symbol>(L[0]->data).name; if(head.size()>2 && head[0]=='r' && std::isalpha(static_cast<unsigned char>(head[1])) && head.rfind("ret",0)!=0){
+                std::cerr << "[logic-debug] leftover head: " << head << "\n";
+            }
+        }
+        for(auto &e: L) scan(e);
+    }; scan(expanded);
 
     TypeContext tctx; TypeChecker tc(tctx);
     auto tcres = tc.check_module(expanded);

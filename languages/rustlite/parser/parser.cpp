@@ -100,19 +100,25 @@ struct stmt : sor< if_stmt, while_stmt, loop_stmt, return_stmt, break_stmt, cont
 // Padded braces so we can hook actions reliably
 struct lb_padded : ws< lbrace > {};
 struct rb_padded : ws< rbrace > {};
+// Tail expression (no trailing semicolon) allowed at end of block
+struct tail_expr : ws< cond_expr > {};
 struct block_rule : seq< lb_padded,
                                      star< space_or_comment >,
                                      star< stmt >,
+                                     opt< tail_expr >,
                                      star< space_or_comment >,
                                      rb_padded > {};
 
 // item: fn ident(params) (-> type)? { ... }
-struct param_decl; // fwd
+struct param_decl; // fwd (defined below as optional mut ident)
 struct params_inner : seq< ws< param_decl >, star< seq< ws< comma >, ws< param_decl > > > > {};
 struct params_list : seq< ws< lparen >, opt< params_inner >, ws< rparen > > {};
 // Capture function name with a dedicated rule so actions can find it easily
 struct fn_name : ident {};
 struct ret_type_rule : seq< ws< arrow >, ws< type_name > > {};
+// Parameter declaration: optional 'mut' then identifier and optional ': Type'
+struct param_mut : kw_mut {};
+struct param_decl : seq< opt< ws< param_mut > >, ws< ident >, opt< seq< ws< colon >, type_name > > > {};
 struct fn_item : seq< ws< kw_fn >, ws< fn_name >, params_list, opt< ret_type_rule >, block_rule > {};
 
 struct module_rule : must< star< space_or_comment >, star< fn_item >, star< space_or_comment >, eof > {};
@@ -135,6 +141,7 @@ struct build_state {
     // Function signature
     std::vector<std::pair<std::string,std::string>> params; // (type,name)
     std::string ret_type{"i32"};
+    bool saw_ret{false};
     };
     std::vector<fn_emit> fns;
     fn_emit* current(){ return fns.empty()? nullptr : &fns.back(); }
@@ -147,32 +154,12 @@ struct action : nothing<Rule> {};
 static inline void ltrim(const std::string& s, size_t& i);
 static inline std::string parse_ident(const std::string& s, size_t& i);
 
-template<>
-struct action< fn_name > {
-    template<typename Input>
-    static void apply(const Input& in, build_state& st) {
-        build_state::fn_emit f; f.name = in.string(); st.fns.push_back(std::move(f));
-    }
-};
+// fn_name action provided later (unified version)
 
-// Parameters
-struct param_decl : seq< ws< ident >, ws< colon >, type_name > {};
-
-template<>
-struct action< param_decl > {
-    template<typename Input>
-    static void apply(const Input& in, build_state& st){
-        auto* fn=st.current(); if(!fn) return;
-        std::string s = in.string(); size_t i=0; ltrim(s,i); auto name = parse_ident(s,i); ltrim(s,i); if(i<s.size() && s[i]==':'){ ++i; ltrim(s,i); auto ty = parse_ident(s,i); if(!name.empty() && !ty.empty()){ if(name[0] != '%') name = std::string("%") + name; fn->params.emplace_back(ty, name); } }
-    }
-};
+// (Old typed param form removed; simple param_decl action added later.)
 
 // Return type
-template<>
-struct action< ret_type_rule > {
-    template<typename Input>
-    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; std::string s=in.string(); auto pos=s.find('>'); if(pos!=std::string::npos){ std::string t = s.substr(pos+1); size_t i=0; ltrim(t,i); auto ty = parse_ident(t,i); if(!ty.empty()) fn->ret_type = ty; } }
-};
+// ret_type_rule action provided later (unified version)
 
 // Small helpers to parse substrings for simple statements
 static inline void ltrim(const std::string& s, size_t& i){ while(i<s.size() && isspace((unsigned char)s[i])) ++i; }
@@ -484,6 +471,7 @@ struct action< return_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
         auto* fn = st.current(); if(!fn) return;
+    fn->saw_ret = true;
         std::string s = in.string(); // includes 'return' and ';'
         size_t i=0; ltrim(s,i);
         if(s.compare(i,6,"return")!=0) return; i+=6; ltrim(s,i);
@@ -546,6 +534,41 @@ template<>
 struct action< rb_padded > {
     template<typename Input>
     static void apply(const Input&, build_state& st){ auto* fn=st.current(); if(!fn) return; if(fn->block_stack.empty()) return; auto blk = std::move(fn->block_stack.back()); fn->block_stack.pop_back(); fn->block_results.push_back(std::move(blk)); }
+};
+
+// Completed block_rule: when closing a function's top-level block, if no explicit return emitted
+// and the function body ends with a simple expression statement lacking semicolon semantics,
+// we could synthesize an implicit return; current grammar models only terminated statements,
+// so just move collected instructions into sink when associated with an enclosing construct.
+template<>
+struct action< block_rule > {
+    template<typename Input>
+    static void apply(const Input&, build_state& st){
+        auto* fn = st.current(); if(!fn) return;
+        if(st.fns.empty()) return;
+        // If this block belongs to a function item (top-level after lb_padded/rb_padded), its
+        // serialized instructions were already pushed via block_results and consumed by fn_item action.
+        // No extra logic needed now; placeholder for future tail expression return.
+    }
+};
+
+// Tail expression implicit return
+template<>
+struct action< tail_expr > {
+    template<typename Input>
+    static void apply(const Input& in, build_state& st){
+        auto* fn = st.current(); if(!fn) return; if(fn->saw_ret) return; // already have explicit return
+        std::string expr = in.string();
+        auto [ty, sym] = lower_simple_expr_into(*fn, expr);
+        auto rty = (fn->ret_type.empty()? std::string("i32") : fn->ret_type);
+        if(ty != rty){
+            auto cast = fn->gensym("tail");
+            fn->sink().push_back("(as " + cast + " " + rty + " " + sym + ")");
+            sym = cast;
+        }
+        fn->sink().push_back("(ret " + rty + " " + sym + ")");
+        fn->saw_ret = true;
+    }
 };
 
 // while <cond> <block>
@@ -642,6 +665,29 @@ template<>
 struct action< while_cond > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; auto p = lower_simple_expr_into(*fn, in.string()); fn->cond_results.push_back(p.second); }
+};
+
+// Capture function name
+template<>
+struct action< fn_name > {
+    template<typename Input>
+    static void apply(const Input& in, build_state& st){ build_state::fn_emit f; f.name=in.string(); st.fns.push_back(std::move(f)); }
+};
+
+// Return type rule unified action
+template<>
+struct action< ret_type_rule > {
+    template<typename Input>
+    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; std::string s=in.string(); auto pos=s.find('>'); if(pos!=std::string::npos){ std::string t=s.substr(pos+1); size_t i=0; ltrim(t,i); auto ty=parse_ident(t,i); if(!ty.empty()) fn->ret_type=ty; } }
+};
+
+// Parameter capture: supports [mut] name [: Type]
+template<>
+struct action< param_decl > {
+    template<typename Input>
+    static void apply(const Input& in, build_state& st){ auto* fn=st.current(); if(!fn) return; std::string s=in.string(); size_t i=0; ltrim(s,i); if(s.compare(i,3,"mut")==0 && (i+3==s.size()||isspace((unsigned char)s[i+3]))){ i+=3; ltrim(s,i);} auto name=parse_ident(s,i); ltrim(s,i); std::string ty="i32"; if(i<s.size() && s[i]==':'){ ++i; ltrim(s,i); auto t=parse_ident(s,i); if(!t.empty()) ty=t; }
+        if(!name.empty()){ if(name[0] != '%') name = std::string("%") + name; fn->params.emplace_back(ty, name); }
+    }
 };
 
 // At end of a function item, if the body was parsed as a block, move it into fn.body

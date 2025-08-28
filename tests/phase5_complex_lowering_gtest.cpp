@@ -24,8 +24,15 @@ static std::string locate_driver(){
 
 static int run_complex_lowering(std::string *fullOut=nullptr){
     std::string exe = locate_driver();
-    const char *sample = "../../languages/rustlite/samples/complex_lowering.rl.rs"; // from build/tests
-    if(FILE *f = fopen(sample, "rb")) fclose(f); else sample = "languages/rustlite/samples/complex_lowering.rl.rs"; // try alt path
+    // Try a sequence of sample paths relative to typical invocation CWDs (build/, build/tests/, repo root)
+    const char* sample_candidates[] = {
+        "../../languages/rustlite/samples/complex_lowering.rl.rs", // when CWD=build/tests
+        "../languages/rustlite/samples/complex_lowering.rl.rs",    // when CWD=build
+        "languages/rustlite/samples/complex_lowering.rl.rs",       // when CWD=repo root
+        "./languages/rustlite/samples/complex_lowering.rl.rs"      // explicit relative
+    };
+    const char* sample = sample_candidates[0];
+    for(auto cand : sample_candidates){ if(FILE *f = fopen(cand, "rb")){ fclose(f); sample = cand; break; } }
     std::string cmd = exe + " " + sample + " --debug";
     std::array<char, 512> buf{};
 #if defined(_WIN32)

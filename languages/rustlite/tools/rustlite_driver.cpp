@@ -55,7 +55,23 @@ int main(int argc, char** argv){
     auto tcres = tc.check_module(expanded);
     if(!tcres.success){
         std::cerr << "[rustlite] type check failed\n";
-    std::cerr << "\n=== Generated EDN (pre-expand) ===\n" << prog.edn_text << "\n";
+        std::cerr << "\n=== Generated EDN (pre-expand) ===\n" << prog.edn_text << "\n";
+        // Scan for residual macro heads and unknown ops
+        std::unordered_set<std::string> allow = {"module","sum","variant","fn","param","add","sub","mul","div","eq","ne","lt","le","gt","ge","const","ret","assign","as","alloca","store","load","while","for","block","if","match","case","bind","panic","assert","call","call-closure","make-closure","sum-new","trait-call","make-trait-obj","struct","field","typedef","extern-fn","global","rmatch","default"};
+        std::unordered_set<std::string> seenUnknown;
+        std::function<void(const edn::node_ptr&)> scan = [&](const edn::node_ptr& n){
+            if(!n) return; if(std::holds_alternative<edn::vector_t>(n->data)){ for(auto &e: std::get<edn::vector_t>(n->data).elems) scan(e); return; }
+            if(!std::holds_alternative<edn::list>(n->data)) return; auto &L = std::get<edn::list>(n->data).elems; if(L.empty()) return; if(std::holds_alternative<edn::symbol>(L[0]->data)){
+                auto head = std::get<edn::symbol>(L[0]->data).name;
+                if(!allow.count(head)) seenUnknown.insert(head);
+            }
+            for(auto &e: L) scan(e);
+        }; scan(expanded);
+        if(!seenUnknown.empty()){
+            std::cerr << "[smoke-debug] unknown heads after macro expansion:";
+            for(auto &h: seenUnknown) std::cerr << ' ' << h;
+            std::cerr << "\n";
+        }
         for(const auto& e : tcres.errors){
             std::cerr << e.code << ": " << e.message << "\n";
             for(const auto& n : e.notes){ std::cerr << "  note: " << n.message << "\n"; }

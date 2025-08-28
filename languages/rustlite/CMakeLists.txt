@@ -4,6 +4,15 @@ project(rustlite LANGUAGES CXX)
 add_library(rustlite STATIC
   src/rustlite.cpp
   src/expand.cpp
+  src/macros_literals.cpp
+  src/macros_control.cpp
+  src/macros_sum_enum.cpp
+  src/macros_call_logic.cpp
+  src/macros_struct_trait.cpp
+  src/macros_field_index.cpp
+  src/macros_tuple_array.cpp
+  src/macros_assert.cpp
+  src/macros_alias.cpp
 )
 
 target_include_directories(rustlite PUBLIC

@@ -27,7 +27,7 @@ int main(){
 
     auto prog = b.build();
     auto ast = parse(prog.edn_text);
-    auto expanded = rustlite::expand_rustlite(expand_traits(ast));
+    auto expanded = expand_traits(rustlite::expand_rustlite(ast));
 
     TypeContext tctx; TypeChecker tc(tctx);
     auto tcres = tc.check_module(expanded);
