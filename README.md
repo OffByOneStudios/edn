@@ -8,6 +8,21 @@ An experimental polyglot compilation substrate:
 
 Ultimate vision: Seamless interop across modern language surfaces (Rust↔Python↔Zig↔TypeScript, etc.) in one process without FFI glue, fragmentation, or per-language runtimes. Multiple languages become syntactic veneers that macro‑lower into the same strongly‑typed EDN/IR graph, enabling mixed-module optimization, unified diagnostics, and shared tooling.
 
+
+## Quickstart:
+* Install cmake
+* Install and configure: [vcpkg](https://github.com/Microsoft/vcpkg)
+* Clone this project:
+```sh
+git clone https://github.com/OffByOneStudios/edn
+```
+* Configure and build project:
+```sh
+cmake --preset default
+cmake --build build
+```
+
+
 ## Why
 Today polyglot means: brittle FFI boundaries, duplicated runtime stacks, impedance mismatches in types, and separate debuggers/toolchains. We want:
 1. Single canonical IR + type system with zero-copy value passing where possible.

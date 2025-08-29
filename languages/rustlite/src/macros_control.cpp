@@ -152,17 +152,33 @@ void register_var_control_macros(edn::Transformer& tx, const std::shared_ptr<Mac
             { list tgetL; tgetL.elems = { rl_make_sym("tget"), startTmp, tySym, rangeSym, rl_make_i64(0) }; prologue.elems.push_back(std::make_shared<node>( node{ tgetL, {} } )); }
             // tget end
             { list tgetL; tgetL.elems = { rl_make_sym("tget"), endSym, tySym, rangeSym, rl_make_i64(1) }; prologue.elems.push_back(std::make_shared<node>( node{ tgetL, {} } )); }
+            // tget inclusive flag (i1)
+            auto inclusiveSym = rl_make_sym(rl_gensym("rinclusive"));
+            { list tgetL; tgetL.elems = { rl_make_sym("tget"), inclusiveSym, rl_make_sym("i1"), rangeSym, rl_make_i64(2) }; prologue.elems.push_back(std::make_shared<node>( node{ tgetL, {} } )); }
             // assign loop var from startTmp
             { list asL; asL.elems = { rl_make_sym("assign"), loopVar, startTmp }; prologue.elems.push_back(std::make_shared<node>( node{ asL, {} } )); }
             // const one
             { list c; c.elems = { rl_make_sym("const"), oneSym, tySym, rl_make_i64(1) }; prologue.elems.push_back(std::make_shared<node>( node{ c, {} } )); }
-            // initial cond
-            { list cmp; cmp.elems = { rl_make_sym("lt"), condSym, rl_make_sym("i1"), loopVar, endSym }; prologue.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            // initial cond (supports inclusive flag): cond = (or (lt i end) (and inclusive (eq i end)))
+            auto ltTmp = rl_make_sym(rl_gensym("lt"));
+            { list cmp; cmp.elems = { rl_make_sym("lt"), ltTmp, rl_make_sym("i1"), loopVar, endSym }; prologue.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            auto eqTmp = rl_make_sym(rl_gensym("eq"));
+            { list cmp; cmp.elems = { rl_make_sym("eq"), eqTmp, rl_make_sym("i1"), loopVar, endSym }; prologue.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            auto andTmp = rl_make_sym(rl_gensym("and"));
+            { list a; a.elems = { rl_make_sym("and"), andTmp, rl_make_sym("i1"), inclusiveSym, eqTmp }; prologue.elems.push_back(std::make_shared<node>( node{ a, {} } )); }
+            { list o; o.elems = { rl_make_sym("or"), condSym, rl_make_sym("i1"), ltTmp, andTmp }; prologue.elems.push_back(std::make_shared<node>( node{ o, {} } )); }
             // Build step
             vector_t stepV;
             { list addL; addL.elems = { rl_make_sym("add"), tmpSym, tySym, loopVar, oneSym }; stepV.elems.push_back(std::make_shared<node>( node{ addL, {} } )); }
             { list asg; asg.elems = { rl_make_sym("assign"), loopVar, tmpSym }; stepV.elems.push_back(std::make_shared<node>( node{ asg, {} } )); }
-            { list cmp; cmp.elems = { rl_make_sym("lt"), condSym, rl_make_sym("i1"), loopVar, endSym }; stepV.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            // Recompute cond with inclusive logic
+            auto ltTmp2 = rl_make_sym(rl_gensym("lt"));
+            { list cmp; cmp.elems = { rl_make_sym("lt"), ltTmp2, rl_make_sym("i1"), loopVar, endSym }; stepV.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            auto eqTmp2 = rl_make_sym(rl_gensym("eq"));
+            { list cmp; cmp.elems = { rl_make_sym("eq"), eqTmp2, rl_make_sym("i1"), loopVar, endSym }; stepV.elems.push_back(std::make_shared<node>( node{ cmp, {} } )); }
+            auto andTmp2 = rl_make_sym(rl_gensym("and"));
+            { list a; a.elems = { rl_make_sym("and"), andTmp2, rl_make_sym("i1"), inclusiveSym, eqTmp2 }; stepV.elems.push_back(std::make_shared<node>( node{ a, {} } )); }
+            { list o; o.elems = { rl_make_sym("or"), condSym, rl_make_sym("i1"), ltTmp2, andTmp2 }; stepV.elems.push_back(std::make_shared<node>( node{ o, {} } )); }
             list forL; forL.elems = { rl_make_sym("for"), rl_make_kw("init"), std::make_shared<node>( node{ prologue, {} } ), rl_make_kw("cond"), condSym, rl_make_kw("step"), std::make_shared<node>( node{ stepV, {} } ), rl_make_kw("body"), bodyVec };
             return std::make_shared<node>( node{ forL, form.elems.front()->metadata } );
         }

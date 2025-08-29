@@ -1,1 +1,0 @@
-(module (global :name G :type i32 :init 7 :const true) (fn :name "use" :ret i32 :params [] :body [ (gload %v i32 G) (ret i32 %v) ]))

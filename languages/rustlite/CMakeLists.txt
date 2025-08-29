@@ -464,6 +464,12 @@ target_compile_features(rustlite_range_literal_driver PRIVATE cxx_std_20)
 target_include_directories(rustlite_range_literal_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME rustlite.range_literal COMMAND rustlite_range_literal_driver)
 
+add_executable(rustlite_range_tuple_inclusive_driver tools/rustlite_range_tuple_inclusive_driver.cpp)
+  target_link_libraries(rustlite_range_tuple_inclusive_driver PRIVATE rustlite edn)
+  target_compile_features(rustlite_range_tuple_inclusive_driver PRIVATE cxx_std_20)
+  target_include_directories(rustlite_range_tuple_inclusive_driver PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME rustlite.range_tuple_inclusive COMMAND rustlite_range_tuple_inclusive_driver)
+
 # Range inclusive literal driver
 add_executable(rustlite_range_inclusive_driver tools/rustlite_range_inclusive_driver.cpp)
 target_link_libraries(rustlite_range_inclusive_driver PRIVATE rustlite edn)
