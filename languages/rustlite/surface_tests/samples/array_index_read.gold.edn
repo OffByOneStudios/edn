@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (const %__rl_c1 i32 10) (const %__rl_c2 i32 20) (const %__rl_c3 i32 30) (rcall %__rl_arr4 i32 array %__rl_c1 %__rl_c2 %__rl_c3) (as %a i32 %__rl_arr4) (const %__rl_c5 i32 1) (rcall %__rl_idx6 i32 idx %a %__rl_c5) (as %v i32 %__rl_idx6) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

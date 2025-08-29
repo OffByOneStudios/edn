@@ -176,6 +176,9 @@ struct build_state {
 template<typename Rule>
 struct action : nothing<Rule> {};
 
+// Ensure module has at least one synthetic function for free-standing statements
+template<> struct action< module_rule > { template<typename Input> static void apply(const Input&, build_state& st){ if(st.fns.empty()){ build_state::fn_emit f; f.name="__surface"; st.fns.push_back(std::move(f)); } } };
+
 // Forward declarations for helper parsers used in early action specializations
 static inline void ltrim(const std::string& s, size_t& i);
 static inline std::string parse_ident(const std::string& s, size_t& i);
@@ -256,6 +259,41 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             std::vector<std::string> elems; size_t start=0; int dpar=0; int dbr=0; for(size_t k=0;k<=inner.size(); ++k){ if(k==inner.size() || (inner[k]==',' && dpar==0 && dbr==0)){ std::string part = inner.substr(start, k-start); size_t a2=0; ltrim(part,a2); part = part.substr(a2); size_t b2=part.size(); while(b2>0 && isspace((unsigned char)part[b2-1])) --b2; part = part.substr(0,b2); if(!part.empty()) elems.push_back(part); start=k+1; } else { char cc=inner[k]; if(cc=='(') ++dpar; else if(cc==')') --dpar; else if(cc=='[') ++dbr; else if(cc==']') --dbr; } }
             std::vector<std::string> elemSyms; elemSyms.reserve(elems.size()); for(const auto& e : elems){ auto p = lower_simple_expr_into(fn, e); elemSyms.push_back(p.second); }
             auto dst = fn.gensym("arr"); std::ostringstream aoss; aoss << "(rcall " << dst << " i32 array"; for(const auto& es : elemSyms) aoss << ' ' << es; aoss << ')'; fn.sink().push_back(aoss.str()); return {"i32", dst};
+        }
+    }
+    // Enum constructor detection: Type::Variant or Type::Variant(arg1, arg2, ...)
+    // Very lightweight parse: single '::' separating two identifiers, optional parenthesized comma list
+    if(s.find("::") != std::string::npos){
+        size_t dpos = s.find("::");
+        std::string lhsT = s.substr(0, dpos);
+        std::string rhsT = s.substr(dpos+2);
+        auto trim_simple = [](std::string v){ size_t a=0; while(a<v.size() && isspace((unsigned char)v[a])) ++a; size_t b=v.size(); while(b>a && isspace((unsigned char)v[b-1])) --b; return v.substr(a,b-a); };
+        lhsT = trim_simple(lhsT); rhsT = trim_simple(rhsT);
+        auto is_ident_simple = [](const std::string& id){ if(id.empty()) return false; if(!(isalpha((unsigned char)id[0])||id[0]=='_')) return false; for(char c: id){ if(!(isalnum((unsigned char)c)||c=='_')) return false; } return true; };
+        if(is_ident_simple(lhsT) && !rhsT.empty()){
+            std::string variantPart = rhsT; std::string argText; bool hasArgs=false;
+            if(!rhsT.empty()){
+                size_t lp = rhsT.find('(');
+                if(lp != std::string::npos && rhsT.back()==')'){
+                    variantPart = rhsT.substr(0, lp);
+                    argText = rhsT.substr(lp+1, rhsT.size()-lp-2);
+                    hasArgs = true;
+                }
+            }
+            variantPart = trim_simple(variantPart);
+            if(is_ident_simple(variantPart)){
+                std::vector<std::string> argExprs;
+                if(hasArgs){
+                    // split top-level commas in argText
+                    int depthP=0; int depthB=0; size_t start=0; for(size_t k=0;k<=argText.size(); ++k){ if(k==argText.size() || (argText[k]==',' && depthP==0 && depthB==0)){ std::string part = argText.substr(start, k-start); part = trim_simple(part); if(!part.empty()) argExprs.push_back(part); start=k+1; } else { char c=argText[k]; if(c=='(') ++depthP; else if(c==')') --depthP; else if(c=='[') ++depthB; else if(c==']') --depthB; } }
+                }
+                std::vector<std::string> argSyms; argSyms.reserve(argExprs.size());
+                for(const auto& ae : argExprs){ auto p = lower_simple_expr_into(fn, ae); argSyms.push_back(p.second); }
+                auto dst = fn.gensym("enum");
+                std::ostringstream eoss; eoss << "(rcall " << dst << " i32 enum-ctor " << lhsT << ' ' << variantPart; for(const auto& as : argSyms) eoss << ' ' << as; eoss << ')';
+                fn.sink().push_back(eoss.str());
+                return {"i32", dst};
+            }
         }
     }
     // Early numeric literal detection (handles plain and negative integers) before operator splitting.
