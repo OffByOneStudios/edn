@@ -222,3 +222,15 @@ if(EDN_BUILD_TESTS)
         endforeach()
     endif()
 endif()
+
+# Developer utility: regenerate error index (docs/ERRORS.md)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(error_index
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/gen_error_index.py --write
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Generating docs/ERRORS.md from error codes"
+        VERBATIM)
+else()
+    message(STATUS "Python3 not found: 'error_index' target will be unavailable")
+endif()
