@@ -498,6 +498,12 @@ target_compile_features(rustlite_keyword_ident_negdriver PRIVATE cxx_std_20)
 add_test(NAME rustlite.keyword_ident_neg COMMAND rustlite_keyword_ident_negdriver)
 set_tests_properties(rustlite.keyword_ident_neg PROPERTIES LABELS "rustlite-neg")
 
+# Tuple destructuring placeholder driver
+add_executable(rustlite_tuple_destructure_driver tools/rustlite_tuple_destructure_driver.cpp)
+target_link_libraries(rustlite_tuple_destructure_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_tuple_destructure_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure COMMAND rustlite_tuple_destructure_driver)
+
 # Closure capture inference (enabled)
 add_executable(rustlite_closure_infer_driver tools/rustlite_closure_infer_driver.cpp)
 target_link_libraries(rustlite_closure_infer_driver PRIVATE rustlite edn)
