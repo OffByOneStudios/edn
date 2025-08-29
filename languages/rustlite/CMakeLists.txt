@@ -220,6 +220,12 @@ endif()
 target_compile_features(rustlite_rtry_option_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.rtry_option COMMAND rustlite_rtry_option_driver)
 
+add_executable(rustlite_rtry_negdriver tools/rustlite_rtry_negdriver.cpp)
+if(TARGET edn)
+  target_link_libraries(rustlite_rtry_negdriver PRIVATE rustlite edn)
+endif()
+target_compile_features(rustlite_rtry_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rtry_negative COMMAND rustlite_rtry_negdriver)
 # rdot negative driver
 add_executable(rustlite_rdot_negdriver tools/rustlite_rdot_negdriver.cpp)
 if(TARGET edn)

@@ -332,6 +332,22 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
                 if(casesNode && std::holds_alternative<vector_t>(casesNode->data)){ for(auto &cv : std::get<vector_t>(casesNode->data).elems){ if(!cv||!std::holds_alternative<list>(cv->data)) continue; auto &cl=std::get<list>(cv->data).elems; if(cl.size()>=3 && std::holds_alternative<vector_t>(cl[2]->data)){ bool rch=true; scan(std::get<vector_t>(cl[2]->data).elems, rch); anyReach |= rch; } } }
                 if(defaultNode && std::holds_alternative<vector_t>(defaultNode->data)){ bool rch=true; scan(std::get<vector_t>(defaultNode->data).elems, rch); anyReach |= rch; }
                 reachable = anyReach; continue; }
+            if(op=="rtry"){ // (rtry %bind SumType %expr) surface/macro sugar misuse detection when not expanded
+                // We only validate misuse; correct forms expand to (match ...) earlier.
+                // Expect arity 4: rtry %bind SumType %expr
+                if(il.size()==4){
+                    auto bindSym = symAt(1); auto sumSym = symAt(2); if(bindSym.empty()||bindSym[0] != '%'){ error_code(r,*n,"E1601","rtry bind must be %var","use %prefix for destination binding"); r.success=false; }
+                    if(!sumSym.empty()){
+                        bool isOpt = sumSym.rfind("Option",0)==0; bool isRes = sumSym.rfind("Result",0)==0;
+                        if(!isOpt && !isRes){
+                            error_code(r,*n,"E1603","rtry sum type unsupported","use Option*/Result* or ensure macro expansion produced match"); r.success=false;
+                        }
+                    }
+                } else {
+                    error_code(r,*n,"E1601","rtry arity","expected (rtry %bind SumType %expr)"); r.success=false;
+                }
+                continue; // skip further processing; not a real core op
+            }
             if(op=="match"){ // treat like switch for reachability; also descend into case/default bodies to track uses
                 bool anyReach=false; size_t argBase=1; if(il.size()>=2 && std::holds_alternative<symbol>(il[1]->data)){ std::string maybeDst=std::get<symbol>(il[1]->data).name; if(!maybeDst.empty() && maybeDst[0]=='%') argBase=3; }
                 if(il.size()>argBase+1){ noteUse(symAt(argBase+1)); }
