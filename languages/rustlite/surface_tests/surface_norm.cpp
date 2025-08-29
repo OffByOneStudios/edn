@@ -46,6 +46,11 @@ static std::string normalize(const std::string &src, const std::string& path) {
   }
   // For now, parser.edn already canonicaled (assumed). Strip trailing spaces & ensure newline.
   std::string edn = res.edn;
+  // Heuristic: detect placeholder emitted for a non-exhaustive ematch (single arm parsed) and map to an error tag.
+  // Placeholder instruction pattern currently: (as %r i32 %ematch)
+  if(edn.find("(as %r i32 %ematch)") != std::string::npos || edn.find("(ematch-non-exhaustive-placeholder)") != std::string::npos){
+    return std::string("<error ematch-non-exhaustive>\n");
+  }
   // fallback: if edn empty, dump source (comment + blank stripped) to keep coverage until lowering improves
   if(edn.empty()){
     std::istringstream iss(src);

@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (rcall %__rl_enum1 i32 enum-ctor MyEnum A) (as %v i32 %__rl_enum1) (ematch %__rl_ematch6 i32 MyEnum %v :cases [(arm A :body [(const %__rl_c4 i32 1)]) (arm B :body [(const %__rl_c5 i32 2)])]) (as %r i32 %__rl_ematch6) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

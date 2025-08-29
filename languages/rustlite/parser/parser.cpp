@@ -296,6 +296,98 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             }
         }
     }
+    // ematch (simplified surface): ematch <EnumType> <scrut> <Variant1>{ body } <Variant2(payloads){ body } ...
+    // body is a simple expression; variants >=2 required.
+    // New: optional payload bind list Variant(x,y){ body }. For now payload binds are lowered to
+    // placeholder zero-initialized temps so body can reference them; future macro phase may rewrite.
+    if(s.rfind("ematch ", 0) == 0){
+        bool ok=true;
+        std::string rest = s.substr(7);
+        auto trim_simple = [](std::string v){ size_t a=0; while(a<v.size() && isspace((unsigned char)v[a])) ++a; size_t b=v.size(); while(b>a && isspace((unsigned char)v[b-1])) --b; return v.substr(a,b-a); };
+        size_t i2=0; while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startType=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string enumType = rest.substr(startType, i2-startType); if(enumType.empty()) ok=false;
+        while(ok && i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startScr=i2; while(ok && i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string scrut = rest.substr(startScr, i2-startScr); if(scrut.empty()) ok=false;
+        struct Arm { std::string variant; std::vector<std::string> binds; std::vector<std::string> bodyInsts; std::string valueSym; };
+        std::vector<Arm> arms;
+        while(ok && i2<rest.size()){
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()) break;
+            if(rest[i2]=='/' && i2+1<rest.size() && (rest[i2+1]=='/'||rest[i2+1]=='*')){
+                if(rest[i2+1]=='/') { while(i2<rest.size() && rest[i2]!='\n') ++i2; continue; } else { size_t bcEnd = rest.find("*/", i2+2); if(bcEnd==std::string::npos){ ok=false; break; } i2 = bcEnd+2; continue; }
+            }
+            size_t vs=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string variant = rest.substr(vs, i2-vs); if(variant.empty()){ ok=false; break; }
+            // Optional payload bind list in parentheses
+            std::vector<std::string> binds;
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2;
+            if(i2<rest.size() && rest[i2]=='('){
+                ++i2; // skip '('
+                std::string accum; int depth=0; bool done=false; for(; i2<rest.size(); ++i2){ char c=rest[i2]; if(c=='('){ ++depth; accum.push_back(c); } else if(c==')' && depth==0){
+                        // flush last
+                        std::string name = trim_simple(accum); if(!name.empty()) binds.push_back(name); ++i2; done=true; break; }
+                    else if(c==')'){ --depth; accum.push_back(c); }
+                    else if(c==',' && depth==0){ std::string name = trim_simple(accum); if(!name.empty()) binds.push_back(name); accum.clear(); }
+                    else { accum.push_back(c); }
+                }
+                if(!done){ ok=false; break; }
+                // validate binds are simple identifiers
+                for(const auto& b : binds){ for(char ch : b){ if(!(isalnum((unsigned char)ch) || ch=='_')) { ok=false; break; } } if(!ok) break; }
+            }
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()||rest[i2] != '{'){ ok=false; break; }
+            int depthB=0; size_t bstart=i2; for(; i2<rest.size(); ++i2){ char c=rest[i2]; if(c=='{'){ if(depthB==0) bstart=i2; ++depthB; } else if(c=='}'){ --depthB; if(depthB==0){ ++i2; break; } } }
+            if(depthB!=0){ ok=false; break; }
+            size_t bend=i2; std::string bodyBlock = rest.substr(bstart+1, bend-bstart-2); bodyBlock = trim_simple(bodyBlock); if(bodyBlock.empty()) bodyBlock = "0";
+            fn.block_stack.emplace_back(); auto bodyPair = lower_simple_expr_into(fn, bodyBlock); auto bodyInsts = std::move(fn.block_stack.back()); fn.block_stack.pop_back();
+            // Prepend placeholder payload bind inits
+            if(!binds.empty()){
+                std::vector<std::string> pref;
+                for(const auto& b : binds){
+                    auto ctmp = fn.gensym("c");
+                    pref.push_back("(const " + ctmp + " i32 0)");
+                    pref.push_back("(as %" + b + " i32 " + ctmp + ")");
+                }
+                pref.insert(pref.end(), bodyInsts.begin(), bodyInsts.end());
+                bodyInsts.swap(pref);
+            }
+            Arm arm; arm.variant=variant; arm.binds = std::move(binds); arm.bodyInsts = std::move(bodyInsts); arm.valueSym = bodyPair.second; arms.push_back(std::move(arm));
+        }
+        if(ok && arms.size() >= 2){
+            auto dst = fn.gensym("ematch");
+            auto serialize_vec = [](const std::vector<std::string>& v){ std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : v){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; return bv.str(); };
+            std::ostringstream armsVec; armsVec << "["; for(size_t ai=0; ai<arms.size(); ++ai){ const auto& A=arms[ai]; if(ai>0) armsVec << ' '; std::ostringstream armO; armO << "(arm " << A.variant; if(!A.binds.empty()){ armO << " :binds ["; for(size_t bi=0; bi<A.binds.size(); ++bi){ if(bi>0) armO << ' '; armO << A.binds[bi]; } armO << "]"; } armO << " :body " << serialize_vec(A.bodyInsts) << ")"; armsVec << armO.str(); } armsVec << "]";
+            std::ostringstream em; em << "(ematch " << dst << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn.sink().push_back(em.str()); return {"i32", dst};
+        } else if(ok && arms.size()==1){
+            // Mark non-exhaustive ematch placeholder so surface_norm can classify it as an error
+            fn.sink().push_back("(ematch-non-exhaustive-placeholder)");
+        }
+    }
+    // rtry surface: rtry <SumTypeName> <ident>
+    if(s.rfind("rtry ",0)==0){
+        std::string rest = s.substr(5); size_t i3=0; while(i3<rest.size() && isspace((unsigned char)rest[i3])) ++i3; size_t ts=i3; while(i3<rest.size() && (isalnum((unsigned char)rest[i3])||rest[i3]=='_')) ++i3; std::string sumType = rest.substr(ts, i3-ts);
+        while(i3<rest.size() && isspace((unsigned char)rest[i3])) ++i3; size_t vs=i3; while(i3<rest.size() && (isalnum((unsigned char)rest[i3])||rest[i3]=='_')) ++i3; std::string varName = rest.substr(vs, i3-vs);
+        if(!sumType.empty() && !varName.empty()){
+            auto dst = fn.gensym("rtry");
+            fn.sink().push_back("(rtry " + dst + " " + sumType + " %" + varName + ")");
+            return {"i32", dst};
+        }
+    }
+    // rwhile-let surface (simplified): rwhile_let <SumType> <Variant> <scrut> { body }
+    if(s.rfind("rwhile_let ",0)==0){
+        std::string rest = s.substr(11); size_t i4=0; auto scanIdent=[&](std::string& out){ size_t b=i4; while(i4<rest.size() && (isalnum((unsigned char)rest[i4])||rest[i4]=='_')) ++i4; out=rest.substr(b,i4-b); return !out.empty(); };
+        std::string sumType, variant, scrut; if(!scanIdent(sumType)){} else { while(i4<rest.size() && isspace((unsigned char)rest[i4])) ++i4; if(!scanIdent(variant)) sumType.clear(); else { while(i4<rest.size() && isspace((unsigned char)rest[i4])) ++i4; if(!scanIdent(scrut)) sumType.clear(); } }
+        if(!sumType.empty() && !variant.empty() && !scrut.empty()){
+            while(i4<rest.size() && isspace((unsigned char)rest[i4])) ++i4; if(i4<rest.size() && rest[i4]=='{'){
+                int depth=0; size_t bstart=i4; for(; i4<rest.size(); ++i4){ char c=rest[i4]; if(c=='{'){ if(depth==0) bstart=i4; ++depth; } else if(c=='}'){ --depth; if(depth==0){ ++i4; break; } } }
+                if(depth==0){ std::string body = rest.substr(bstart+1, (i4-bstart-2)); // simple body expr list separated by ';'
+                    // Just emit a placeholder macro form mapping: (rwhile-let SumType Variant %scrut :bind %tmp :body [ <body lowered as single expr> ])
+                    // Lower body expression (take first non-empty chunk split by ';')
+                    std::string bodyTrim=body; size_t a5=0; while(a5<bodyTrim.size() && isspace((unsigned char)bodyTrim[a5])) ++a5; bodyTrim=bodyTrim.substr(a5); while(!bodyTrim.empty() && isspace((unsigned char)bodyTrim.back())) bodyTrim.pop_back();
+                    if(bodyTrim.empty()) bodyTrim = "0";
+                    auto bodyPair = lower_simple_expr_into(fn, bodyTrim);
+                    auto dstTmp = fn.gensym("wlt"); // bound value each iteration
+                    // We model by invoking macro directly; macro expander will transform match+loop semantics.
+                    fn.sink().push_back("(rwhile-let " + sumType + " " + variant + " %" + scrut + " :bind " + dstTmp + " :body [ (as " + dstTmp + " i32 " + bodyPair.second + ") ])");
+                    return {"i32", dstTmp}; }
+            }
+        }
+    }
     // Early numeric literal detection (handles plain and negative integers) before operator splitting.
     if(!s.empty()){
         size_t ni=0; auto num=parse_number(s, ni);
@@ -396,17 +488,33 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             return {"i1", dst};
         }
     }
-    // 2: relational
+    // 2: shifts (<< >>) mapped to shl / ashr (placed before relational to avoid '<' splitting into two comparisons)
+    {
+        int depth=0; for(size_t i=s.size(); i-- > 0;){ char c=s[i]; if(c==')') ++depth; else if(c=='('){ if(depth>0) --depth; }
+            if(depth!=0) continue; if(i>0){
+                if(s[i-1]=='<' && c=='<'){
+                    std::string L = s.substr(0,i-1); std::string R = s.substr(i+1);
+                    auto lv = lower_simple_expr_into(fn, L).second; auto rv = lower_simple_expr_into(fn, R).second; auto dst = fn.gensym("shf");
+                    fn.sink().push_back("(rcall " + dst + " i32 shl " + lv + " " + rv + ")"); return std::make_pair(std::string("i32"), dst);
+                }
+                if(s[i-1]=='>' && c=='>'){
+                    std::string L = s.substr(0,i-1); std::string R = s.substr(i+1);
+                    auto lv = lower_simple_expr_into(fn, L).second; auto rv = lower_simple_expr_into(fn, R).second; auto dst = fn.gensym("shf");
+                    fn.sink().push_back("(rcall " + dst + " i32 ashr " + lv + " " + rv + ")"); return std::make_pair(std::string("i32"), dst);
+                }
+            }
+        }
+    }
+    // 2.5: relational
     {
         size_t pos=0; std::string oper, L, R; if(split_top_level(s, {"<=", ">=", "<", ">"}, pos, oper, L, R)){
             auto lv = lower_simple_expr_into(fn, L).second;
             auto rv = lower_simple_expr_into(fn, R).second;
             auto dst = fn.gensym("cmp");
             std::string name = (oper=="<")? "lt" : (oper==">")? "gt" : (oper=="<=")? "le" : "ge";
-            // For relational ops, pass operand type i32; result is i1.
             std::ostringstream oss; oss << "(rcall " << dst << " i32 " << name << " " << lv << " " << rv << ")";
             fn.sink().push_back(oss.str());
-            return {"i1", dst};
+            return std::make_pair(std::string("i1"), dst);
         }
     }
     // 3: additive
@@ -561,6 +669,40 @@ struct action< let_stmt > {
     // rest is expr; trim and lower via standard expression lowering path
     std::string expr = s.substr(i);
     size_t a=0; ltrim(expr,a); expr = expr.substr(a); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    // Early ematch lowering inside let initializer (reuses simplified parser from expression path)
+    auto try_ematch = [&](const std::string& ems)->std::optional<std::pair<std::string,std::string>>{
+        if(ems.rfind("ematch ",0)!=0) return std::nullopt; std::string rest = ems.substr(7);
+        auto trim_simple = [](std::string v){ size_t a3=0; while(a3<v.size() && isspace((unsigned char)v[a3])) ++a3; size_t b3=v.size(); while(b3>a3 && isspace((unsigned char)v[b3-1])) --b3; return v.substr(a3,b3-a3); };
+        size_t i2=0; while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startType=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string enumType = rest.substr(startType, i2-startType); if(enumType.empty()) return std::nullopt;
+        while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startScr=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string scrut = rest.substr(startScr, i2-startScr); if(scrut.empty()) return std::nullopt;
+        struct Arm { std::string variant; std::vector<std::string> bodyInsts; std::string valueSym; };
+        std::vector<Arm> arms; bool ok=true; while(ok && i2<rest.size()){
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()) break;
+            if(rest[i2]=='/' && i2+1<rest.size() && (rest[i2+1]=='/'||rest[i2+1]=='*')){ if(rest[i2+1]=='/') { while(i2<rest.size() && rest[i2]!='\n') ++i2; continue; } else { size_t bcEnd = rest.find("*/", i2+2); if(bcEnd==std::string::npos){ ok=false; break; } i2=bcEnd+2; continue; } }
+            size_t vs=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string variant = rest.substr(vs, i2-vs); if(variant.empty()){ ok=false; break; }
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()||rest[i2] != '{'){ ok=false; break; }
+            int depthB=0; size_t bstart=i2; for(; i2<rest.size(); ++i2){ char c=rest[i2]; if(c=='{'){ if(depthB==0) bstart=i2; ++depthB; } else if(c=='}'){ --depthB; if(depthB==0){ ++i2; break; } } }
+            if(depthB!=0){ ok=false; break; }
+            size_t bend=i2; std::string bodyBlock = rest.substr(bstart+1, bend-bstart-2); bodyBlock = trim_simple(bodyBlock); if(bodyBlock.empty()) bodyBlock = "0";
+            fn->block_stack.emplace_back(); auto bodyPair = lower_simple_expr_into(*fn, bodyBlock); auto bodyInsts = std::move(fn->block_stack.back()); fn->block_stack.pop_back(); Arm arm; arm.variant=variant; arm.bodyInsts=std::move(bodyInsts); arm.valueSym=bodyPair.second; arms.push_back(std::move(arm));
+        }
+        if(!ok) return std::nullopt; 
+        if(arms.size()<2){
+            // Emit marker placeholder to allow classification as error
+            fn->sink().push_back("(ematch-non-exhaustive-placeholder)");
+            return std::nullopt;
+        }
+        auto dst2 = fn->gensym("ematch");
+        auto serialize_vec = [](const std::vector<std::string>& v){ std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : v){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; return bv.str(); };
+        std::ostringstream armsVec; armsVec << "["; for(size_t ai=0; ai<arms.size(); ++ai){ const auto& A=arms[ai]; if(ai>0) armsVec << ' '; std::ostringstream armO; armO << "(arm " << A.variant << " :body " << serialize_vec(A.bodyInsts) << ")"; armsVec << armO.str(); } armsVec << "]";
+        std::ostringstream em; em << "(ematch " << dst2 << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn->sink().push_back(em.str()); return std::make_pair(std::string("i32"), dst2);
+    };
+    if(auto emr = try_ematch(expr)){
+        auto valSym = emr->second; fn->sink().push_back("(as " + name + " " + emr->first + " " + valSym + ")"); return; }
+        // Early rtry: rtry <SumType> <ident>
+        if(expr.rfind("rtry ",0)==0){
+            std::string rest = expr.substr(5); size_t i4=0; while(i4<rest.size() && isspace((unsigned char)rest[i4])) ++i4; size_t ts=i4; while(i4<rest.size() && (isalnum((unsigned char)rest[i4])||rest[i4]=='_')) ++i4; std::string sumType = rest.substr(ts, i4-ts); while(i4<rest.size() && isspace((unsigned char)rest[i4])) ++i4; size_t vs=i4; while(i4<rest.size() && (isalnum((unsigned char)rest[i4])||rest[i4]=='_')) ++i4; std::string varName = rest.substr(vs, i4-vs); if(!sumType.empty() && !varName.empty()){ auto dst = fn->gensym("rtry"); fn->sink().push_back("(rtry " + dst + " " + sumType + " %" + varName + ")"); fn->sink().push_back("(as " + name + " i32 " + dst + ")"); return; }
+        }
         // Remove a stray trailing semicolon (expr_text may have included it if parse slicing was broad)
         if(!expr.empty() && expr.back()==';') { expr.pop_back(); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back(); }
         // Direct array literal lowering (handles [a,b,c]) to ensure proper construction before generic fallback

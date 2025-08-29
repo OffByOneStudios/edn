@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (rtry %__rl_rtry1 ResultI32 %val1) (as %a i32 %__rl_rtry1) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))

@@ -2,6 +2,44 @@
 
 Rustlite is a tiny Rust-inspired frontend that lowers to EDN IR. It lives under `languages/rustlite` and can be driven either from the CLI (`rustlitec`) or via the node-based `rustlite::Builder`.
 
+## Test Layers (Surface vs Macro)
+
+Rustlite now has a two-layer test strategy:
+
+1. Surface Parsing Tests (`languages/rustlite/surface_tests/samples/*.rl.rs`):
+  - Parse surface syntax and emit macro-level EDN forms (pre macro expansion).
+  - Each sample has a golden EDN file `<name>.gold.edn`.
+  - Negative tests expect a single-line `<error ...>` tag as the entire golden.
+  - Normalization tool: `rustlite_surface_norm` (invoked automatically by CTest). It performs:
+    * Parse + minimal lowering
+    * Canonical EDN emission
+    * Structural EDN equality fallback if textual diff fails
+  - Regenerate goldens by setting `UPDATE_RUSTLITE_GOLDENS=1` when running the test.
+
+2. Macro Expansion / Semantic Tests (existing `rustlite.*` drivers):
+  - Start from EDN macro forms, expand (`expand_rustlite`), then type check / IR emit.
+  - Focus on semantic correctness and IR shape rather than surface parsing.
+
+Rationale: isolates parser / syntax evolution from semantic regressions and minimizes churn—surface tests catch syntactic & lowering changes early.
+
+### Adding a Surface Test
+
+1. Create `languages/rustlite/surface_tests/samples/<name>.rl.rs` with the surface snippet.
+2. Run the specific test (after configuring) to see failure with missing golden:
+  ```bash
+  ctest --test-dir build -R rustlite.surface.<name>
+  ```
+3. Regenerate or create the golden:
+  ```bash
+  UPDATE_RUSTLITE_GOLDENS=1 ctest --test-dir build -R rustlite.surface.<name>
+  ```
+4. Inspect the generated `.gold.edn` for clarity & stability (avoid volatile symbol ordering when possible).
+5. Commit both files.
+
+Negative case: author the `.rl.rs` that triggers a parser or lowering error and set the golden to the expected `<error <tag>>` value (e.g. `<error ematch-non-exhaustive>`).
+
+Current progress snapshot & roadmap live in `issues/EDN-0013-rustlite-surface-vs-macro-test-plan.md`.
+
 ## Build and run tests
 
 ```bash

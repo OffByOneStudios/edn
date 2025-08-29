@@ -41,6 +41,17 @@ All notable changes will be documented here once releases begin.
 ### Fixed
 - Added validation preventing mutation of const globals.
 
+### Added (Rustlite Surface Parsing Layer Progress)
+- Introduced surface test harness (`.rl.rs` + golden EDN) with normalization tool.
+- Added array literals, indexing read/write, enum constructors to surface parser.
+- Implemented simplified `ematch` exhaustive + non-exhaustive diagnostic (placeholder mapped to `<error ematch-non-exhaustive>`).
+- Added payload/binding variant support for `ematch` (payload binds lowered to placeholder zero-inits for now).
+- Implemented shift operators `<<` and `>>` with correct precedence tier.
+- Added `rtry <SumType> <ident>` surface construct (Result/Option success path tests).
+- Added `rwhile_let <SumType> <Variant> <scrut> { body }` surface construct basic loop form.
+- Added corresponding surface samples & goldens: `shift_ops`, `rtry_result`, `rtry_option`, `rwhile_let_basic`, `ematch_payloads`.
+- Updated test plan ticket EDN-0013 to reflect 46/55 (~84%) initial coverage progress.
+
 ### Added (Phase 3 Completion & Phase 4 Kickoff)
 - Phase 3 finalized: pointer arithmetic, address-of/deref, function pointers & indirect calls, typedef, enums, unions, variadics (with intrinsics), for/continue, switch, and cast sugar. Structured diagnostics extended (JSON mode in tests).
 - Phase 4 progress:

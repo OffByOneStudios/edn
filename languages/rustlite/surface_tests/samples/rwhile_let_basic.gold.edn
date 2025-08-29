@@ -1,0 +1,1 @@
+(module (fn :name "__surface" :ret i32 :params [  ] :body [ (const %__rl_c1 i32 1) (rwhile-let OptionI32 Some %opt :bind %__rl_wlt2 :body [ (as %__rl_wlt2 i32 %__rl_c1) ]) (as %v i32 %__rl_wlt2) (const %__rl_zero i32 0) (ret i32 %__rl_zero) ]))
