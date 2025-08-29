@@ -491,6 +491,13 @@ target_include_directories(rustlite_range_negdriver PRIVATE ${CMAKE_SOURCE_DIR}/
 add_test(NAME rustlite.range_neg COMMAND rustlite_range_negdriver)
 set_tests_properties(rustlite.range_neg PROPERTIES LABELS "rustlite-neg")
 
+# Keyword-as-identifier negative driver
+add_executable(rustlite_keyword_ident_negdriver tools/rustlite_keyword_ident_negdriver.cpp)
+target_link_libraries(rustlite_keyword_ident_negdriver PRIVATE rustlite edn)
+target_compile_features(rustlite_keyword_ident_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.keyword_ident_neg COMMAND rustlite_keyword_ident_negdriver)
+set_tests_properties(rustlite.keyword_ident_neg PROPERTIES LABELS "rustlite-neg")
+
 # Closure capture inference (enabled)
 add_executable(rustlite_closure_infer_driver tools/rustlite_closure_infer_driver.cpp)
 target_link_libraries(rustlite_closure_infer_driver PRIVATE rustlite edn)
