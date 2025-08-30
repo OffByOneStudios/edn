@@ -391,7 +391,19 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
     // Early numeric literal detection (handles plain and negative integers) before operator splitting.
     if(!s.empty()){
         size_t ni=0; auto num=parse_number(s, ni);
-    if(!num.empty() && ni==s.size() && s.find("..")==std::string::npos){ auto sym=fn.gensym("c"); fn.sink().push_back("(const " + sym + " i32 " + num + ")"); return {"i32", sym}; }
+    if(!num.empty() && ni==s.size() && s.find("..")==std::string::npos){
+        // Normalize signed integer literals: represent negatives as (sub 0 <pos>) to align with golden expectations.
+        if(num[0]=='-' && num.size()>1){
+            std::string pos = num.substr(1);
+            if(!fn.has_zero){ fn.sink().push_back("(const " + fn.zero_sym + " i32 0)"); fn.has_zero=true; }
+            auto posSym = fn.gensym("c");
+            fn.sink().push_back("(const " + posSym + " i32 " + pos + ")");
+            auto dst = fn.gensym("add"); // match legacy naming used in goldens
+            fn.sink().push_back("(rcall " + dst + " i32 sub " + fn.zero_sym + " " + posSym + ")");
+            return {"i32", dst};
+        }
+        if(num[0]=='+') num = num.substr(1);
+        auto sym=fn.gensym("c"); fn.sink().push_back("(const " + sym + " i32 " + num + ")"); return {"i32", sym}; }
     }
     // Operator precedence tiers (lowest to highest)
     // 0: logical OR with short-circuit
@@ -728,8 +740,11 @@ struct action< assign_stmt > {
     auto* fn = ensure_fn(st); if(!fn) return;
         std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
         size_t i=0; ltrim(s,i); auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i); if(i>=s.size()||s[i]!='=') return; ++i; ltrim(s,i);
-        auto expr = s.substr(i);
-        auto [ety, val] = lower_simple_expr_into(*fn, expr);
+    auto expr = s.substr(i);
+    // Trim trailing whitespace/semicolon defensively
+    while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    if(!expr.empty() && expr.back()==';'){ expr.pop_back(); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back(); }
+    auto [ety, val] = lower_simple_expr_into(*fn, expr);
     fn->sink().push_back("(assign " + name + " " + val + ")");
     }
 };
@@ -755,7 +770,9 @@ struct action< compound_assign_stmt > {
             else if(s[i]=='^') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "bxor"; } }
         }
         if(op.empty()) return; ltrim(s,i);
-        auto expr = s.substr(i);
+    auto expr = s.substr(i);
+    while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    if(!expr.empty() && expr.back()==';'){ expr.pop_back(); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back(); }
         auto rhs = lower_simple_expr_into(*fn, expr).second;
         auto tmp = fn->gensym("op");
         std::ostringstream oss; oss << "(rcall " << tmp << " i32 " << op << " " << name << " " << rhs << ")";
@@ -789,6 +806,12 @@ struct action< return_stmt > {
         } else {
             // parse simple expr to symbol
             auto expr = s.substr(i);
+            // Drop trailing semicolon (still present because grammar's expr_text excludes it, but we sliced from overall match)
+            // Trim any trailing whitespace first so a pattern like "42 ;" still works.
+            while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+            if(!expr.empty() && expr.back()==';') expr.pop_back();
+            // Trim again after removing ';'
+            while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
             auto [ety, v] = lower_simple_expr_into(*fn, expr);
             valSym = v;
         }

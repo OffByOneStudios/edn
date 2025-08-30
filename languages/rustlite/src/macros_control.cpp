@@ -67,6 +67,8 @@ void register_var_control_macros(edn::Transformer& tx, const std::shared_ptr<Mac
         node_ptr bindVar=nullptr; node_ptr thenVec=nullptr; node_ptr elseVec=nullptr;
         for(size_t i=6;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; auto kw=std::get<keyword>(el[i]->data).name; auto v=el[i+1]; if(kw=="bind") bindVar=v; else if(kw=="then") thenVec=v; else if(kw=="else") elseVec=v; }
         if(!bindVar || !thenVec || !elseVec) return std::nullopt;
+    // Expect caller to supply :value %var entries inside both branches.
+    if(!std::holds_alternative<vector_t>(thenVec->data) || !std::holds_alternative<vector_t>(elseVec->data)) return std::nullopt;
         list matchL; matchL.elems = { rl_make_sym("match"), dst, retTy, rl_make_sym(sumName), ptrNode, rl_make_kw("cases") };
         vector_t casesV; {
             list caseL; caseL.elems = { rl_make_sym("case"), rl_make_sym(variantName), rl_make_kw("binds") };
@@ -227,6 +229,42 @@ void register_var_control_macros(edn::Transformer& tx, const std::shared_ptr<Mac
     { list whileL; whileL.elems = { rl_make_sym("while"), rl_make_sym("%__rl_true"), bodyVec }; outV.elems.push_back(std::make_shared<node>( node{ whileL, {} } )); }
     list blockL; blockL.elems = { rl_make_sym("block"), rl_make_kw("body"), std::make_shared<node>( node{ outV, {} } ) }; return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
     });
+    // rloop-val: (rloop-val %dst Ty :body [ ... (rbreak :value %v) ... ])
+    // Expands to a block allocating a result slot, an infinite while loop, and break with assignment.
+    tx.add_macro("rloop-val", [](const list& form)->std::optional<node_ptr>{
+        // Expect head %dst Ty :body [ ... ]
+        auto &el = form.elems; if(el.size() < 5) return std::nullopt;
+        if(!std::holds_alternative<symbol>(el[1]->data) || !std::holds_alternative<symbol>(el[2]->data)) return std::nullopt;
+        auto dst = el[1]; auto ty = el[2]; node_ptr bodyVec=nullptr;
+        for(size_t i=3;i+1<el.size(); i+=2){ if(!std::holds_alternative<keyword>(el[i]->data)) break; if(std::get<keyword>(el[i]->data).name=="body") bodyVec=el[i+1]; }
+        if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) return std::nullopt;
+        // We'll scan body for pattern (rbreak :value %sym) and rewrite to (assign %dst %sym) (break)
+        vector_t transformedBody;
+        for(auto &n : std::get<vector_t>(bodyVec->data).elems){
+            bool replaced=false;
+            if(n && std::holds_alternative<list>(n->data)){
+                auto &l = std::get<list>(n->data);
+                if(!l.elems.empty() && std::holds_alternative<symbol>(l.elems[0]->data) && std::get<symbol>(l.elems[0]->data).name=="rbreak"){
+                    // parse optional :value %var
+                    node_ptr valSym=nullptr; for(size_t i=1;i+1<l.elems.size(); i+=2){ if(!std::holds_alternative<keyword>(l.elems[i]->data)) break; if(std::get<keyword>(l.elems[i]->data).name=="value") valSym = l.elems[i+1]; }
+                    if(valSym){
+                        // expand to assign then plain break
+                        { list asL; asL.elems = { rl_make_sym("assign"), dst, valSym }; transformedBody.elems.push_back(std::make_shared<node>( node{ asL, {} } )); }
+                        { list brL; brL.elems = { rl_make_sym("break") }; transformedBody.elems.push_back(std::make_shared<node>( node{ brL, {} } )); }
+                        replaced=true;
+                    }
+                }
+            }
+            if(!replaced) transformedBody.elems.push_back(n);
+        }
+        // Prefix with const true + while form (like rloop)
+        vector_t outV; { list c; c.elems = { rl_make_sym("const"), rl_make_sym("%__rl_true"), rl_make_sym("i1"), rl_make_i64(1) }; outV.elems.push_back(std::make_shared<node>( node{ c, {} } )); }
+        // initial dummy init for dst if not already assigned before break (set zero of type)
+        // We emit a zero literal initialization outside loop to ensure defined.
+        { list zeroC; zeroC.elems = { rl_make_sym("const"), dst, ty, rl_make_i64(0) }; outV.elems.push_back(std::make_shared<node>( node{ zeroC, {} } )); }
+        { list whileL; whileL.elems = { rl_make_sym("while"), rl_make_sym("%__rl_true"), std::make_shared<node>( node{ transformedBody, {} } ) }; outV.elems.push_back(std::make_shared<node>( node{ whileL, {} } )); }
+        list blockL; blockL.elems = { rl_make_sym("block"), rl_make_kw("body"), std::make_shared<node>( node{ outV, {} } ) }; return std::make_shared<node>( node{ blockL, form.elems.front()->metadata } );
+    });
     // rwhile-let
     tx.add_macro("rwhile-let", [](const list& form)->std::optional<node_ptr>{
         auto& el=form.elems; if(el.size()<5) return std::nullopt; if(!std::holds_alternative<symbol>(el[1]->data) || !std::holds_alternative<symbol>(el[2]->data)) return std::nullopt;
@@ -240,7 +278,9 @@ void register_var_control_macros(edn::Transformer& tx, const std::shared_ptr<Mac
             vector_t bindsV; { list b; b.elems = { rl_make_sym("bind"), bindVar, rl_make_i64(0) }; bindsV.elems.push_back(std::make_shared<node>( node{ b, {} } )); }
             caseL.elems.push_back(std::make_shared<node>( node{ bindsV, {} } ));
             caseL.elems.push_back(rl_make_kw("body")); vector_t thenV; for(auto &e : std::get<vector_t>(bodyVec->data).elems) thenV.elems.push_back(e);
-            { list oneC; oneC.elems = { rl_make_sym("const"), rl_make_sym(rl_gensym("one")), rl_make_sym("i1"), rl_make_i64(1) }; auto oneN = std::make_shared<node>( node{ oneC, {} } ); thenV.elems.push_back(oneN); auto oneSym = std::get<list>(oneN->data).elems[1]; thenV.elems.push_back(rl_make_kw("value")); thenV.elems.push_back(oneSym); }
+            // Ensure :value present (assign true literal if user didn't set)
+            bool hasValue=false; for(size_t bi=0; bi+1<thenV.elems.size(); ++bi){ auto &n=thenV.elems[bi]; if(n && std::holds_alternative<keyword>(n->data) && std::get<keyword>(n->data).name=="value"){ hasValue=true; break; } }
+            if(!hasValue){ list oneC; oneC.elems = { rl_make_sym("const"), rl_make_sym(rl_gensym("one")), rl_make_sym("i1"), rl_make_i64(1) }; auto oneN = std::make_shared<node>( node{ oneC, {} } ); thenV.elems.push_back(oneN); auto oneSym = std::get<list>(oneN->data).elems[1]; thenV.elems.push_back(rl_make_kw("value")); thenV.elems.push_back(oneSym); }
             caseL.elems.push_back(std::make_shared<node>( node{ thenV, {} } ));
             casesV.elems.push_back(std::make_shared<node>( node{ caseL, {} } ));
         }
@@ -249,7 +289,8 @@ void register_var_control_macros(edn::Transformer& tx, const std::shared_ptr<Mac
         vector_t dv; {
             list br; br.elems = { rl_make_sym("break") }; dv.elems.push_back(std::make_shared<node>( node{ br, {} } ));
         } {
-            list zeroC; zeroC.elems = { rl_make_sym("const"), rl_make_sym(rl_gensym("zero")), rl_make_sym("i1"), rl_make_i64(0) }; auto zN = std::make_shared<node>( node{ zeroC, {} } ); dv.elems.push_back(zN); auto zSym = std::get<list>(zN->data).elems[1]; dv.elems.push_back(rl_make_kw("value")); dv.elems.push_back(zSym);
+            bool hasValue=false; for(size_t di=0; di+1<dv.elems.size(); ++di){ auto &n=dv.elems[di]; if(n && std::holds_alternative<keyword>(n->data) && std::get<keyword>(n->data).name=="value"){ hasValue=true; break; } }
+            if(!hasValue){ list zeroC; zeroC.elems = { rl_make_sym("const"), rl_make_sym(rl_gensym("zero")), rl_make_sym("i1"), rl_make_i64(0) }; auto zN = std::make_shared<node>( node{ zeroC, {} } ); dv.elems.push_back(zN); auto zSym = std::get<list>(zN->data).elems[1]; dv.elems.push_back(rl_make_kw("value")); dv.elems.push_back(zSym); }
         }
         matchL.elems.push_back(rl_make_kw("default")); matchL.elems.push_back(std::make_shared<node>( node{ dv, {} } ));
         { list whileL; whileL.elems = { rl_make_sym("while"), rl_make_sym(tName), std::make_shared<node>( node{ vector_t{ { std::make_shared<node>( node{ matchL, {} } ) } }, {} } ) }; outV.elems.push_back(std::make_shared<node>( node{ whileL, {} } )); }

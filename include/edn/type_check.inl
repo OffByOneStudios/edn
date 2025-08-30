@@ -32,7 +32,18 @@ inline void TypeChecker::collect_typedefs(TypeCheckResult& r, const std::vector<
         }
         if(!haveName){ error_code(r,*n,"E1330","typedef missing :name","expected (typedef :name Alias :type <type>)"); r.success=false; continue; }
         if(!haveType){ error_code(r,*n,"E1331","typedef missing :type","add :type <type-form>"); r.success=false; continue; }
-        if(typedefs_.count(name) || structs_.count(name)){ error_code(r,*n,"E1332","typedef redefinition","choose unique alias name"); r.success=false; continue; }
+        if(typedefs_.count(name) || structs_.count(name) || sums_.count(name) || unions_.count(name) || enums_.count(name)){
+            error_code(r,*n,"E1332","typedef redefinition","choose unique alias name"); r.success=false; continue; }
+        // Simple cycle / self-reference detection: (typedef :name X :type X)
+        if(typeNode){
+            bool selfRef=false;
+            if(std::holds_alternative<symbol>(typeNode->data)){
+                if(std::get<symbol>(typeNode->data).name==name) selfRef=true;
+            } else if(std::holds_alternative<std::string>(typeNode->data)){
+                if(std::get<std::string>(typeNode->data)==name) selfRef=true;
+            }
+            if(selfRef){ error_code(r,*n,"E1333","typedef type form invalid","self-referential cycle"); r.success=false; continue; }
+        }
         TypeId underlying = 0; try { underlying = ctx_.parse_type(typeNode); } catch(const parse_error&){ error_code(r,*n,"E1333","typedef type form invalid","fix underlying type form"); r.success=false; continue; }
         if(!underlying){ error_code(r,*n,"E1333","typedef type form invalid","fix underlying type form"); r.success=false; continue; }
         typedefs_[name]=underlying; // success
@@ -146,7 +157,19 @@ inline void TypeChecker::collect_globals(TypeCheckResult& r, const std::vector<n
         auto &l=std::get<list>(n->data).elems;
         if(l.empty()||!std::holds_alternative<symbol>(l[0]->data)) continue;
         if(std::get<symbol>(l[0]->data).name!="global") continue;
-        std::string name; TypeId ty=0; bool isConst=false; node_ptr init;
+        std::string name; TypeId ty=0; bool isConst=false; node_ptr init; 
+        // Early generic error metadata harvesting from module head
+        if(i==0 && n && std::holds_alternative<symbol>(n->data)){
+            for(auto &kv : n->metadata){
+                if(kv.first.rfind("generic-error-",0)==0 && kv.second && std::holds_alternative<symbol>(kv.second->data)){
+                    std::string payload = std::get<symbol>(kv.second->data).name; // CODE:msg
+                    auto pos = payload.find(':');
+                    std::string code = pos==std::string::npos?payload:payload.substr(0,pos);
+                    std::string msg = pos==std::string::npos?"generic diagnostic":payload.substr(pos+1);
+                    if(code.rfind("E17",0)==0){ error_code(r,*n,code,msg,"generic instantiation error"); r.success=false; }
+                }
+            }
+        }
         for(size_t j=1;j<l.size(); ++j){
             if(l[j]&&std::holds_alternative<keyword>(l[j]->data)){
                 std::string kw=std::get<keyword>(l[j]->data).name; if(++j>=l.size()) break; auto val=l[j];

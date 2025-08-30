@@ -136,6 +136,198 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     // First expand macros to Core-like EDN
     edn::node_ptr expanded = tx.expand(ast_copy);
 
+    // Generic monomorphization prototype (Phase: initial). Surface pattern:
+    // (fn :name "id" :generics [ T ] :ret T :params [ (param T %x) ] :body [ (ret T %x) ])
+    // Call sites use rcall-g form (not a macro) which is rewritten here:
+    // (rcall-g %dst RetTy id [ ConcreteTy... ] %args...) -> (call %dst RetTy id__ConcreteTy... %args...)
+    // We clone the generic fn per unique instantiation, substituting type parameter symbols in ret/param types and body.
+    // Limitations: no trait bounds, no nested generics, simple symbol equality substitution only.
+    if(expanded && std::holds_alternative<list>(expanded->data)){
+        auto &modList = std::get<list>(expanded->data);
+        if(!modList.elems.empty() && std::holds_alternative<symbol>(modList.elems[0]->data) && std::get<symbol>(modList.elems[0]->data).name=="module"){
+            // Collect generic function templates and remove them from module (we'll append specializations after cloning)
+            struct GenericTemplate { std::string name; std::vector<std::string> typeParams; std::vector<std::pair<std::string,std::string>> bounds; node_ptr fnList; };
+            std::vector<GenericTemplate> generics;
+            std::vector<node_ptr> retained; retained.reserve(modList.elems.size());
+            retained.push_back(modList.elems[0]); // keep module head
+            for(size_t i=1;i<modList.elems.size(); ++i){
+                auto &n = modList.elems[i];
+                bool isGeneric=false; std::vector<std::string> tparams; std::vector<std::pair<std::string,std::string>> bounds; std::string fname;
+                if(n && std::holds_alternative<list>(n->data)){
+                    auto &L = std::get<list>(n->data).elems;
+                    if(!L.empty() && std::holds_alternative<symbol>(L[0]->data) && std::get<symbol>(L[0]->data).name=="fn"){
+                        // scan keywords
+                        for(size_t k=1;k+1<L.size(); k+=2){
+                            if(!std::holds_alternative<keyword>(L[k]->data)) break;
+                            std::string kw = std::get<keyword>(L[k]->data).name;
+                            if(kw=="name" && std::holds_alternative<std::string>(L[k+1]->data)) fname = std::get<std::string>(L[k+1]->data); // function name stored as string
+                            if(kw=="generics" && std::holds_alternative<vector_t>(L[k+1]->data)){
+                                isGeneric=true;
+                                auto &vec = std::get<vector_t>(L[k+1]->data).elems;
+                                for(auto &tp : vec){ if(tp && std::holds_alternative<symbol>(tp->data)) tparams.push_back(std::get<symbol>(tp->data).name); }
+                            }
+                            if(kw=="bounds" && std::holds_alternative<vector_t>(L[k+1]->data)){
+                                auto &bvec = std::get<vector_t>(L[k+1]->data).elems;
+                                for(auto &b : bvec){
+                                    if(!b || !std::holds_alternative<list>(b->data)) continue;
+                                    auto &BL = std::get<list>(b->data).elems;
+                                    // (bound T TraitName)
+                                    if(BL.size()==3 && std::holds_alternative<symbol>(BL[0]->data) && std::get<symbol>(BL[0]->data).name=="bound" && std::holds_alternative<symbol>(BL[1]->data) && std::holds_alternative<symbol>(BL[2]->data)){
+                                        bounds.emplace_back(std::get<symbol>(BL[1]->data).name, std::get<symbol>(BL[2]->data).name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if(isGeneric && !tparams.empty() && !fname.empty()){
+                    generics.push_back(GenericTemplate{ fname, tparams, bounds, n });
+                } else {
+                    retained.push_back(n);
+                }
+            }
+            // Helper: deep clone with type substitution
+            std::function<node_ptr(const node_ptr&, const std::unordered_map<std::string,std::string>&)> clone_subst;
+            clone_subst = [&](const node_ptr &n, const std::unordered_map<std::string,std::string>& subst)->node_ptr{
+                if(!n) return nullptr;
+                if(std::holds_alternative<symbol>(n->data)){
+                    auto name = std::get<symbol>(n->data).name;
+                    auto it = subst.find(name); if(it!=subst.end()) return rl_make_sym(it->second);
+                    return n; // reuse
+                }
+                if(std::holds_alternative<list>(n->data)){
+                    list out; out.elems.reserve(std::get<list>(n->data).elems.size());
+                    for(auto &e : std::get<list>(n->data).elems){ out.elems.push_back(clone_subst(e, subst)); }
+                    auto nn = std::make_shared<node>(*n); nn->data = out; return nn;
+                }
+                if(std::holds_alternative<vector_t>(n->data)){
+                    vector_t v; v.elems.reserve(std::get<vector_t>(n->data).elems.size());
+                    for(auto &e : std::get<vector_t>(n->data).elems){ v.elems.push_back(clone_subst(e, subst)); }
+                    auto nn = std::make_shared<node>(*n); nn->data = v; return nn;
+                }
+                return n; // other atom types (string, integer, keyword)
+            };
+            // Map generic name -> template
+            std::unordered_map<std::string, GenericTemplate*> gmap; for(auto &g : generics) gmap[g.name]=&g;
+            // Track created specializations
+            std::unordered_map<std::string, node_ptr> specializations; // specName -> fn node
+            auto make_spec_name = [&](const std::string& base, const std::vector<std::string>& tys){ std::string s = base; s += "__"; for(size_t i=0;i<tys.size(); ++i){ if(i) s+="_"; s+=tys[i]; } return s; };
+            // Scan retained function bodies for rcall-g forms to rewrite; collect simple errors (arity mismatch / unknown generic)
+            struct PendingGenericError { node_ptr callNode; std::string code; std::string msg; };
+            std::vector<PendingGenericError> genErrors;
+            // Simple built-in trait satisfaction table: trait -> set of type symbols satisfying it
+            std::unordered_map<std::string,std::unordered_set<std::string>> builtinTraitSatisfaction = {
+                {"Addable", {"i8","i16","i32","i64","u8","u16","u32","u64","f32","f64"}},
+                {"Copy", {"i8","i16","i32","i64","u8","u16","u32","u64","f32","f64","i1"}}
+            };
+            for(auto &n : retained){
+                if(!n || !std::holds_alternative<list>(n->data)) continue;
+                auto &L = std::get<list>(n->data).elems; if(L.empty()) continue;
+                if(std::holds_alternative<symbol>(L[0]->data) && std::get<symbol>(L[0]->data).name=="fn"){
+                    // recurse into body vectors
+                    std::function<void(node_ptr&)> walk;
+                    walk = [&](node_ptr &node){
+                        if(!node) return;
+                        if(std::holds_alternative<vector_t>(node->data)){
+                            for(auto &e : std::get<vector_t>(node->data).elems) walk(e);
+                            return;
+                        }
+                        if(!std::holds_alternative<list>(node->data)) return;
+                        auto &LL = std::get<list>(node->data).elems;
+                        if(LL.empty() || !std::holds_alternative<symbol>(LL[0]->data)) { for(auto &c: LL) walk(c); return; }
+                        std::string op = std::get<symbol>(LL[0]->data).name;
+                        if(op=="rcall-g" && LL.size()>=6){
+                            // pattern: rcall-g %dst RetTy calleeSym typeArgsVec args...
+                            if(!std::holds_alternative<symbol>(LL[1]->data) || !std::holds_alternative<symbol>(LL[2]->data) || !std::holds_alternative<symbol>(LL[3]->data) || !std::holds_alternative<vector_t>(LL[4]->data)) return; // malformed
+                            std::string callee = std::get<symbol>(LL[3]->data).name;
+                            auto itG = gmap.find(callee); if(itG==gmap.end()){
+                                genErrors.push_back({ node, "E1700", std::string("unknown generic function ")+callee });
+                                return;
+                            }
+                            auto &tvec = std::get<vector_t>(LL[4]->data).elems; if(tvec.size()!=itG->second->typeParams.size()){
+                                genErrors.push_back({ node, "E1701", std::string("generic type arg arity mismatch for ")+callee });
+                                return;
+                            }
+                            std::vector<std::string> argTypes; argTypes.reserve(tvec.size());
+                            for(auto &tv : tvec){ if(tv && std::holds_alternative<symbol>(tv->data)) argTypes.push_back(std::get<symbol>(tv->data).name); else return; }
+                            std::string specName = make_spec_name(callee, argTypes);
+                            if(!specializations.count(specName)){
+                                // create substitution map param -> concrete type
+                                std::unordered_map<std::string,std::string> subst;
+                                for(size_t i=0;i<argTypes.size(); ++i) subst[itG->second->typeParams[i]] = argTypes[i];
+                                // (Future) bounds enforcement: verify each (T Trait) pair is satisfied by concrete type; currently skipped.
+                                bool boundsOk = true;
+                                for(auto &b : itG->second->bounds){
+                                    auto itSub = subst.find(b.first);
+                                    if(itSub==subst.end()) continue; // param missing => skip
+                                    const std::string &concreteTy = itSub->second;
+                                    auto traitIt = builtinTraitSatisfaction.find(b.second);
+                                    if(traitIt==builtinTraitSatisfaction.end() || !traitIt->second.count(concreteTy)){
+                                        genErrors.push_back({ node, "E1702", std::string("bound ")+b.first+":"+b.second+" unsatisfied by "+concreteTy });
+                                        boundsOk=false; break;
+                                    }
+                                }
+                                if(!boundsOk){
+                                    // Do not create specialization; leave call as rcall-g so type checker still sees error diagnostic node.
+                                } else {
+                                // clone function list and patch :name & remove :generics
+                                if(itG->second->fnList && std::holds_alternative<list>(itG->second->fnList->data)){
+                                    auto fnClone = clone_subst(itG->second->fnList, subst);
+                                    auto &F = std::get<list>(fnClone->data).elems;
+                                    // Iterate keyword/value pairs; allow erasure without unsigned wraparound hacks.
+                                    for(size_t k=1; k+1 < F.size(); ){
+                                        if(!std::holds_alternative<keyword>(F[k]->data)) break;
+                                        std::string kw = std::get<keyword>(F[k]->data).name;
+                                        if(kw=="name" && std::holds_alternative<std::string>(F[k+1]->data)) {
+                                            F[k+1] = edn::n_str(specName);
+                                            k += 2;
+                                            continue;
+                                        }
+                                        if(kw=="generics" || kw=="bounds"){
+                                            // Erase this kw/value pair (drop surface-only metadata in specialization).
+                                            // Cast k to difference_type to avoid -Wsign-conversion noise on iterator arithmetic.
+                                            F.erase(F.begin()+static_cast<std::ptrdiff_t>(k), F.begin()+static_cast<std::ptrdiff_t>(k+2));
+                                            // Do not advance k; next element now occupies index k.
+                                            continue;
+                                        }
+                                        // Unhandled keyword: advance.
+                                        k += 2;
+                                    }
+                                    specializations[specName] = fnClone;
+                                }
+                }
+                            }
+                            // Rewrite rcall-g to call specialized function
+                            list callL; callL.elems.push_back(rl_make_sym("call"));
+                            callL.elems.push_back(LL[1]); // %dst
+                            callL.elems.push_back(LL[2]); // RetTy
+                            callL.elems.push_back(rl_make_sym(specName));
+                            for(size_t ai=5; ai<LL.size(); ++ai) callL.elems.push_back(LL[ai]);
+                            node->data = callL;
+                            return; // done
+                        }
+                        // generic recursion for nested structures
+                        for(auto &c : LL) walk(c);
+                    };
+                    walk(n);
+                }
+            }
+            // Rebuild module element list: retained + generated specializations
+            modList.elems = retained;
+            for(auto &kv : specializations){ modList.elems.push_back(kv.second); }
+            // (Transitional) encode generic errors as metadata on the module head; downstream can surface.
+            if(!genErrors.empty() && !modList.elems.empty()){
+                auto &head = modList.elems[0]; // module symbol list start
+                if(head && std::holds_alternative<symbol>(head->data)){
+                    for(auto &ge : genErrors){
+                        auto metaNode = rl_make_sym(ge.code+":"+ge.msg);
+                        head->metadata["generic-error-"+ge.code+"-"+std::to_string(head->metadata.size())] = metaNode;
+                    }
+                }
+            }
+        }
+    }
+
     // Inject struct declarations for each used tuple arity if missing.
     // Attempt lightweight field type inference by scanning preceding const/as instructions
     // for each struct-lit usage of a tuple. Fallback to i32 if any field ambiguous.

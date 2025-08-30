@@ -504,6 +504,63 @@ target_link_libraries(rustlite_tuple_destructure_driver PRIVATE rustlite edn)
 target_compile_features(rustlite_tuple_destructure_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.tuple_destructure COMMAND rustlite_tuple_destructure_driver)
 
+# if-let / while-let driver
+add_executable(rustlite_if_while_let_driver tools/rustlite_if_while_let_driver.cpp)
+target_link_libraries(rustlite_if_while_let_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_if_while_let_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.if_while_let COMMAND rustlite_if_while_let_driver)
+
+# Negative: missing :value in rif-let branch
+add_executable(rustlite_if_while_let_neg_missing_value_driver tools/rustlite_if_while_let_neg_missing_value_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_missing_value_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_if_while_let_neg_missing_value_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.if_while_let.neg.missing_value COMMAND rustlite_if_while_let_neg_missing_value_driver)
+
+# Negative: missing :value in rif-let default branch
+add_executable(rustlite_if_while_let_neg_missing_default_value_driver tools/rustlite_if_while_let_neg_missing_default_value_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_missing_default_value_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_if_while_let_neg_missing_default_value_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.if_while_let.neg.missing_default_value COMMAND rustlite_if_while_let_neg_missing_default_value_driver)
+set_tests_properties(rustlite.if_while_let.neg.missing_default_value PROPERTIES LABELS "rustlite-neg")
+
+# Negative: rif-let case result type mismatch
+add_executable(rustlite_if_while_let_neg_case_result_type_mismatch_driver tools/rustlite_if_while_let_neg_case_result_type_mismatch_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_case_result_type_mismatch_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_if_while_let_neg_case_result_type_mismatch_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.if_while_let.neg.case_result_type_mismatch COMMAND rustlite_if_while_let_neg_case_result_type_mismatch_driver)
+set_tests_properties(rustlite.if_while_let.neg.case_result_type_mismatch PROPERTIES LABELS "rustlite-neg")
+
+# Negative: rif-let default result type mismatch
+add_executable(rustlite_if_while_let_neg_default_result_type_mismatch_driver tools/rustlite_if_while_let_neg_default_result_type_mismatch_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_default_result_type_mismatch_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_if_while_let_neg_default_result_type_mismatch_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.if_while_let.neg.default_result_type_mismatch COMMAND rustlite_if_while_let_neg_default_result_type_mismatch_driver)
+set_tests_properties(rustlite.if_while_let.neg.default_result_type_mismatch PROPERTIES LABELS "rustlite-neg")
+
+# rloop-val positive driver
+add_executable(rustlite_rloop_val_driver tools/rustlite_rloop_val_driver.cpp)
+target_link_libraries(rustlite_rloop_val_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_rloop_val_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rloop_val COMMAND rustlite_rloop_val_driver)
+
+# New: rloop-val plain break (no value) positive driver
+add_executable(rustlite_rloop_val_plain_break_driver tools/rustlite_rloop_val_plain_break_driver.cpp)
+target_link_libraries(rustlite_rloop_val_plain_break_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_rloop_val_plain_break_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rloop_val.plain_break COMMAND rustlite_rloop_val_plain_break_driver)
+
+# New: rloop-val no-break positive (compilation only)
+add_executable(rustlite_rloop_val_no_break_driver tools/rustlite_rloop_val_no_break_driver.cpp)
+target_link_libraries(rustlite_rloop_val_no_break_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_rloop_val_no_break_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rloop_val.no_break COMMAND rustlite_rloop_val_no_break_driver)
+
+# New: rloop-val multi-break (same type) positive
+add_executable(rustlite_rloop_val_multi_break_driver tools/rustlite_rloop_val_multi_break_driver.cpp)
+target_link_libraries(rustlite_rloop_val_multi_break_driver PRIVATE rustlite edn)
+target_compile_features(rustlite_rloop_val_multi_break_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.rloop_val.multi_break COMMAND rustlite_rloop_val_multi_break_driver)
+
 # Closure capture inference (enabled)
 add_executable(rustlite_closure_infer_driver tools/rustlite_closure_infer_driver.cpp)
 target_link_libraries(rustlite_closure_infer_driver PRIVATE rustlite edn)
@@ -520,4 +577,85 @@ add_test(NAME rustlite.closure_infer_disabled COMMAND rustlite_closure_infer_dis
 
 # Surface tests (parser golden comparisons)
 add_subdirectory(surface_tests)
+
+# Register new rif-let variant mismatch negative driver
+add_executable(rustlite_if_while_let_neg_variant_mismatch_driver tools/rustlite_if_while_let_neg_variant_mismatch_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_variant_mismatch_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.if_while_let.neg.variant_mismatch COMMAND rustlite_if_while_let_neg_variant_mismatch_driver)
+
+# Register new rif-let undefined :value negative driver
+add_executable(rustlite_if_while_let_neg_undefined_value_driver tools/rustlite_if_while_let_neg_undefined_value_driver.cpp)
+target_link_libraries(rustlite_if_while_let_neg_undefined_value_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.if_while_let.neg.undefined_value COMMAND rustlite_if_while_let_neg_undefined_value_driver)
+
+# Type alias driver
+add_executable(rustlite_type_alias_driver tools/rustlite_type_alias_driver.cpp)
+target_link_libraries(rustlite_type_alias_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias COMMAND rustlite_type_alias_driver)
+
+# Type alias negative tests
+add_executable(rustlite_type_alias_neg_missing_name_driver tools/rustlite_type_alias_neg_missing_name_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_missing_name_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.missing_name COMMAND rustlite_type_alias_neg_missing_name_driver)
+
+add_executable(rustlite_type_alias_neg_missing_type_driver tools/rustlite_type_alias_neg_missing_type_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_missing_type_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.missing_type COMMAND rustlite_type_alias_neg_missing_type_driver)
+
+add_executable(rustlite_type_alias_neg_redefinition_driver tools/rustlite_type_alias_neg_redefinition_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_redefinition_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.redefinition COMMAND rustlite_type_alias_neg_redefinition_driver)
+
+add_executable(rustlite_type_alias_neg_invalid_underlying_driver tools/rustlite_type_alias_neg_invalid_underlying_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_invalid_underlying_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.invalid_underlying COMMAND rustlite_type_alias_neg_invalid_underlying_driver)
+
+add_executable(rustlite_type_alias_neg_shadow_driver tools/rustlite_type_alias_neg_shadow_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_shadow_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.shadow COMMAND rustlite_type_alias_neg_shadow_driver)
+
+add_executable(rustlite_type_alias_neg_cycle_driver tools/rustlite_type_alias_neg_cycle_driver.cpp)
+target_link_libraries(rustlite_type_alias_neg_cycle_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.type_alias.neg.cycle COMMAND rustlite_type_alias_neg_cycle_driver)
+
+# Generics basic prototype driver
+add_executable(rustlite_generics_basic_driver tools/rustlite_generics_basic_driver.cpp)
+target_link_libraries(rustlite_generics_basic_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.basic COMMAND rustlite_generics_basic_driver)
+
+# Generic parameter driver (uses :generics + rcall-g expansion)
+add_executable(rustlite_generics_param_driver tools/rustlite_generics_param_driver.cpp)
+target_link_libraries(rustlite_generics_param_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.param COMMAND rustlite_generics_param_driver)
+
+add_executable(rustlite_generics_neg_arity_driver tools/rustlite_generics_neg_arity_driver.cpp)
+target_link_libraries(rustlite_generics_neg_arity_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.neg.arity COMMAND rustlite_generics_neg_arity_driver)
+
+add_executable(rustlite_generics_neg_unknown_driver tools/rustlite_generics_neg_unknown_driver.cpp)
+target_link_libraries(rustlite_generics_neg_unknown_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.neg.unknown COMMAND rustlite_generics_neg_unknown_driver)
+
+add_executable(rustlite_generics_bounds_driver tools/rustlite_generics_bounds_driver.cpp)
+target_link_libraries(rustlite_generics_bounds_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.bounds COMMAND rustlite_generics_bounds_driver)
+
+add_executable(rustlite_generics_neg_bound_driver tools/rustlite_generics_neg_bound_driver.cpp)
+target_link_libraries(rustlite_generics_neg_bound_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.neg.bound COMMAND rustlite_generics_neg_bound_driver)
+
+# IR specialization verification test: ensures monomorphization produces concrete fn symbols
+# tests/ lives at repo root; from languages/rustlite we need to go up two levels.
+add_executable(rustlite_generics_specialization_ir_test ../../tests/rustlite_generics_specialization_ir_test.cpp)
+target_link_libraries(rustlite_generics_specialization_ir_test PRIVATE rustlite edn)
+add_test(NAME rustlite.generics.specialization_ir COMMAND rustlite_generics_specialization_ir_test)
+
+# rwhile-let parity negative tests
+add_executable(rustlite_rwhile_let_neg_variant_mismatch_driver tools/rustlite_rwhile_let_neg_variant_mismatch_driver.cpp)
+target_link_libraries(rustlite_rwhile_let_neg_variant_mismatch_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.rwhile_let.neg.variant_mismatch COMMAND rustlite_rwhile_let_neg_variant_mismatch_driver)
+
+add_executable(rustlite_rwhile_let_neg_undefined_value_driver tools/rustlite_rwhile_let_neg_undefined_value_driver.cpp)
+target_link_libraries(rustlite_rwhile_let_neg_undefined_value_driver PRIVATE rustlite edn)
+add_test(NAME rustlite.rwhile_let.neg.undefined_value COMMAND rustlite_rwhile_let_neg_undefined_value_driver)
 
