@@ -35,6 +35,10 @@ public:
     // Define a function with a body of raw EDN instructions (already using macro shapes where needed)
     Builder& fn_raw(const std::string& name, const std::string& ret_type, const std::vector<std::pair<std::string,std::string>>& params, const std::string& body_ir_vec);
 
+    // Legacy convenience: append a raw EDN form string directly into the module root.
+    // Used by older negative driver snippets; retained for backward compatibility.
+    Builder& raw(const std::string& form_edn);
+
     Program build() const { return Program{ edn::to_string(root_) }; }
 private:
     edn::node_ptr root_;

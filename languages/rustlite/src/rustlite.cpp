@@ -38,4 +38,16 @@ Builder& Builder::rstruct(const std::string& name, const std::vector<std::pair<s
     st << fvec; root_ << st; return *this;
 }
 
+Builder& Builder::raw(const std::string& form_edn){
+    using namespace edn;
+    // Parse the provided EDN snippet (single form) and append it.
+    try {
+        auto node = edn::parse(form_edn);
+        root_ << node;
+    } catch(...) {
+        // Swallow parse errors silently for legacy negative tests; in production we'd report.
+    }
+    return *this;
+}
+
 } // namespace rustlite

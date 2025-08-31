@@ -127,7 +127,7 @@ Then branch into parallelizable P1 items.
 | 9 | Modules + pub (31/32) | Pending | Namespace + export retention design TBD. |
 | 10 | Exhaustiveness + duplicate arm (35/36) | Pending | Exhaustiveness algorithm + structural pattern hash for duplicate detection. |
 
-Progress summary (current cycle): Completed if/while-let negatives (E1405, E1421–E1423); type alias suite incl. cycle + shadow; began generics/bounds planning.
+Progress summary (current cycle): Completed if/while-let negatives (E1405, E1421–E1423); type alias suite incl. cycle + shadow; began generics/bounds planning. Fixed compound assignment RHS literal trimming regression (shift operators) – numeric literal now preserved (removed spurious zero const). Removed temporary debug logging and legacy unordered_set include from parser.
 
 ### Recent Progress Log (2025-08-29)
 Added after parser/lowering stabilization work in active debugging session.
@@ -135,13 +135,15 @@ Added after parser/lowering stabilization work in active debugging session.
 Completed / Fixed:
 - Literal lowering regressions resolved: return statements no longer capture trailing semicolons; numeric literals (including negatives) now preserve correct values.
 - Negative integer literals normalized to (sub 0 <pos>) pattern to align with golden IR expectations (stability for future diff-based tests).
-- Assignment & compound assignment expression trimming prevents spurious zero constants.
+- Assignment & compound assignment expression trimming prevents spurious zero constants (confirmed via compound_shift surface test; RHS '3' lowered correctly).
+- Removed temporary compound assignment debug instrumentation and unused unordered_set include (eliminates intermittent stale build confusion).
 - Generics specialization IR test passes post parser adjustments (no regressions introduced).
 
 Outstanding (Short-Term Next):
 - Run broader surface test suite to flush any remaining literal/operator edge cases beyond validated unary minus & assignment scenarios.
 - Refactor outdated type alias negative driver sources referencing removed Builder::raw / fn_raw APIs (blocking a subset of negative tests from compiling).
 - Address sign-conversion warning in `expand.cpp` (iterator vs index erase loop) to keep warning budget clean.
+- Silence trivial parser warning (unused 'inclusive' flag in for-range lowering) or implement inclusive semantics.
 - Add regression tests for: compound assignment with negative literal, nested negative literals inside generic instantiations, and alias use across generic specialization boundaries.
 
 Risk Watch:

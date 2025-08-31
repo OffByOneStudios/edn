@@ -1,10 +1,15 @@
 #include "parser.hpp"
 #include <tao/pegtl.hpp>
 #include <sstream>
-// Removed debug logging that previously used std::cerr; avoid conditional <iostream> include.
+// Removed legacy unordered_set usage and temporary debug logging.
 using namespace tao::pegtl;
 
 namespace rustlite {
+
+// Helper: recognized primitive binary ops for compound assignment lowering.
+static inline bool is_primitive_compound_assign_op(const std::string& op){
+    return op=="add"||op=="sub"||op=="mul"||op=="div"||op=="band"||op=="bor"||op=="bxor"||op=="shl"||op=="ashr";
+}
 
 // Grammar v0.1:
 // - Skip spaces and comments
@@ -99,13 +104,16 @@ struct plus_equal : seq< plus_tok, equal > {};
 struct minus_equal : seq< minus, equal > {};
 struct star_equal : seq< star_tok, equal > {};
 struct slash_equal : seq< slash_tok, equal > {};
+// Added shift compound assignment tokens (<<=, >>=) and bitwise assignment tokens if not already present
+struct shl_equal : seq< string<'<','<'>, equal > {};
+struct shr_equal : seq< string<'>','>'>, equal > {};
 struct amp_tok : one<'&'> {};
 struct pipe_tok : one<'|'> {};
 struct caret_tok : one<'^'> {};
 struct amp_equal : seq< amp_tok, equal > {};
 struct pipe_equal : seq< pipe_tok, equal > {};
 struct caret_equal : seq< caret_tok, equal > {};
-struct compound_assign_stmt : seq< ws< ident >, ws< sor< plus_equal, minus_equal, star_equal, slash_equal, amp_equal, pipe_equal, caret_equal > >, ws< expr_text >, ws< semi > > {};
+struct compound_assign_stmt : seq< ws< ident >, ws< sor< plus_equal, minus_equal, star_equal, slash_equal, shl_equal, shr_equal, amp_equal, pipe_equal, caret_equal > >, ws< expr_text >, ws< semi > > {};
 // Added: brackets + index assignment statement
 struct lbracket : one<'['> {};
 struct rbracket : one<']'> {};
@@ -680,7 +688,20 @@ struct action< let_stmt > {
     if(i>=s.size() || s[i] != '=') return; ++i; ltrim(s,i);
     // rest is expr; trim and lower via standard expression lowering path
     std::string expr = s.substr(i);
-    size_t a=0; ltrim(expr,a); expr = expr.substr(a); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    size_t a=0; ltrim(expr,a); expr = expr.substr(a);
+    // Strip any line comment (// ...) appearing in the initializer; only keep code before it.
+    if(!expr.empty()){
+        auto cpos = expr.find("//");
+        if(cpos != std::string::npos){
+            expr = expr.substr(0, cpos);
+        }
+    }
+    while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    // Remove trailing semicolon now that comments are stripped
+    if(!expr.empty() && expr.back()==';'){
+        expr.pop_back();
+        while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+    }
     // Early ematch lowering inside let initializer (reuses simplified parser from expression path)
     auto try_ematch = [&](const std::string& ems)->std::optional<std::pair<std::string,std::string>>{
         if(ems.rfind("ematch ",0)!=0) return std::nullopt; std::string rest = ems.substr(7);
@@ -738,7 +759,10 @@ struct action< assign_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
     auto* fn = ensure_fn(st); if(!fn) return;
-        std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
+    std::string s = in.string();
+    // Normalize trailing whitespace + semicolons (handle pattern ";\n" where previous logic missed semicolon)
+    while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+    while(!s.empty() && s.back()==';'){ s.pop_back(); while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back(); }
         size_t i=0; ltrim(s,i); auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i); if(i>=s.size()||s[i]!='=') return; ++i; ltrim(s,i);
     auto expr = s.substr(i);
     // Trim trailing whitespace/semicolon defensively
@@ -755,7 +779,10 @@ struct action< compound_assign_stmt > {
     template<typename Input>
     static void apply(const Input& in, build_state& st){
     auto* fn = ensure_fn(st); if(!fn) return;
-        std::string s = in.string(); if(!s.empty() && s.back()==';') s.pop_back();
+    std::string s = in.string();
+    // Normalize: strip trailing whitespace then any trailing semicolons (handle patterns like ";   \n")
+    while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back();
+    while(!s.empty() && s.back()==';'){ s.pop_back(); while(!s.empty() && isspace((unsigned char)s.back())) s.pop_back(); }
         size_t i=0; ltrim(s,i);
         auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i);
         // parse operator before '='
@@ -768,15 +795,81 @@ struct action< compound_assign_stmt > {
             else if(s[i]=='&') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "band"; } }
             else if(s[i]=='|') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "bor"; } }
             else if(s[i]=='^') { ++i; if(i<s.size() && s[i]=='='){ ++i; op = "bxor"; } }
+            else if(s[i]=='<' && i+2 < s.size() && s[i+1]=='<' && s[i+2]=='='){ i+=3; op = "shl"; }
+            else if(s[i]=='>' && i+2 < s.size() && s[i+1]=='>' && s[i+2]=='='){ i+=3; op = "ashr"; }
         }
         if(op.empty()) return; ltrim(s,i);
-    auto expr = s.substr(i);
-    while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
-    if(!expr.empty() && expr.back()==';'){ expr.pop_back(); while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back(); }
-        auto rhs = lower_simple_expr_into(*fn, expr).second;
-        auto tmp = fn->gensym("op");
-        std::ostringstream oss; oss << "(rcall " << tmp << " i32 " << op << " " << name << " " << rhs << ")";
-        fn->sink().push_back(oss.str());
+        auto expr = s.substr(i);
+        // Robustly strip any trailing semicolons and whitespace (multiple passes in case of patterns like "3;  ;")
+        while(true){
+            while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+            if(!expr.empty() && expr.back()==';'){ expr.pop_back(); continue; }
+            break;
+        }
+        // Strip any line comment (// ...) that may have been captured with the RHS (e.g. comment on next line when match range was broad)
+        auto cpos = expr.find("//");
+        if(cpos != std::string::npos){
+            expr = expr.substr(0, cpos);
+            while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+            // After removing a trailing comment we may have re-exposed a semicolon; strip again.
+            while(true){
+                while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+                if(!expr.empty() && expr.back()==';'){ expr.pop_back(); continue; }
+                break;
+            }
+        }
+        // Defensive salvage: if expr ended up empty (e.g., parser slice consumed only whitespace), try to recover a trailing numeric literal
+        if(expr.empty()){
+            size_t p = s.size();
+            // walk backward ignoring whitespace
+            while(p>0 && isspace((unsigned char)s[p-1])) --p;
+            size_t q = p;
+            while(q>0 && isdigit((unsigned char)s[q-1])) --q;
+            if(q<p){ expr = s.substr(q, p-q); }
+            // Trim again in case
+            while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
+        }
+        // Additional forward salvage: if still empty, scan forward from original index for a simple integer literal
+        if(expr.empty()){
+            size_t f=i; // i was left at start of RHS when slicing
+            while(f<s.size() && isspace((unsigned char)s[f])) ++f;
+            size_t start=f;
+            if(f<s.size() && (isdigit((unsigned char)s[f]) || ((s[f]=='-'||s[f]=='+') && f+1<s.size() && isdigit((unsigned char)s[f+1])))){
+                ++f; while(f<s.size() && isdigit((unsigned char)s[f])) ++f; expr = s.substr(start, f-start);
+            }
+        }
+    // (debug logging for compound assignment parsing removed)
+        std::string rhs;
+        // Fast-path numeric literal to ensure we don't fall through to zero-fallback due to any subtle expr_text slicing issues.
+        // Trim leading whitespace (already trimmed tail above, but defensive here)
+        // EXTRA TRIM: remove a trailing semicolon (and following whitespace) that may survive when it was not at absolute end of original statement.
+        if(!expr.empty()){
+            size_t p = expr.size();
+            // first strip trailing whitespace
+            while(p>0 && isspace((unsigned char)expr[p-1])) --p;
+            if(p>0 && expr[p-1]==';'){
+                --p; while(p>0 && isspace((unsigned char)expr[p-1])) --p; expr = expr.substr(0,p);
+            }
+        }
+        while(!expr.empty() && isspace((unsigned char)expr.front())) expr.erase(expr.begin());
+        bool numeric_only=true; if(expr.empty()) numeric_only=false; else {
+            for(size_t idx=0; idx<expr.size(); ++idx){ char c = expr[idx];
+                if(!(isdigit((unsigned char)c) || (c=='-' && idx==0))){ numeric_only=false; break; }
+            }
+        }
+        if(numeric_only){
+            rhs = fn->gensym("c");
+            fn->sink().push_back("(const " + rhs + " i32 " + expr + ")");
+        } else {
+            rhs = lower_simple_expr_into(*fn, expr).second;
+        }
+        auto tmp = fn->gensym("cassn");
+    // Emit primitive op instruction directly when recognized.
+    if(is_primitive_compound_assign_op(op)){
+            fn->sink().push_back("(" + op + " " + tmp + " i32 " + name + " " + rhs + ")");
+        } else {
+            std::ostringstream oss; oss << "(rcall " << tmp << " i32 " << op << " " << name << " " << rhs << ")"; fn->sink().push_back(oss.str());
+        }
         fn->sink().push_back("(assign " + name + " " + tmp + ")");
     }
 };
