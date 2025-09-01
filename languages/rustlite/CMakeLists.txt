@@ -722,3 +722,8 @@ add_executable(rustlite_rwhile_let_neg_undefined_value_driver tools/rustlite_rwh
 target_link_libraries(rustlite_rwhile_let_neg_undefined_value_driver PRIVATE rustlite edn)
 add_test(NAME rustlite.rwhile_let.neg.undefined_value COMMAND rustlite_rwhile_let_neg_undefined_value_driver)
 
+# Register new variable pattern tuple match test
+add_executable(rustlite_tuple_match_variable_pattern_test ../../tests/rustlite_tuple_match_variable_pattern_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_tuple_match_variable_pattern_test PRIVATE rustlite edn)
+add_test(NAME rustlite.tuple_match.variable_pattern COMMAND rustlite_tuple_match_variable_pattern_test)
+
