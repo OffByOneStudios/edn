@@ -374,3 +374,90 @@ Phase 2e: Finalize codes & docs.
 Maintenance:
 - Keep this list trimmed: when an item lands in main with tests, flip to [x] and (optionally) annotate PR/commit hash.
 - Introduce new bullets only if they represent distinct diagnostic behavior, not duplicates of already-covered code paths.
+
+## 2025-08-31 update — tuple match literal guard lowering & protective snapshot
+
+Summary
+- Implemented multi-arm tuple match lowering for Rustlite surface `match t { (pat){..} ... }` producing:
+  - Per-arm extraction clusters: `(tget %sym i32 %scrut <idx>)` + `(tuple-pattern-meta %scrut <arity>)` (one meta per arm).
+  - Literal guard predicates: integer literals generate `(const)` + `(eq ...)` comparisons combined via `(band ...)` (currently appearing as nested `(if ...)` chain post-expansion; rif canonicalization deferred).
+  - Destination pre-zero-init + per-arm `(assign %dst %valueSym)` inside conditional path.
+- Added `rustlite_tuple_match_literal_guard_test` asserting:
+  - >=3 `tuple-pattern-meta` (cluster per arm for this test shape).
+  - Either a rif chain (future) or nested if chain length >=2.
+  - >=2 `(eq ...)` literal guard comparisons (first two discriminatory arms).
+- Fixed parser arm body scan depth bug (body brace depth initialized incorrectly); previously aborted lowering (`ok=0`).
+- Removed all temporary debug instrumentation (match RHS, per-arm summaries, IR dump) after green test; kept robust RHS brace capture logic (now silent).
+
+Rationale
+- Capturing this state before type checker macro-op integration (tget/tuple-pattern-meta/tuple-match-arms-count) in case forthcoming edits regress lowering.
+
+Next (planned immediately after this snapshot)
+1. Extend type checker to recognize `tget`, `tuple-pattern-meta`, `tuple-match-arms-count`, and nested if chain semantics for match selection.
+2. Re-enable type checking path within the guard test (currently structural-only) once ops validated.
+3. Optional optimization: lazy cluster emission (skip extraction for arms ruled out by prior literal guards).
+4. Broaden guard forms (variable equality, relational ops) + new positive/negative tests.
+
+Risk Notes
+- Current nested `(if ...)` structure will change once rif macro canonicalization lands; test tolerant to either form to avoid churn.
+- Parser still emits unused variable warnings in earlier phases (not tuple-related); scheduled cleanup after type checker integration.
+
+### 2025-08-31 (later session) – Tuple Pattern Meta Type Checker Integration (WIP)
+Status: In progress (blocked on structural compile error)
+
+Work Started:
+- Began extending `TypeChecker::check_instruction_list` to recognize tuple pattern support ops emitted by lowering:
+	- `tuple-pattern-meta` (tuple arity + structural validation; ensures target is synthetic `__TupleN`).
+	- `tuple-match-arms-count` (records arm count metadata; presently a no-op validation).
+- Clarified that surface `tget` macro is lowered to existing `(member ...)` ops; no distinct `tget` IR handler required unless raw form leaks pre-expansion (none observed).
+
+Current Blocker:
+- Structural compile failure in `type_check.inl` (compiler reports `check_module` definition nested inside prior scope). Numeric brace counts inside the edited region now balanced; indicates an earlier inadvertent brace misplacement or macro edge causing scope to remain open. Further inspection of earlier (unmodified) portions of the file needed next session.
+
+Planned Next Session Actions:
+1. Resolve brace/scope issue (full-file scan + minimal diff bisect) to restore build.
+2. Add if-chain result assignment unification semantics for lowered nested `if` / future `rif` chains (ensure consistent result type across arms, single destination binding).
+3. Re-run tuple match literal guard test with full type checking enabled (was previously structural-only) to confirm metadata ops are benign (no unexpected diagnostics).
+4. Add a regression test asserting `tuple-pattern-meta` / `tuple-match-arms-count` presence does not emit diagnostics and that over-arity (E1454) still surfaces correctly.
+5. Decide whether provisional struct pattern related codes (E1456–E1459) remain reserved or need renumbering before struct pattern implementation begins.
+
+Notes:
+- No changes yet to test files; integration work paused immediately upon encountering structural compile error to avoid compounding issues.
+- If-chain assignment semantics will leverage existing destination type inference currently used by `rif-let` / `rwhile-let` macros for value arms.
+
+-- END UPDATE 2025-08-31
+
+### 2025-09-01 – Tuple Meta Type Checker Integration Completed + If-Chain Unification
+Status: Complete (Phase slice) / Next: Struct patterns
+
+Delivered:
+- Resolved prior structural compilation issue in `type_check.inl`; clean rebuild passes.
+- Added semantic handlers:
+	* `tuple-pattern-meta` – shape + optional arity validation against `__TupleN` synthetic struct pointer (benign in positive flows).
+	* `tuple-match-arms-count` – metadata arity check only.
+	* `(assign %dst %src)` – explicit arity + type match (E1106 arity / E1107 mismatch).
+- Implemented if-chain assignment destination unification (E1108) to enforce single `%dst` across nested conditional selection chains produced by tuple match lowering (prevents silent divergence of result variable).
+- Removed unused local lambda (`is_int`) eliminating a warning.
+- Extended `rustlite_tuple_match_literal_guard_test` to run full type checking; asserts absence of unexpected tuple pattern diagnostics (E1454/E1456–E1459) in positive case – test passes.
+
+Diagnostics / Codes:
+- New: E1106 (assign arity / operand form), E1107 (assign type mismatch reuse), E1108 (if-chain destination inconsistency).
+- Tuple provisional codes E1456–E1459 currently reserved; not yet repurposed.
+
+Verification:
+- All builds succeed; only pre-existing link duplicate-library warnings remain (benign linking noise to address later).
+- Guard test output: `[rustlite-tuple-match-literal-guard] ok` after type check integration.
+
+Next Focus:
+1. Struct pattern parsing + lowering (Phase 2b) with planned diagnostics (unknown field, duplicate field, bad `..`, non-struct target).
+2. Nested tuple pattern support and placeholder `_` suppression (Phase 2c/d).
+3. Regression test: negative tuple arity mismatch still emits single E1454 (already covered by existing neg drivers) post type checker changes.
+4. Decide final numbering or reuse of E1456–E1459 before struct pattern landing.
+5. Optional: integrate lazy tuple arm extraction (skip clusters for arms proven unreachable by earlier literal guards) – performance micro-optimization.
+
+Notes:
+- If-chain unification deliberately shallow: it only scans branch vectors for `(assign ...)` ops; future enhancements may track nested blocks.
+- No observable impact on existing ematch / rif-let tests (assign mismatch negative still surfaces E1107).
+
+-- END UPDATE 2025-09-01
+

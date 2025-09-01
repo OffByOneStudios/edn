@@ -31,7 +31,24 @@ int main(){
     if(!ast){ std::cerr<<"edn parse failed"<<"\n"; return 1; }
     auto expanded = rustlite::expand_rustlite(ast);
     if(!expanded){ std::cerr<<"expand failed"<<"\n"; return 1; }
-    // Serialize expanded EDN to string for simple pattern assertions (skip type checking until rif/tget supported).
+    // Run type checker now that tuple meta ops are recognized.
+    // (forced rebuild marker)
+    edn::TypeContext tctx;
+    edn::TypeChecker tc(tctx);
+    auto tcres = tc.check_module(expanded);
+    if(!tcres.success){
+        std::cerr << "type check failed for tuple match literal guard test\n";
+        for(auto &e: tcres.errors){ std::cerr<<e.code<<":"<<e.message<<"\n"; }
+        return 1;
+    }
+    // Assert no meta-op related diagnostics surfaced (E1454 only appears on arity mismatch cases, not in this positive test).
+    for(auto &e: tcres.errors){
+        if(e.code=="E1454"||e.code=="E1456"||e.code=="E1457"||e.code=="E1458"||e.code=="E1459"){
+            std::cerr << "unexpected tuple pattern diagnostic: "<<e.code<<" -> "<<e.message<<"\n";
+            return 1;
+        }
+    }
+    // Serialize expanded EDN to string for structural assertions.
     auto irStr = edn::to_string(expanded);
     // (debug IR dump removed; will emit on assertion failure below)
     // Basic structural assertions:

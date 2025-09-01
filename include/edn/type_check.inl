@@ -408,9 +408,33 @@ inline void TypeChecker::analyze_fn_lints(TypeCheckResult& r, const std::vector<
         }
     }
 }
-inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn, int loop_depth){ auto get_var=[&](const std::string& n)->TypeId{ auto it=var_types_.find(n); return it==var_types_.end() ? (TypeId)-1 : it->second; }; auto attach=[&](const node_ptr& n, TypeId t){ n->metadata["type-id"]=detail::make_node((int64_t)t); }; auto is_int=[&](TypeId t){ const Type& T=ctx_.at(t); if(T.kind!=Type::Kind::Base) return false; switch(T.base){ case BaseType::I1: case BaseType::I8: case BaseType::I16: case BaseType::I32: case BaseType::I64: case BaseType::U8: case BaseType::U16: case BaseType::U32: case BaseType::U64: return true; default: return false;} };
+inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::vector<node_ptr>& insts, const FunctionInfoTC& fn, int loop_depth){ auto get_var=[&](const std::string& n)->TypeId{ auto it=var_types_.find(n); return it==var_types_.end() ? (TypeId)-1 : it->second; }; auto attach=[&](const node_ptr& n, TypeId t){ n->metadata["type-id"]=detail::make_node((int64_t)t); };
     // (Tuple pattern arity mismatch E1454 is diagnosed during expansion; redundant checker pass removed to avoid duplicate reports.)
     for(auto &n: insts){ if(!n||!std::holds_alternative<list>(n->data)){ error(r,*n,"instruction must be list"); r.success=false; continue; } auto &il=std::get<list>(n->data).elems; if(il.empty()||!std::holds_alternative<symbol>(il[0]->data)){ error(r,*n,"instruction missing opcode"); r.success=false; continue; } std::string op=std::get<symbol>(il[0]->data).name; auto sym=[&](size_t i)->std::string{ if(i<il.size() && std::holds_alternative<symbol>(il[i]->data)) return std::get<symbol>(il[i]->data).name; return std::string{}; };
+    // --- Tuple pattern / match auxiliary ops (Rustlite) ---
+    // (tuple-pattern-meta %tuple <arity-literal>) : emitted purely for diagnostics during expansion phase.
+    // We only validate operand shape (symbol + int literal) and that %tuple, if defined, has a tuple struct type (__TupleN) when available.
+    if(op=="tuple-pattern-meta"){ // (tuple-pattern-meta %t <arity>)
+        if(il.size()!=3){ error_code(r,*n,"E1456","tuple-pattern-meta arity","expected (tuple-pattern-meta %tuple <arity-int>)"); r.success=false; continue; }
+        std::string tup = sym(1); if(tup.empty()||tup[0] != '%'){ error_code(r,*n,"E1457","tuple-pattern-meta tuple must be %var","prefix with %"); r.success=false; }
+        if(!std::holds_alternative<int64_t>(il[2]->data)) { error_code(r,*n,"E1458","tuple-pattern-meta arity literal required","supply integer literal arity"); r.success=false; }
+        // Best-effort structural validation: if tuple var already has a struct pointer type to __TupleA, ensure arity matches suffix.
+        if(tup.size()>1){ auto tt = get_var(tup.substr(1)); if(tt!=(TypeId)-1){ const Type& TV = ctx_.at(tt); if(TV.kind==Type::Kind::Pointer){ const Type& PT = ctx_.at(TV.pointee); if(PT.kind==Type::Kind::Struct && PT.struct_name.rfind("__Tuple",0)==0){ int64_t declaredArity = std::stoll(PT.struct_name.substr(7)); int64_t metaArity = std::get<int64_t>(il[2]->data); if(metaArity!=declaredArity){ error_code(r,*n,"E1454","tuple pattern arity mismatch","pattern arity doesn't match tuple value arity"); r.success=false; } } } }
+        continue; }
+    if(op=="tuple-match-arms-count"){ // (tuple-match-arms-count <int>) metadata only
+        if(il.size()!=2 || !std::holds_alternative<int64_t>(il[1]->data)) { error_code(r,*n,"E1459","tuple-match-arms-count arity","expected (tuple-match-arms-count <int>)"); r.success=false; }
+        continue; }
+    // Note: (tget ...) lowers to (member ...) during macro expansion; no direct checker support required.
+    // If unexpanded (should not normally happen), fall through to unknown instruction to surface issue.
+    if(op=="assign"){ // (assign %dst %src)
+        if(il.size()!=3){ error_code(r,*n,"E1106","assign arity","expected (assign %dst %src)"); r.success=false; continue; }
+        std::string dst = sym(1), src = sym(2);
+        if(dst.empty()||dst[0] != '%'){ error_code(r,*n,"E1106","assign dst must be %var","prefix destination with %"); r.success=false; continue; }
+        if(src.empty()||src[0] != '%'){ error_code(r,*n,"E1106","assign src must be %var","prefix source with %"); r.success=false; continue; }
+        auto dt = get_var(dst.substr(1)); if(dt==(TypeId)-1){ error_code(r,*n,"E1106","assign undefined dst","define variable before assign"); r.success=false; continue; }
+        auto st = get_var(src.substr(1)); if(st==(TypeId)-1){ error_code(r,*n,"E1106","assign undefined src","define source before use"); r.success=false; continue; }
+        if(dt!=st){ type_mismatch(r,*n,"E1107","assign value", dt, st); r.success=false; }
+        continue; }
     // --- M4.4 Closures (minimal non-escaping, single capture env) ---
     if(op=="closure"){ // (closure %dst (ptr (fn-type ...)) Callee [ %env ])
         if(il.size()<5){ error_code(r,*n,"E1430","closure arity","expected (closure %dst (ptr (fn-type ...)) <callee> [ %env ])"); r.success=false; continue; }
@@ -710,7 +734,28 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         var_types_=saved; 
         continue; 
     }
-    if(op=="if"){ if(il.size()<3){ error_code(r,*n,"E1000","if arity","expected (if %cond [ then ] [ else ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1001","if cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1002","if cond must be i1","use boolean (i1) value"); r.success=false; } } if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn, loop_depth); if(il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data)) check_instruction_list(r, std::get<vector_t>(il[3]->data).elems, fn, loop_depth); continue; }
+    if(op=="if"){ if(il.size()<3){ error_code(r,*n,"E1000","if arity","expected (if %cond [ then ] [ else ])"); r.success=false; continue; } std::string cond=sym(1); if(cond.empty()||cond[0] != '%'){ error_code(r,*n,"E1001","if cond must be %var","prefix condition with %"); r.success=false; continue; } auto ct=get_var(cond.substr(1)); if(ct!=(TypeId)-1){ const Type& T=ctx_.at(ct); if(!(T.kind==Type::Kind::Base && T.base==BaseType::I1)){ error_code(r,*n,"E1002","if cond must be i1","use boolean (i1) value"); r.success=false; } }
+        // Recursive descent into branches first
+        if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) check_instruction_list(r, std::get<vector_t>(il[2]->data).elems, fn, loop_depth);
+        if(il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data)) check_instruction_list(r, std::get<vector_t>(il[3]->data).elems, fn, loop_depth);
+        // If-chain assignment unification: ensure a nested chain of ifs assigns consistently to one destination (common in lowered rif chains)
+        auto collect_assign_dst = [&](const std::vector<node_ptr>& vec, std::string& dstOut, bool& bad, auto&& self)->void {
+            for(auto &cn : vec){ if(!cn || !std::holds_alternative<list>(cn->data)) continue; auto &cl = std::get<list>(cn->data).elems; if(cl.empty()||!std::holds_alternative<symbol>(cl[0]->data)) continue; std::string cop = std::get<symbol>(cl[0]->data).name; if(cop=="assign"){ if(cl.size()>=3 && std::holds_alternative<symbol>(cl[1]->data)){ std::string d = std::get<symbol>(cl[1]->data).name; if(dstOut.empty()) dstOut=d; else if(dstOut!=d){ bad=true; return; } } }
+                // Tail-nested chain pattern: else branch vector beginning with single if; detect by looking for solitary if as first inst
+                if(cop=="if"){ // nested if inside branch body (not common but guard)
+                    // Recurse into its then/else vectors only for assignment destination tracking (avoid full re-check)
+                    if(cl.size()>=3 && std::holds_alternative<vector_t>(cl[2]->data)) self(std::get<vector_t>(cl[2]->data).elems, dstOut, bad, self);
+                    if(bad) return;
+                    if(cl.size()>=4 && std::holds_alternative<vector_t>(cl[3]->data)) self(std::get<vector_t>(cl[3]->data).elems, dstOut, bad, self);
+                    if(bad) return;
+                }
+            }
+        };
+        std::string chainDst; bool inconsistent=false;
+        if(il.size()>=3 && std::holds_alternative<vector_t>(il[2]->data)) collect_assign_dst(std::get<vector_t>(il[2]->data).elems, chainDst, inconsistent, collect_assign_dst);
+        if(!inconsistent && il.size()>=4 && std::holds_alternative<vector_t>(il[3]->data)) collect_assign_dst(std::get<vector_t>(il[3]->data).elems, chainDst, inconsistent, collect_assign_dst);
+        if(inconsistent){ error_code(r,*n,"E1108","if-chain assigns different destinations","ensure all branches assign the same %var or separate chains"); r.success=false; }
+        continue; }
     if(op=="try"){ // (try :body [ ... ] :catch [ ... ])
         node_ptr bodyNode=nullptr, catchNode=nullptr; bool haveBody=false, haveCatch=false;
         for(size_t i=1;i<il.size(); ++i){ if(!il[i] || !std::holds_alternative<keyword>(il[i]->data)) break; std::string kw=std::get<keyword>(il[i]->data).name; if(++i>=il.size()) break; auto val=il[i];
@@ -895,9 +940,10 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
         auto apt=get_var(ap.substr(1)); if(apt==(TypeId)-1){ error_code(r,*n,"E1368","va-end arity","va-list undefined"); r.success=false; }
         continue; }
     error(r,*n,"unknown instruction"); r.success=false; }
-}
-// (removed stray extra brace that previously closed namespace early)
-inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_sums(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); 
+    } // end inner for
+    } // end check_instruction_list
+    // (removed stray extra brace that previously closed namespace early)
+    inline TypeCheckResult TypeChecker::check_module(const node_ptr& m){ TypeCheckResult res{true,{},{}}; if(!m||!std::holds_alternative<list>(m->data)){ res.success=false; res.errors.push_back(TypeError{"EMOD1","module not list","",-1,-1,{}}); return res; } auto &l=std::get<list>(m->data).elems; if(l.empty()||!std::holds_alternative<symbol>(l[0]->data) || std::get<symbol>(l[0]->data).name!="module"){ res.success=false; res.errors.push_back(TypeError{"EMOD2","expected (module ...)","start file with (module ...)",-1,-1,{}}); return res; } reset(); collect_typedefs(res,l); collect_enums(res,l); collect_structs(res,l); collect_unions(res,l); collect_sums(res,l); collect_globals(res,l); collect_functions_headers(res,l); if(res.success) check_functions(res,l); 
     // Emit lints for unused globals (W1405) unless disabled
     if(const char* lintEnv = std::getenv("EDN_LINT")){ if(lintEnv[0]=='0') return res; }
     {
