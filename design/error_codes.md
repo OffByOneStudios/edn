@@ -494,5 +494,23 @@ Form: `(try :body [ ... ] :catch [ ... ])` – minimal catch‑all support initi
 | E1452 | try :catch must be vector    | `:catch` present but not a vector                         | wrap catch ops in `[ ... ]` |
 | E1453 | try missing :catch           | `:catch` section absent                                   | add `:catch [ ... ]` |
 
+### E145x (continued) – Tuple Patterns (Destructuring)
+Upcoming tuple/struct-like pattern support for `let (a,b)=...` and match arms introduces dedicated diagnostics; grouped in the same numeric band for nearby control-flow/data shape validations.
+
+| Code  | Title                          | Condition / When Emitted                                 | Hint |
+|-------|--------------------------------|-----------------------------------------------------------|------|
+| E1454 | tuple pattern arity mismatch   | Pattern element count != underlying tuple arity          | adjust pattern to `(e0 ... eN)` matching tuple size |
+| E1455 | tuple pattern non-tuple target | Applying tuple pattern to value whose type isn't a tuple | ensure initializer / scrutinee is a tuple value |
+
+### E145x (future) – Struct / Nested Pattern Extensions (Reserved)
+Codes below are provisional reservations to avoid collisions while implementing remaining destructuring phases (see EDN-0014).
+| Code  | Title (Proposed)                     | When / Condition (Planned)                               | Hint / Notes |
+|-------|--------------------------------------|----------------------------------------------------------|-------------|
+| E1456 | struct pattern unknown field         | Field name not present in struct during pattern expand   | check field or struct definition (may reuse E0803 instead) |
+| E1457 | struct pattern duplicate field       | Same field listed twice in a single struct pattern       | remove duplicate field entry |
+| E1458 | struct pattern invalid `..` usage    | `..` repeated or not last element                        | place single `..` at end only |
+| E1459 | struct pattern non-struct target     | Applying struct pattern to non-struct value              | ensure value is struct of expected type (may reuse E0805) |
+| E145A | duplicate binding in pattern         | Two bindings in one pattern share same identifier        | rename one binding / use `_` if discard |
+
 Reachability and lints:
 - The lints analyzer treats try/catch as reachable if either body or catch can reach a terminator.

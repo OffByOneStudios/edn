@@ -96,14 +96,18 @@ endif()
 
 # Phase 5 tests
 file(GLOB PHASE5_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/phase5_*.cpp")
+# Add explicitly maintained rustlite feature tests (not phase-prefixed) here.
+list(APPEND PHASE5_SOURCES
+)
 if(NOT EDN_BUILD_GTESTS)
 	# If gtests are disabled, exclude files that require GoogleTest headers/macros
 	list(FILTER PHASE5_SOURCES EXCLUDE REGEX ".*/phase5_complex_lowering_gtest\\.cpp$")
 	list(FILTER PHASE5_SOURCES EXCLUDE REGEX ".*/phase5_complex_lowering_regression\\.cpp$")
 endif()
 if(EDN_BUILD_TESTS_PHASE5)
-add_executable(edn_tests_phase5 ${PHASE5_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase5_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/test_env.cpp)
-target_link_libraries(edn_tests_phase5 PRIVATE edn)
+add_executable(edn_tests_phase5 ${PHASE5_SOURCES} ${CMAKE_CURRENT_SOURCE_DIR}/phase5_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/test_env.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(edn_tests_phase5 PRIVATE edn rustlite)
+target_include_directories(edn_tests_phase5 PRIVATE ${CMAKE_SOURCE_DIR}/languages/rustlite/include)
 if(EDN_BUILD_GTESTS)
 	message(STATUS "Phase5: adding GTest::gtest to edn_tests_phase5 (sources=${PHASE5_SOURCES})")
 	target_link_libraries(edn_tests_phase5 PRIVATE GTest::gtest)

@@ -116,7 +116,7 @@ Then branch into parallelizable P1 items.
 ### Implementation Progress (Rolling)
 | Order | Feature(s) | Status | Notes / Next Steps |
 |-------|------------|--------|--------------------|
-| 1 | Destructuring (2) | Not started | Will introduce tuple pattern lowering + arity mismatch E-code. |
+| 1 | Destructuring (2) | Partial (Phase 1 done) | Tuple let tuple-patterns implemented (lowering via `tget` cluster → `member`); match tuple pattern diagnostics (E1454 arity mismatch, E1455 non-tuple) plus over-arity detection (highest index scan) landed with positive + three negative drivers (arity mismatch, non-tuple, over-arity, gapped). Remaining: match arm pattern lowering proper (arm-scoped prologue emission), struct patterns, nested patterns, `_` discard, duplicate-binding diag, ordering/gap robustness tests (non-dense suppression locked in), finalize over-arity vs per-index OOB precedence (current: single E1454). |
 | 2 | while/if let (20/21) | Complete | Macros (`rif-let`, `rwhile-let`) implemented; negative tests for missing / type mismatch / variant mismatch (E1421/E1422/E1423/E1405) and undefined :value symbol (E1421) landed. |
 | 3 | loop-with-value (19) | Complete | `rloop-val` macro validated. Test matrix: break with value, plain break (retain zero-init), no break body, multi break (first wins), negative type mismatch (E1107). |
 | 4 | Type alias (7) | Complete | Positive + negatives (E1330–E1333) plus cycle (self-ref) and sum shadow tests landed (E1333/E1401). |
@@ -127,7 +127,34 @@ Then branch into parallelizable P1 items.
 | 9 | Modules + pub (31/32) | Pending | Namespace + export retention design TBD. |
 | 10 | Exhaustiveness + duplicate arm (35/36) | Pending | Exhaustiveness algorithm + structural pattern hash for duplicate detection. |
 
-Progress summary (current cycle): Completed if/while-let negatives (E1405, E1421–E1423); type alias suite incl. cycle + shadow; began generics/bounds planning. Fixed compound assignment RHS literal trimming regression (shift operators) – numeric literal now preserved (removed spurious zero const). Removed temporary debug logging and legacy unordered_set include from parser.
+Progress summary (current cycle): Completed if/while-let negatives (E1405, E1421–E1423); type alias suite incl. cycle + shadow; began generics/bounds planning. Fixed compound assignment RHS literal trimming regression (shift operators) – numeric literal now preserved (removed spurious zero const). Removed temporary debug logging and legacy unordered_set include from parser. Implemented tuple pattern over-arity detection (meta + backward scan over `tget`/`member`) and added over-arity negative driver; gapped pattern driver asserts no false positives.
+
+### Recent Progress Log (2025-09-01)
+Tuple match literal guard lowering stabilized:
+* Fixed arm body block scanning depth bug preventing multi-arm tuple match lowering emission (previously `ok=0` abort).
+* Added per-arm cluster emission (already present) now verified by new dedicated test `rustlite_tuple_match_literal_guard_test`.
+* Adjusted guard lowering to accept post-expansion nested `(if ...)` chain in addition to planned `(rif ...)` macros; test now tolerant to either form pending future rif canonicalization.
+* Test assertions strengthened: require 3 `(tuple-pattern-meta ...)` entries (one per arm), at least two guard comparisons `(eq ...)`, and conditional chain length >=2 (rif or nested ifs).
+* Removed all temporary debug instrumentation (match arm summaries, IR dumps) after green test run; kept match RHS rescan logic (now without debug print).
+* Remaining cleanup: eliminate minor parser warnings (unused `braceStart`/`sawMatchWord` shadow remnants) in a follow-up patch once match RHS capture refactored into utility.
+Next steps:
+* Integrate type checker awareness for `tget`, `tuple-pattern-meta`, and `tuple-match-arms-count` so test can re-enable full type checking path.
+* Introduce lazy cluster emission optimization (skip extraction for arms made unreachable by earlier literal guards).
+* Extend guard support (variable equality + simple relational ops) and add corresponding positive/negative tests.
+
+### Recent Progress Log (2025-08-31)
+Tuple pattern & match infrastructure advances:
+* Implemented multi-arm tuple match lowering: parser now emits per-arm extraction clusters (`tget` + `(tuple-pattern-meta ...)`) followed by synthesized guard predicates and a reversed `rif` chain selecting the first satisfied arm. Destination is pre-zero-initialized; each taken arm assigns final value.
+* Added literal element guard generation: integer literals in arm patterns generate `(const)` + `(rcall eq)` predicates, combined via `(rcall band)` for conjunction. Unconditional arms receive a synthesized true const `(const %c i1 1)`.
+* Introduced chain terminator pattern (empty `[]`) for final `:else` in `rif` chain enabling simple linearization.
+* Added tuple pattern over-arity detection (meta path + backward scan) and drivers:
+	- `rustlite_match_tuple_over_arity_negdriver` (E1454 on highest out-of-range index)
+	- `rustlite_match_tuple_gapped_driver` (asserts no E1454/E1455 for non-dense indices)
+* Began guard-focused positive test (`rustlite_tuple_match_literal_guard_test`) validating lowering + type check (currently placeholder assertions; IR structure verification TODO).
+Deferred / upcoming:
+* Lazy extraction: only emit cluster for arms reachable given preceding guards (current implementation eagerly emits all clusters).
+* Extend guards beyond integer equality (planned: variable equality, simple relational ops, future boolean expression embedding).
+* Parser warning cleanup (unused `inclusive` flag) scheduled post guard generalization.
 
 ### Recent Progress Log (2025-08-29)
 Added after parser/lowering stabilization work in active debugging session.
@@ -194,7 +221,114 @@ Pending / planned negative (and a few edge positive) tests to ensure every lower
 - [ ] Unused bound variable warning (future when unused-variable lint lands) – placeholder.
 
 ### Match / Pattern Infrastructure (prep for destructuring)
-- [ ] Tuple pattern arity mismatch (once destructuring implemented) – new E-code.
+- [x] Tuple pattern arity mismatch – E1454 (implemented in expansion; negative driver added).
+- [x] Tuple pattern non-tuple target – E1455 (implemented; negative driver added).
+- [ ] Match arm tuple pattern lowering (emits same `tget` cluster per arm) – add positive + E1454/E1455 negatives.
+- [ ] Struct pattern destructuring (let & match) – field name mapping; unknown field / missing field diagnostics (new E-codes TBD).
+- [ ] Nested tuple patterns (e.g. `let (a,(b,c)) = ...`) – recursive cluster emission plan & tests.
+- [ ] Placeholder `_` bindings (skip variable introduction) – ensure not emitted as `tget %_` and adjust clustering logic.
+- [ ] Duplicate binding names in a single pattern – new diagnostic (reuses existing redefinition code path or new E-code TBD).
+- [ ] Out-of-order / gapped indices should NOT trigger tuple pattern diagnostics (add negative test to assert suppression).
+- [x] Over-arity pattern producing out-of-range `tget` indices: decided to emit single aggregate E1454 (highest index +1) instead of per-index OOB; implemented meta and backward scan; tests added (over-arity & gapped). Follow-up: ensure future per-index OOB diagnostics suppressed when part of recognized pattern cluster.
+
+### Destructuring Remaining Gaps (Detail)
+Phase 1 delivered only tuple destructuring for `let` statements. The following remain to fully satisfy roadmap item (2):
+1. Match arm tuple patterns: Parser support to emit clustered `tget` sequences inside arm prologue prior to arm body lowering.
+2. Struct patterns: Syntax draft (Rust-like `StructName { a, b: alias, .. }`) and lowering to `member` reads; decide on support for `..` rest (likely defer to P1/P2).
+3. Nesting: Recursive descent to flatten nested tuples into ordered `tget` emission while preserving binding order.
+4. Placeholder `_`: Skip binding emission & exclude from cluster size (affects arity mismatch logic—need to count underscores as elements for arity check while not generating destinations).
+5. Duplicate names: Detect and emit dedicated diagnostic before expansion; pick code range (suggest E1456+) or reuse existing redefinition path with clearer message.
+6. Index ordering robustness: Add tests ensuring non-dense or out-of-order manual `tget` sequences do not spuriously emit E1454/E1455 (current heuristic suppresses but untested).
+7. Over-arity semantics: Decide precedence between per-index out-of-range diagnostic vs aggregate arity mismatch; may emit both or prefer aggregate.
+8. Struct pattern partial / missing fields: Plan diagnostics for omitted mandatory fields vs use of a rest pattern (if adopted).
+9. Exhaustiveness integration: Ensure tuple/struct patterns participate in future duplicate arm & exhaustiveness passes (features 35/36).
+10. Documentation: Expand RUSTLITE.md once match/struct patterns land; current section documents only tuple let patterns.
+\n+### Draft Pattern Syntax (Proposal)
+Status: Working draft. Adjust before parser implementation.
+\n+#### Tuple Patterns in Match Arms
+Surface:
+```
+match v {
+	(x, y) => expr1,
+	(a, _, c) => expr2,
+}
+```
+Lowering (arm prologue): bind scrutinee `%scrut`; emit dense `tget` for non-`_` entries preserving index order. `_` counts toward arity but produces no SSA var (implementation may temporarily emit a throwaway `%_ignoreN`). Reuse E1454/E1455.
+\n+#### Struct Patterns
+Let:
+```
+let Point { x, y } = p;
+let Rect { width: w, height, .. } = r;
+```
+Match:
+```
+match p { Point { x, y } => expr, _ => expr2 }
+```
+Grammar sketch:
+```
+StructPattern := Ident '{' FieldPatList [ ',' RestPat ] '}'
+FieldPat      := Ident (':' Ident)?
+RestPat       := '..'
+```
+Diagnostics (proposed): unknown field (reuse E0803 or new E1456), duplicate field (E1457), bad/misplaced `..` (E1458), non-struct target (reuse E0805 or E1459). Rest currently ignored (no binding) in Phase 1.
+\n+#### Nested Patterns
+Example: `let (a, (b, c), Point { x, .. }) = value;`
+Option A (flatten): only emit leaf `tget` ops sequentially for all tuple leaves; record mapping for diagnostics.
+Option B (recursive): emit intermediate `tget` temps then descend. Start with flatten (simpler clustering) then revisit.
+\n+#### Placeholder `_`
+Counts for arity; no binding; unlimited occurrences. Implementation path: emit dummy vars initially, later teach cluster logic to accept sparse-with-placeholders metadata.
+\n+#### Duplicate Bindings
+Detect during parse before lowering. Reserve E145A (or sequential after final chosen). Avoid generating conflicting SSA definitions.
+\n+#### Out-of-Order / Gapped Indices
+Ensure user-authored non-dense `tget` sequences don’t trigger pattern diagnostics; add negative test to lock in suppression.
+\n+#### Over-Arity Handling
+Prefer single E1454 over multiple index OOB diagnostics; suppress per-index error when cluster recognized as pattern with > arity elements.
+\n+#### New E-Code Reservation Table (tentative)
+| Code  | Purpose                          | Reuse Option |
+|-------|----------------------------------|--------------|
+| E1456 | Struct pattern unknown field     | could reuse E0803 |
+| E1457 | Struct pattern duplicate field   | new |
+| E1458 | Struct pattern bad `..` usage    | new |
+| E1459 | Struct pattern non-struct target | could reuse E0805 |
+| E145A | Duplicate binding in one pattern | new |
+\n+#### Parser Pseudocode Sketch
+```
+parsePattern():
+	if '(' -> parseTuplePattern()
+	if Ident then lookahead '{' -> parseStructPattern()
+	if '_' -> Placeholder
+	else Ident -> Binding(name)
+```
+\n+#### Lowering Outline
+```
+lowerLetPattern(p, val):
+	if Tuple: for each element i:
+		if Placeholder continue
+		emit (tget %dest Ty val i)
+		recurse if nested
+	if Struct: for each field:
+		emit (member %dest Struct val field)
+```
+\n+#### Test Matrix Additions
+| Case | Expect |
+|------|--------|
+| `(a, b)` vs `__Tuple2` | success |
+| `(a, b)` vs `__Tuple3` | E1454 |
+| `(a, b, c, d)` vs `__Tuple3` | E1454 only |
+| `(a, _, c)` | skip middle binding |
+| `(a, a)` | duplicate binding diag |
+| `Point { x, y }` | two member ops |
+| `Point { z }` | unknown field diag |
+| `Point { x, x }` | duplicate field diag |
+| `Point { .., x }` | misplaced `..` diag |
+| Nested `(a,(b,c))` | flattened leaf ops |
+\n+#### Phasing
+Phase 2a: Match arm tuple patterns.
+Phase 2b: Struct patterns.
+Phase 2c: `_` + duplicate binding diagnostics.
+Phase 2d: Nesting + over-arity suppression.
+Phase 2e: Finalize codes & docs.
+
 - [ ] Duplicate match arm structurally identical (after feature 36) – new E-code.
 - [ ] Non-exhaustive match without wildcard or all variants (after feature 35) – existing/new E-code.
 

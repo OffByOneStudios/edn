@@ -339,6 +339,51 @@ Access:
 
 Static out-of-range indices abort macro expansion (will surface as diagnostic E1601 once mapped). Maximum supported arity: 16.
 
+#### Tuple Destructuring (`let (a,b,...) = %t`)
+
+The surface pattern form allows unpacking a tuple into freshly bound symbols:
+
+```
+let (a,b,c) = %t;
+```
+
+Lowering pipeline:
+
+1. Parser detects a tuple pattern on the LHS of a `let` binding and emits a *cluster* of synthetic `tget` ops in index order 0..N-1:
+  ```
+  (tget %a <TyA> %t 0) (tget %b <TyB> %t 1) (tget %c <TyC> %t 2)
+  ```
+  Types (`<TyA>` etc.) are inferred from the tuple value when possible (same heuristic as tuple literal field inference) or fall back to `i32` placeholders.
+2. Macro expansion rewrites each `(tget ...)` into `(member ...)` against the synthesized struct backing the tuple (`__TupleN` with fields `_0 .. _{N-1}`):
+  ```
+  (member %a __Tuple3 %t _0) ...
+  ```
+3. A scan in the Rustlite expansion phase groups consecutive `tget` (pre-rewrite) or `member` (post-rewrite) instructions that:
+  - Share the same source tuple variable `%t`
+  - Cover a dense, zero-based index/field sequence `_0 .. _{k-1}` with no gaps
+  - Appear contiguously (no unrelated instructions between them)
+
+Diagnostics (emitted as generic module metadata entries):
+
+| Code  | Condition | Message Sketch |
+|-------|-----------|----------------|
+| E1454 | Pattern arity mismatch | Pattern variable count != tuple arity (e.g. `let (a,b) = %t;` where `%t` is `__Tuple3`) |
+| E1455 | Non-tuple target       | Pattern applied to value not recognized as a tuple (`__TupleN`) |
+
+Heuristic notes:
+- Overlapping or interleaved access sequences are each evaluated independently; only perfectly dense, ordered clusters are treated as a destructuring pattern site.
+- An out-of-order index (e.g. requesting index `2` before `1`) breaks clustering and suppresses pattern diagnostics (future enhancement may relax this if needed).
+- Because detection happens in expansion, the TypeChecker no longer duplicates these errors—test drivers assert only on expansion metadata.
+
+Example end-to-end:
+
+```
+(tuple %t [ %x %y %z ])
+let (a,b,c) = %t; ; parser -> tget cluster -> expansion -> member cluster
+```
+
+See `rustlite_tuple_destructure_*_driver.cpp` tool sources for runnable examples (positive, arity mismatch, non-tuple cases).
+
 ### Arrays (`arr`, legacy `rarray` numeric size)
 
 `arr` lowers directly to a core array literal form:

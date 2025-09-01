@@ -334,6 +334,145 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
     if(expanded && std::holds_alternative<list>(expanded->data)){
         auto &modList = std::get<list>(expanded->data);
         if(!modList.elems.empty() && std::holds_alternative<symbol>(modList.elems[0]->data) && std::get<symbol>(modList.elems[0]->data).name=="module"){
+            // --- Tuple pattern diagnostics (E1454/E1455) ---
+            // We approximate a tuple pattern destructure as a contiguous cluster of (tget %dst <Ty> %tuple <idx>)
+            // instructions with ascending <idx> starting at 0 emitted immediately after the let pattern.
+            // We validate that:
+            //  1. The source tuple variable has a recorded arity; if not -> E1455 (non-tuple target).
+            //  2. The number of contiguous indices equals the recorded arity; if not -> E1454 (arity mismatch).
+            // Limitations (acceptable for Phase 1):
+            //  * Only clusters where each tget uses the same %tuple symbol and indices are dense from 0..k-1.
+            //  * Stops cluster when encountering a gap, different tuple var, or non-tget instruction.
+            auto emit_tuple_pattern_generic_error = [&](node_ptr headNode, const std::string& code, const std::string& msg){
+                // Reuse generic-error metadata channel to surface diagnostics in type checker (similar to generics errors).
+                if(!headNode || !std::holds_alternative<symbol>(headNode->data)) return;
+                auto metaNode = rl_make_sym(code+":"+msg);
+                headNode->metadata["generic-error-"+code+"-"+std::to_string(headNode->metadata.size())] = metaNode;
+            };
+            if(!modList.elems.empty()){
+                node_ptr moduleHead = modList.elems[0];
+                // Walk function bodies to find clusters.
+                for(auto &top : modList.elems){
+                    if(!top || !std::holds_alternative<list>(top->data)) continue;
+                    auto &fnL = std::get<list>(top->data).elems; if(fnL.empty() || !std::holds_alternative<symbol>(fnL[0]->data)) continue;
+                    std::string head = std::get<symbol>(fnL[0]->data).name; if(head!="fn" && head!="rfn") continue;
+                    // locate :body vector
+                    node_ptr bodyVec=nullptr; for(size_t i=1;i+1<fnL.size(); i+=2){ if(!std::holds_alternative<keyword>(fnL[i]->data)) break; if(std::get<keyword>(fnL[i]->data).name=="body") { bodyVec=fnL[i+1]; break; } }
+                    if(!bodyVec || !std::holds_alternative<vector_t>(bodyVec->data)) continue; auto &instrs = std::get<vector_t>(bodyVec->data).elems;
+                    for(size_t i=0;i<instrs.size(); ++i){
+                        auto &inst = instrs[i]; if(!inst || !std::holds_alternative<list>(inst->data)) continue;
+                        // Fast-path: explicit meta emitted by parser: (tuple-pattern-meta %var expectedCount)
+                        {
+                            auto &Lmeta = std::get<list>(inst->data).elems;
+                            if(Lmeta.size()==3 && std::holds_alternative<symbol>(Lmeta[0]->data) && std::get<symbol>(Lmeta[0]->data).name=="tuple-pattern-meta"){
+                                if(std::holds_alternative<symbol>(Lmeta[1]->data) && std::holds_alternative<int64_t>(Lmeta[2]->data)){
+                                    std::string tup = std::get<symbol>(Lmeta[1]->data).name; size_t expected = (size_t)std::get<int64_t>(Lmeta[2]->data);
+                                    size_t recorded=0; bool have=false; if(!tup.empty() && tup[0]=='%'){ auto itA=macroCtx->tupleVarArity.find(tup.substr(1)); if(itA!=macroCtx->tupleVarArity.end()){ recorded=itA->second; have=true; } }
+                                    if(!have){ emit_tuple_pattern_generic_error(moduleHead, "E1455", "tuple pattern target not tuple"); }
+                                    else if(recorded != expected){ emit_tuple_pattern_generic_error(moduleHead, "E1454", "tuple pattern arity mismatch expected"+std::to_string(recorded)+" got"+std::to_string(expected)); }
+                                    else {
+                                        // Over-arity detection (Phase 2a meta path): scan preceding contiguous pattern extraction
+                                        // instructions (either lowered (member %dst __TupleN %tup _idx) or unreduced
+                                        // (tget %dst Ty %tup idx)) to find the highest referenced index.
+                                        // We walk backwards until a non-matching instruction is found.
+                                        size_t highestIndexPlusOne = 0; bool any=false; size_t bi = i; // meta at instrs[i]
+                                        while(bi>0){
+                                            size_t prev = bi-1; auto &pinst = instrs[prev];
+                                            if(!pinst || !std::holds_alternative<list>(pinst->data)) break;
+                                            auto &PL = std::get<list>(pinst->data).elems; if(PL.size()!=5) break;
+                                            if(!std::holds_alternative<symbol>(PL[0]->data)) break;
+                                            std::string op = std::get<symbol>(PL[0]->data).name;
+                                            if(op=="tget"){
+                                                if(!std::holds_alternative<symbol>(PL[3]->data) || std::get<symbol>(PL[3]->data).name!=tup) break;
+                                                if(!std::holds_alternative<int64_t>(PL[4]->data)) break;
+                                                int64_t idx = std::get<int64_t>(PL[4]->data); if(idx<0) break; any=true; if((size_t)idx+1>highestIndexPlusOne) highestIndexPlusOne=(size_t)idx+1; bi = prev; continue;
+                                            } else if(op=="member"){
+                                                // (member %dst __TupleN %tup _idx)
+                                                if(!std::holds_alternative<symbol>(PL[2]->data)) break; // struct name
+                                                if(!std::holds_alternative<symbol>(PL[3]->data) || std::get<symbol>(PL[3]->data).name!=tup) break; // tuple var
+                                                if(!std::holds_alternative<symbol>(PL[4]->data)) break; // field symbol _k
+                                                std::string field = std::get<symbol>(PL[4]->data).name; if(field.size()<2 || field[0] != '_') break;
+                                                try {
+                                                    size_t idx = (size_t)std::stoul(field.substr(1)); any=true; if(idx+1>highestIndexPlusOne) highestIndexPlusOne = idx+1; bi = prev; continue; }
+                                                catch(...){ break; }
+                                            } else {
+                                                break; // other op => stop
+                                            }
+                                        }
+                                        if(any && highestIndexPlusOne>recorded){
+                                            emit_tuple_pattern_generic_error(moduleHead, "E1454", "tuple pattern arity mismatch expected"+std::to_string(recorded)+" got"+std::to_string(highestIndexPlusOne));
+                                        }
+                                    }
+                                    continue; // do not treat meta as cluster start
+                                }
+                            }
+                        }
+                        auto &L = std::get<list>(inst->data).elems; if(L.size()!=5) continue;
+                        if(!std::holds_alternative<symbol>(L[0]->data)) continue;
+                        if(std::get<symbol>(L[0]->data).name!="tget") continue;
+                        // Potential start of cluster: require index literal 0.
+                        if(!std::holds_alternative<int64_t>(L[4]->data) || std::get<int64_t>(L[4]->data)!=0) continue;
+                        if(!std::holds_alternative<symbol>(L[3]->data)) continue; std::string tupleSym = std::get<symbol>(L[3]->data).name; if(tupleSym.empty()||tupleSym[0] != '%') continue;
+                        // Gather cluster
+                        size_t clusterCount=0; size_t j=i; bool indicesDense=true; while(j<instrs.size()){
+                            auto &inst2 = instrs[j]; if(!inst2 || !std::holds_alternative<list>(inst2->data)) break; auto &L2 = std::get<list>(inst2->data).elems; if(L2.size()!=5) break; if(!std::holds_alternative<symbol>(L2[0]->data) || std::get<symbol>(L2[0]->data).name!="tget") break; if(!std::holds_alternative<symbol>(L2[3]->data) || std::get<symbol>(L2[3]->data).name!=tupleSym) break; if(!std::holds_alternative<int64_t>(L2[4]->data)) break; int64_t idx = std::get<int64_t>(L2[4]->data); if(idx!=(int64_t)clusterCount){ indicesDense=false; break; } ++clusterCount; ++j; }
+                        if(clusterCount==0 || !indicesDense) continue; // not a valid pattern cluster
+                        // Lookup recorded arity.
+                        size_t recorded = 0; bool haveArity=false; auto itA = macroCtx->tupleVarArity.find(tupleSym.substr(1)); if(itA!=macroCtx->tupleVarArity.end()){ recorded = itA->second; haveArity=true; }
+                        if(!haveArity){ emit_tuple_pattern_generic_error(moduleHead, "E1455", "tuple pattern target not tuple"); continue; }
+                        if(recorded != clusterCount){ emit_tuple_pattern_generic_error(moduleHead, "E1454", "tuple pattern arity mismatch expected"+std::to_string(recorded)+" got"+std::to_string(clusterCount)); }
+                        // Advance i past cluster to avoid re-processing
+                        i += clusterCount-1;
+                    }
+                    // Secondary pattern: after macro rewrite, (tget ...) become (member %dst __TupleN %tup _idx).
+                    // If a user destructures fewer fields than the tuple arity, we only see the emitted members.
+                    // Detect clusters of member ops with struct name __TupleN, starting at field _0 with dense _0.._k-1.
+                    for(size_t mi=0; mi<instrs.size(); ++mi){
+                        auto &mInst = instrs[mi]; if(!mInst || !std::holds_alternative<list>(mInst->data)) continue; auto &ML = std::get<list>(mInst->data).elems; if(ML.size()!=5) continue;
+                        if(!std::holds_alternative<symbol>(ML[0]->data) || std::get<symbol>(ML[0]->data).name!="member") continue;
+                        if(!std::holds_alternative<symbol>(ML[2]->data)) continue; std::string structName = std::get<symbol>(ML[2]->data).name; if(structName.rfind("__Tuple",0)!=0) continue;
+                        if(!std::holds_alternative<symbol>(ML[4]->data) || std::get<symbol>(ML[4]->data).name!="_0") continue; // start of potential cluster
+                        // Parse arity from struct name
+                        size_t tupleAr=0; try { tupleAr = (size_t)std::stoul(structName.substr(7)); } catch(...) { continue; }
+                        if(tupleAr==0) continue;
+                        if(!std::holds_alternative<symbol>(ML[3]->data)) continue; std::string baseTup = std::get<symbol>(ML[3]->data).name; // %t
+                        size_t cLen=0; size_t j=mi; bool dense=true; while(j<instrs.size()){
+                            auto &mn = instrs[j]; if(!mn || !std::holds_alternative<list>(mn->data)) break; auto &L2 = std::get<list>(mn->data).elems; if(L2.size()!=5) break;
+                            if(!std::holds_alternative<symbol>(L2[0]->data) || std::get<symbol>(L2[0]->data).name!="member") break;
+                            if(!std::holds_alternative<symbol>(L2[2]->data) || std::get<symbol>(L2[2]->data).name!=structName) break;
+                            if(!std::holds_alternative<symbol>(L2[3]->data) || std::get<symbol>(L2[3]->data).name!=baseTup) break;
+                            if(!std::holds_alternative<symbol>(L2[4]->data)) break; std::string field = std::get<symbol>(L2[4]->data).name;
+                            std::string want = std::string("_")+std::to_string(cLen); if(field!=want){ dense=false; break; }
+                            ++cLen; ++j; }
+                        if(cLen>0 && cLen<tupleAr && dense){
+                            // Arity mismatch: fewer bound fields than tuple arity.
+                            emit_tuple_pattern_generic_error(moduleHead, "E1454", "tuple pattern arity mismatch expected"+std::to_string(tupleAr)+" got"+std::to_string(cLen));
+                            mi += cLen-1; // skip cluster
+                            continue;
+                        }
+                        if(cLen==tupleAr && dense){
+                            // Potential over-arity: look ahead for stray unreduced (tget ...) referencing same tuple with index >= tupleAr
+                            size_t overMax = tupleAr; // one past last valid index seen
+                            size_t look = mi + cLen; bool foundExtra=false;
+                            while(look < instrs.size()){
+                                auto &n2 = instrs[look]; if(!n2 || !std::holds_alternative<list>(n2->data)) break; auto &L2 = std::get<list>(n2->data).elems;
+                                if(L2.size()==5 && std::holds_alternative<symbol>(L2[0]->data) && std::get<symbol>(L2[0]->data).name=="tget"){
+                                    if(std::holds_alternative<symbol>(L2[3]->data) && std::get<symbol>(L2[3]->data).name==baseTup && std::holds_alternative<int64_t>(L2[4]->data)){
+                                        int64_t idx = std::get<int64_t>(L2[4]->data); if(idx >= (int64_t)tupleAr){
+                                            foundExtra = true; if((size_t)(idx+1) > overMax) overMax = (size_t)(idx+1); ++look; continue; }
+                                    }
+                                }
+                                break; // stop scan on first non-extra
+                            }
+                            if(foundExtra){
+                                emit_tuple_pattern_generic_error(moduleHead, "E1454", "tuple pattern arity mismatch expected"+std::to_string(tupleAr)+" got"+std::to_string(overMax));
+                                mi = look-1; // advance past extras
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             // First pass: infer field types per arity
             std::unordered_map<size_t, std::vector<node_ptr>> inferred;
             std::unordered_map<size_t, std::vector<bool>> complete;
@@ -375,7 +514,7 @@ edn::node_ptr expand_rustlite(const edn::node_ptr& module_ast){
                     if(std::get<symbol>(L[0]->data).name!="struct-lit") continue;
                     if(!std::holds_alternative<symbol>(L[2]->data)) continue;
                     std::string sname = std::get<symbol>(L[2]->data).name; if(sname.rfind("__Tuple",0)!=0) continue;
-                    size_t arity = 0; try { arity = (size_t)std::stoul(sname.substr(8)); } catch(...) { continue; }
+                    size_t arity = 0; try { arity = (size_t)std::stoul(sname.substr(7)); } catch(...) { continue; }
                     if(!macroCtx->tupleArities.count(arity)) continue;
                     if(!std::holds_alternative<vector_t>(L[3]->data)) continue; auto &fields = std::get<vector_t>(L[3]->data).elems;
                     // fields vector pattern: _0 %a _1 %b ... pairs

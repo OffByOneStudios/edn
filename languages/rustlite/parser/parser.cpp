@@ -1,7 +1,8 @@
 #include "parser.hpp"
 #include <tao/pegtl.hpp>
 #include <sstream>
-// Removed legacy unordered_set usage and temporary debug logging.
+#include <unordered_set>
+// Added unordered_set include for primitive_ops set.
 using namespace tao::pegtl;
 
 namespace rustlite {
@@ -356,14 +357,116 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
             }
             Arm arm; arm.variant=variant; arm.binds = std::move(binds); arm.bodyInsts = std::move(bodyInsts); arm.valueSym = bodyPair.second; arms.push_back(std::move(arm));
         }
-        if(ok && arms.size() >= 2){
+    if(ok && arms.size() >= 2){
             auto dst = fn.gensym("ematch");
             auto serialize_vec = [](const std::vector<std::string>& v){ std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : v){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; return bv.str(); };
-            std::ostringstream armsVec; armsVec << "["; for(size_t ai=0; ai<arms.size(); ++ai){ const auto& A=arms[ai]; if(ai>0) armsVec << ' '; std::ostringstream armO; armO << "(arm " << A.variant; if(!A.binds.empty()){ armO << " :binds ["; for(size_t bi=0; bi<A.binds.size(); ++bi){ if(bi>0) armO << ' '; armO << A.binds[bi]; } armO << "]"; } armO << " :body " << serialize_vec(A.bodyInsts) << ")"; armsVec << armO.str(); } armsVec << "]";
-            std::ostringstream em; em << "(ematch " << dst << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn.sink().push_back(em.str()); return {"i32", dst};
+            std::ostringstream armsVec; armsVec << "["; for(size_t ai=0; ai<arms.size(); ++ai){ const auto& A=arms[ai]; if(ai>0) armsVec << ' '; std::ostringstream armO; armO << "(arm " << A.variant << " :body " << serialize_vec(A.bodyInsts) << ")"; armsVec << armO.str(); } armsVec << "]";
+            std::ostringstream em; em << "(ematch " << dst << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn.sink().push_back(em.str());
+            return std::pair<std::string,std::string>{std::string("i32"), dst};
         } else if(ok && arms.size()==1){
-            // Mark non-exhaustive ematch placeholder so surface_norm can classify it as an error
+            // Non-exhaustive single-arm placeholder: emit marker + synthesize i32 0 result
             fn.sink().push_back("(ematch-non-exhaustive-placeholder)");
+            auto singleDst = fn.gensym("ematch1");
+            fn.sink().push_back("(const " + singleDst + " i32 0)");
+            return std::pair<std::string,std::string>{std::string("i32"), singleDst};
+        }
+    }
+    // match tuple pattern form incremental lowering (Phase 2a): match <scrut> { (<a, b, _>) { body } (<x>) { body2 } }
+    // Current semantics: parse all arms but only lower & select the first arm's body (others ignored for now).
+    // Future plan: emit aggregated tmatch macro with per-arm clusters and conditional selection.
+    if(s.rfind("match ",0)==0){
+    // tuple match lowering (debug prints removed)
+        std::string rest = s.substr(6);
+        auto trim_simple = [](std::string v){ size_t a=0; while(a<v.size() && isspace((unsigned char)v[a])) ++a; size_t b=v.size(); while(b>a && isspace((unsigned char)v[b-1])) --b; return v.substr(a,b-a); };
+        bool ok=true;
+        size_t i2=0; while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t scrStart=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string scrut = rest.substr(scrStart, i2-scrStart); if(scrut.empty()) ok=false;
+        while(ok && i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(!ok || i2>=rest.size()||rest[i2]!='{'){ ok=false; }
+        if(ok) ++i2;
+        struct TupleArm {
+            std::vector<std::string> patNames;      // binding symbols ("" for wildcard)
+            std::vector<std::string> literalVals;   // literal integer (string) if this position is a literal, else ""
+            std::vector<std::string> elementSyms;   // symbols produced by tget for each element (bindings or synthesized discard)
+            std::vector<std::string> clusterInsts;  // tget + meta instructions
+            std::vector<std::string> bodyInsts;     // lowered body (no cluster)
+            std::string valueSym;                   // body value symbol
+        };
+        std::vector<TupleArm> arms; arms.reserve(4);
+        auto build_cluster = [&](TupleArm& ta){
+            ta.clusterInsts.reserve(ta.patNames.size()+1);
+            ta.elementSyms.resize(ta.patNames.size());
+            for(size_t pi=0; pi<ta.patNames.size(); ++pi){
+                std::string bind = ta.patNames[pi];
+                if(bind.empty()) bind = fn.gensym("_tp");
+                ta.elementSyms[pi] = bind;
+                std::ostringstream tg; tg << "(tget " << bind << " i32 %" << scrut << " " << pi << ")"; ta.clusterInsts.push_back(tg.str());
+            }
+            { std::ostringstream meta; meta << "(tuple-pattern-meta %" << scrut << " " << ta.patNames.size() << ")"; ta.clusterInsts.push_back(meta.str()); }
+        };
+        while(ok && i2<rest.size()){
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()) break; if(rest[i2]=='}'){ ++i2; break; }
+            if(rest[i2] != '('){ ok=false; break; }
+            ++i2; // skip '('
+            std::vector<std::string> patNames; std::vector<std::string> literalVals; std::string accum; int depth=0; for(; i2<rest.size(); ++i2){ char c=rest[i2]; if(c=='('){ ++depth; accum.push_back(c); }
+                else if((c==',' && depth==0) || c==')'){
+                    std::string part = trim_simple(accum); accum.clear(); if(!part.empty()){
+                        if(part=="_") { patNames.push_back(""); literalVals.push_back(""); }
+                        else {
+                            // Detect integer literal (optional leading sign then digits)
+                            bool isNum=false; size_t p=0; if(part[p]=='-'||part[p]=='+') ++p; if(p<part.size() && isdigit((unsigned char)part[p])){ size_t q=p; while(q<part.size() && isdigit((unsigned char)part[q])) ++q; if(q==part.size()) isNum=true; }
+                            if(isNum){ patNames.push_back(""); literalVals.push_back(part); }
+                            else {
+                                bool idok=true; for(char ch: part){ if(!(isalnum((unsigned char)ch)||ch=='_')) { idok=false; break; } }
+                                if(idok){ if(part[0] != '%') part = std::string("%")+part; patNames.push_back(part); literalVals.push_back(""); }
+                                else { patNames.push_back(""); literalVals.push_back(""); }
+                            }
+                        }
+                    }
+                    if(c==')'){ ++i2; break; }
+                } else accum.push_back(c);
+            }
+            while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()||rest[i2]!='{'){ ok=false; break; }
+            ++i2; // move past '{' to first body character
+            int depthB=1; size_t bstart=i2; for(; i2<rest.size(); ++i2){ char c=rest[i2]; if(c=='{'){ ++depthB; } else if(c=='}'){ --depthB; if(depthB==0){ ++i2; break; } } }
+            if(depthB!=0){ ok=false; break; }
+            size_t bend=i2; std::string bodyBlock = rest.substr(bstart, bend-bstart-1); bodyBlock = trim_simple(bodyBlock); if(bodyBlock.empty()) bodyBlock="0";
+            fn.block_stack.emplace_back(); auto bodyPair = lower_simple_expr_into(fn, bodyBlock); auto bodyInsts = std::move(fn.block_stack.back()); fn.block_stack.pop_back();
+            TupleArm arm; arm.patNames = std::move(patNames); arm.literalVals = std::move(literalVals); arm.bodyInsts = std::move(bodyInsts); arm.valueSym = bodyPair.second; build_cluster(arm); arms.push_back(std::move(arm));
+            // (debug arm summary removed)
+        }
+        // (debug summary removed)
+        if(ok && !arms.empty()){
+            auto dst = fn.gensym("matcht");
+            auto serialize_vec = [](const std::vector<std::string>& v){ std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : v){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; return bv.str(); };
+            // Emit clusters (extracts + meta) for all arms up-front so element symbols are available for guard construction.
+            for(auto &a : arms){ for(const auto& ins : a.clusterInsts) fn.sink().push_back(ins); }
+            // Build guard conditions.
+            std::vector<std::string> armConds; armConds.reserve(arms.size());
+            for(size_t ai=0; ai<arms.size(); ++ai){
+                const auto &a = arms[ai];
+                // Collect literal predicates.
+                std::string condSym; bool haveCond=false;
+                for(size_t pi=0; pi<a.literalVals.size(); ++pi){ if(a.literalVals[pi].empty()) continue; std::string lit = a.literalVals[pi];
+                    // Materialize literal const
+                    auto litSym = fn.gensym("c"); fn.sink().push_back("(const " + litSym + " i32 " + lit + ")");
+                    // Compare elementSym vs literal
+                    auto cmp = fn.gensym("cmp"); fn.sink().push_back("(rcall " + cmp + " i32 eq " + a.elementSyms[pi] + " " + litSym + ")");
+                    if(!haveCond){ condSym = cmp; haveCond=true; }
+                    else {
+                        auto andSym = fn.gensym("band"); fn.sink().push_back("(rcall " + andSym + " i32 band " + condSym + " " + cmp + ")"); condSym = andSym; }
+                }
+                if(!haveCond){ // unconditional arm
+                    auto ctrue = fn.gensym("c"); fn.sink().push_back("(const " + ctrue + " i1 1)"); condSym = ctrue; }
+                armConds.push_back(condSym);
+            }
+            // Initialize destination with zero
+            auto dinit = fn.gensym("c"); fn.sink().push_back("(const " + dinit + " i32 0)"); fn.sink().push_back("(as " + dst + " i32 " + dinit + ")");
+            // Build rif chain from last to first.
+            auto build_branch_body = [&](size_t ai){ std::vector<std::string> b = arms[ai].bodyInsts; b.push_back("(assign " + dst + " " + arms[ai].valueSym + ")"); return serialize_vec(b); };
+            std::string chain = "[]";
+            for(size_t rev=arms.size(); rev-- > 0;){ std::ostringstream rif; rif << "(rif " << armConds[rev] << " :then " << build_branch_body(rev) << " :else " << chain << ")"; chain = rif.str(); }
+            fn.sink().push_back(chain);
+            std::ostringstream meta; meta << "(tuple-match-arms-count " << arms.size() << ")"; fn.sink().push_back(meta.str());
+            return {"i32", dst};
         }
     }
     // rtry surface: rtry <SumTypeName> <ident>
@@ -578,7 +681,7 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
         auto dots = s.find("..");
         if(dots != std::string::npos){
             std::string left = s.substr(0, dots);
-            bool inclusive = false; size_t after = dots + 2; if(after < s.size() && s[after]=='='){ inclusive = true; ++after; }
+            bool hasEq = false; size_t after = dots + 2; if(after < s.size() && s[after]=='='){ hasEq = true; ++after; }
             std::string right = s.substr(after);
             auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
             left = trim(left); right = trim(right);
@@ -587,7 +690,7 @@ static inline std::pair<std::string,std::string> lower_simple_expr_into(build_st
                 auto ltmp = fn.gensym("c"); fn.sink().push_back("(const " + ltmp + " i32 " + lnum + ")");
                 auto rtmp = fn.gensym("c"); fn.sink().push_back("(const " + rtmp + " i32 " + rnum + ")");
                 auto dst = fn.gensym("range");
-                fn.sink().push_back(std::string("(rcall ") + dst + " i32 " + (inclusive? "range_inclusive" : "range") + " " + ltmp + " " + rtmp + ")");
+                fn.sink().push_back(std::string("(rcall ") + dst + " i32 " + (hasEq? "range_inclusive" : "range") + " " + ltmp + " " + rtmp + ")");
                 return {"i32", dst};
             }
         }
@@ -680,10 +783,35 @@ struct action< let_stmt > {
             i += 3; ltrim(s,i);
         }
         // name
-        auto name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i);
-        // optional type
+        bool tuplePattern=false; std::vector<std::string> patternNames; // %names or empty string for discards
+        std::string name;
+        if(i<s.size() && s[i]=='('){
+            // Parse simple tuple pattern: (a, b, _ , c)
+            tuplePattern=true; ++i; ltrim(s,i); std::string accum; int depth=0; for(; i<s.size(); ++i){ char c=s[i]; if(c=='('){ ++depth; accum.push_back(c); }
+                else if(c==')' && depth>0){ --depth; accum.push_back(c); }
+                else if((c==',' && depth==0) || c==')'){
+                    auto trim_part=[&](std::string v){ size_t a2=0; while(a2<v.size() && isspace((unsigned char)v[a2])) ++a2; size_t b2=v.size(); while(b2>a2 && isspace((unsigned char)v[b2-1])) --b2; return v.substr(a2,b2-a2); };
+                    std::string part = trim_part(accum); accum.clear();
+                    if(!part.empty()){
+                        if(part=="_") patternNames.push_back("");
+                        else {
+                            // simple ident
+                            if(!(isalpha((unsigned char)part[0])||part[0]=='_')) patternNames.push_back(""); else {
+                                std::string ident; for(char ch: part){ if(!(isalnum((unsigned char)ch)||ch=='_')) { ident.clear(); break; } ident.push_back(ch); }
+                                if(ident.empty()) patternNames.push_back(""); else { if(ident[0] != '%') ident = std::string("%")+ident; patternNames.push_back(ident); }
+                            }
+                        }
+                    }
+                    if(c==')'){ ++i; break; }
+                } else { accum.push_back(c); }
+            }
+            ltrim(s,i);
+        } else {
+            name = parse_ident(s,i); if(name.empty()) return; if(name[0] != '%') name = std::string("%")+name; ltrim(s,i);
+        }
+        // optional type (only for simple binding currently)
         std::string ty = "i32";
-        if(i<s.size() && s[i]==':'){ ++i; ltrim(s,i); auto tname = parse_ident(s,i); if(!tname.empty()) ty = tname; ltrim(s,i); }
+        if(!tuplePattern && i<s.size() && s[i]==':'){ ++i; ltrim(s,i); auto tname = parse_ident(s,i); if(!tname.empty()) ty = tname; ltrim(s,i); }
     // '='
     if(i>=s.size() || s[i] != '=') return; ++i; ltrim(s,i);
     // rest is expr; trim and lower via standard expression lowering path
@@ -702,13 +830,24 @@ struct action< let_stmt > {
         expr.pop_back();
         while(!expr.empty() && isspace((unsigned char)expr.back())) expr.pop_back();
     }
+        // If RHS begins with 'match' ensure we captured the entire brace-enclosed arm list.
+        if(expr.rfind("match",0)==0){
+            size_t exprStart = i; // points just after '=' and whitespace
+            size_t scanPos = exprStart + 5; // skip 'match'
+            while(scanPos < s.size() && s[scanPos] != '{') ++scanPos;
+            if(scanPos < s.size() && s[scanPos]=='{'){
+                int depth=0; size_t braceEnd=std::string::npos;
+                for(; scanPos < s.size(); ++scanPos){ char c = s[scanPos]; if(c=='{'){ ++depth; } else if(c=='}'){ --depth; if(depth==0){ braceEnd = scanPos; ++scanPos; break; } } }
+                if(braceEnd != std::string::npos){ expr = s.substr(exprStart, braceEnd - exprStart + 1); }
+            }
+        }
     // Early ematch lowering inside let initializer (reuses simplified parser from expression path)
     auto try_ematch = [&](const std::string& ems)->std::optional<std::pair<std::string,std::string>>{
         if(ems.rfind("ematch ",0)!=0) return std::nullopt; std::string rest = ems.substr(7);
         auto trim_simple = [](std::string v){ size_t a3=0; while(a3<v.size() && isspace((unsigned char)v[a3])) ++a3; size_t b3=v.size(); while(b3>a3 && isspace((unsigned char)v[b3-1])) --b3; return v.substr(a3,b3-a3); };
         size_t i2=0; while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startType=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string enumType = rest.substr(startType, i2-startType); if(enumType.empty()) return std::nullopt;
         while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; size_t startScr=i2; while(i2<rest.size() && (isalnum((unsigned char)rest[i2])||rest[i2]=='_')) ++i2; std::string scrut = rest.substr(startScr, i2-startScr); if(scrut.empty()) return std::nullopt;
-        struct Arm { std::string variant; std::vector<std::string> bodyInsts; std::string valueSym; };
+        struct Arm { std::string variant; std::vector<std::string> binds; std::vector<std::string> bodyInsts; std::string valueSym; };
         std::vector<Arm> arms; bool ok=true; while(ok && i2<rest.size()){
             while(i2<rest.size() && isspace((unsigned char)rest[i2])) ++i2; if(i2>=rest.size()) break;
             if(rest[i2]=='/' && i2+1<rest.size() && (rest[i2+1]=='/'||rest[i2+1]=='*')){ if(rest[i2+1]=='/') { while(i2<rest.size() && rest[i2]!='\n') ++i2; continue; } else { size_t bcEnd = rest.find("*/", i2+2); if(bcEnd==std::string::npos){ ok=false; break; } i2=bcEnd+2; continue; } }
@@ -728,7 +867,8 @@ struct action< let_stmt > {
         auto dst2 = fn->gensym("ematch");
         auto serialize_vec = [](const std::vector<std::string>& v){ std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : v){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]"; return bv.str(); };
         std::ostringstream armsVec; armsVec << "["; for(size_t ai=0; ai<arms.size(); ++ai){ const auto& A=arms[ai]; if(ai>0) armsVec << ' '; std::ostringstream armO; armO << "(arm " << A.variant << " :body " << serialize_vec(A.bodyInsts) << ")"; armsVec << armO.str(); } armsVec << "]";
-        std::ostringstream em; em << "(ematch " << dst2 << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn->sink().push_back(em.str()); return std::make_pair(std::string("i32"), dst2);
+    std::ostringstream em; em << "(ematch " << dst2 << " i32 " << enumType << " %" << scrut << " :cases " << armsVec.str() << ")"; fn->sink().push_back(em.str());
+    return std::make_pair(std::string("i32"), dst2);
     };
     if(auto emr = try_ematch(expr)){
         auto valSym = emr->second; fn->sink().push_back("(as " + name + " " + emr->first + " " + valSym + ")"); return; }
@@ -749,7 +889,36 @@ struct action< let_stmt > {
     auto [ety, val] = lower_simple_expr_into(*fn, expr);
     auto expr_insts = std::move(fn->block_stack.back()); fn->block_stack.pop_back();
     for(const auto& ins : expr_insts){ fn->sink().push_back(ins); }
-    fn->sink().push_back(std::string("(as ") + name + " " + ty + " " + val + ")");
+    if(tuplePattern){
+        // Only support pattern against a single tuple variable reference (simple identifier) for now.
+        // If expr lowered to a temp (not a plain variable), we cannot know tuple arity – future enhancement.
+    std::string srcVar=val; // val is symbol produced by lowering; we only destructure if it already starts with '%'
+        // Emit tget macro calls for each bound name assuming element type i32 (current tuple field placeholder type).
+        for(size_t pi=0; pi<patternNames.size(); ++pi){
+            const auto& pname = patternNames[pi];
+            // Emit a placeholder binding even for '_' to preserve dense cluster (use throwaway gensym)
+            std::string bindName = pname;
+            if(bindName.empty()){
+                auto ign = fn->gensym("_tp");
+                bindName = ign; // still a valid SSA symbol (starts with % from gensym)
+            }
+            std::ostringstream tg; tg << "(tget " << bindName << " i32 " << srcVar << " " << pi << ")"; fn->sink().push_back(tg.str());
+        }
+        // Emit meta instruction for expansion fast-path arity validation: (tuple-pattern-meta %srcVar <expectedCount>)
+        {
+            std::ostringstream meta; meta << "(tuple-pattern-meta " << srcVar << " " << patternNames.size() << ")"; fn->sink().push_back(meta.str());
+        }
+        // TODO: Add E1454/E1455 diagnostics via expansion/type-check pass once tuple arity + non-tuple detection accessible here.
+    // FUTURE PATTERN PHASES (see EDN-0014 Draft Pattern Syntax):
+    // Phase 2a: Match arm tuple patterns -> extend parser to recognize patterns inside match arm headers and emit clustered tget before arm body.
+    // Phase 2b: Struct patterns -> parse `Type { field, alias: name, .. }` and emit member ops (reuse E0803/E0805 or new E1456+ codes).
+    // Phase 2c: Placeholder `_` -> count toward arity but skip emission (may temporarily emit %_ignoreN to keep dense index sequence).
+    // Phase 2d: Nested patterns -> recursive descent or flatten leaf emission; adjust clustering heuristic to ignore intermediate temps.
+    // Phase 2e: Duplicate binding detection -> emit diagnostic early (planned code reservation E145A or reuse existing redefinition path).
+    // Phase 2f: Over-arity suppression of per-index OOB -> if cluster recognized as pattern, suppress individual index error in favor of aggregate E1454.
+    } else {
+        fn->sink().push_back(std::string("(as ") + name + " " + ty + " " + val + ")");
+    }
     }
 };
 
@@ -934,7 +1103,7 @@ struct action< expr_stmt > {
         std::vector<std::string> argSyms; argSyms.reserve(args.size());
         for(const auto& a : args){ if(a.empty()) continue; auto p = lower_simple_expr_into(*fn, a); argSyms.push_back(p.second); }
     auto dst = fn->gensym("call");
-    // emit: (rcall %dst i32 callee argSyms...)
+    // emit: (rcall %dst i32 <callee> argSyms...)
     std::ostringstream oss; oss << "(rcall " << dst << " i32 " << callee;
         for(const auto& as : argSyms) oss << " " << as;
         oss << ")";
@@ -1046,17 +1215,17 @@ struct action< for_in_stmt > {
         auto bracePos = src.find('{', i);
         std::string rangeExpr = (bracePos==std::string::npos)? src.substr(i) : src.substr(i, bracePos - i);
     // Support numeric ranges a..b and a..=b
-    auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; bool inclusive=false; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ inclusive=true; ++after; }
+    auto dots = rangeExpr.find(".."); if(dots==std::string::npos) return; size_t after = dots+2; if(after<rangeExpr.size() && rangeExpr[after]=='='){ ++after; }
         auto trim = [](std::string str){ size_t a=0; while(a<str.size() && isspace((unsigned char)str[a])) ++a; size_t b=str.size(); while(b>0 && isspace((unsigned char)str[b-1])) --b; return str.substr(a,b-a); };
         std::string left = trim(rangeExpr.substr(0,dots)); std::string right = trim(rangeExpr.substr(after));
         // Determine start and end symbols (numeric literal -> const; identifier -> reuse)
         std::string startSym; std::string endSym; bool haveStart=false; bool haveEnd=false;
         size_t li=0; auto lnum = parse_number(left, li);
         if(!lnum.empty()) { startSym = fn->gensym("c"); fn->sink().push_back("(const " + startSym + " i32 " + lnum + ")"); haveStart=true; }
-        else { size_t lj=0; auto lid=parse_ident(left, lj); if(!lid.empty()){ if(lid[0] != '%') lid = std::string("%") + lid; startSym=lid; haveStart=true; } }
+        else { size_t lj=0; auto lid=parse_ident(left, lj); if(!lid.empty()){ if(lid[0] != '%') lid = std::string("%")+lid; startSym=lid; haveStart=true; } }
         size_t ri=0; auto rnum = parse_number(right, ri);
         if(!rnum.empty()) { endSym = fn->gensym("c"); fn->sink().push_back("(const " + endSym + " i32 " + rnum + ")"); haveEnd=true; }
-        else { size_t rj=0; auto rid=parse_ident(right, rj); if(!rid.empty()){ if(rid[0] != '%') rid = std::string("%") + rid; endSym=rid; haveEnd=true; } }
+        else { size_t rj=0; auto rid=parse_ident(right, rj); if(!rid.empty()){ if(rid[0] != '%') rid = std::string("%")+rid; endSym=rid; haveEnd=true; } }
         if(!haveStart || !haveEnd) return;
         // Serialize body vector (already lowered)
         std::ostringstream bv; bv << "["; bool first=true; for(const auto& ins : body){ if(!first) bv << ' '; first=false; bv << ins; } bv << "]";

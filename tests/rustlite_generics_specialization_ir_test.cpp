@@ -6,7 +6,7 @@
 #include "edn/edn.hpp"
 #include "edn/type_check.hpp"
 #include "edn/ir_emitter.hpp"
-#include "rustlite/expand.hpp"
+#include "../languages/rustlite/include/rustlite/expand.hpp"
 
 // Test: generic function monomorphization produces distinct specialized function symbols
 // and rcall-g sites are rewritten to plain call of those specialized symbols.

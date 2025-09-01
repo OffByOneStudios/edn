@@ -275,6 +275,7 @@ endif()
 target_compile_features(rustlite_ematch_payload_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.ematch_payload COMMAND rustlite_ematch_payload_driver)
 
+
 # legacy non-exhaustive rmatch regression driver
 add_executable(rustlite_rmatch_non_exhaustive_legacy_driver tools/rustlite_rmatch_non_exhaustive_legacy_driver.cpp)
 if(TARGET edn)
@@ -504,6 +505,63 @@ target_link_libraries(rustlite_tuple_destructure_driver PRIVATE rustlite edn)
 target_compile_features(rustlite_tuple_destructure_driver PRIVATE cxx_std_20)
 add_test(NAME rustlite.tuple_destructure COMMAND rustlite_tuple_destructure_driver)
 
+# Tuple destructure negative tests (arity mismatch, non-tuple target)
+add_executable(rustlite_tuple_destructure_arity_mismatch_negdriver tools/rustlite_tuple_destructure_arity_mismatch_negdriver.cpp)
+  target_link_libraries(rustlite_tuple_destructure_arity_mismatch_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_tuple_destructure_arity_mismatch_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure_arity_mismatch_neg COMMAND rustlite_tuple_destructure_arity_mismatch_negdriver)
+
+add_executable(rustlite_tuple_destructure_non_tuple_negdriver tools/rustlite_tuple_destructure_non_tuple_negdriver.cpp)
+  target_link_libraries(rustlite_tuple_destructure_non_tuple_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_tuple_destructure_non_tuple_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure_non_tuple_neg COMMAND rustlite_tuple_destructure_non_tuple_negdriver)
+
+# Tuple destructure positive test (no diagnostics expected)
+add_executable(rustlite_tuple_destructure_positive_driver tools/rustlite_tuple_destructure_positive_driver.cpp)
+  target_link_libraries(rustlite_tuple_destructure_positive_driver PRIVATE rustlite edn)
+  target_compile_features(rustlite_tuple_destructure_positive_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure_positive COMMAND rustlite_tuple_destructure_positive_driver)
+
+add_executable(rustlite_tuple_destructure_over_arity_negdriver tools/rustlite_tuple_destructure_over_arity_negdriver.cpp)
+  target_link_libraries(rustlite_tuple_destructure_over_arity_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_tuple_destructure_over_arity_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure_over_arity_neg COMMAND rustlite_tuple_destructure_over_arity_negdriver)
+
+add_executable(rustlite_tuple_destructure_gapped_driver tools/rustlite_tuple_destructure_gapped_driver.cpp)
+  target_link_libraries(rustlite_tuple_destructure_gapped_driver PRIVATE rustlite edn)
+  target_compile_features(rustlite_tuple_destructure_gapped_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.tuple_destructure_gapped COMMAND rustlite_tuple_destructure_gapped_driver)
+
+# Match tuple pattern positive (Phase 2a initial)
+add_executable(rustlite_match_tuple_positive_driver tools/rustlite_match_tuple_positive_driver.cpp)
+  target_link_libraries(rustlite_match_tuple_positive_driver PRIVATE rustlite edn)
+  target_compile_features(rustlite_match_tuple_positive_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.match_tuple_positive COMMAND rustlite_match_tuple_positive_driver)
+
+# Match tuple pattern negative: arity mismatch
+add_executable(rustlite_match_tuple_arity_mismatch_negdriver tools/rustlite_match_tuple_arity_mismatch_negdriver.cpp)
+  target_link_libraries(rustlite_match_tuple_arity_mismatch_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_match_tuple_arity_mismatch_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.match_tuple_arity_mismatch_neg COMMAND rustlite_match_tuple_arity_mismatch_negdriver)
+
+# Match tuple pattern negative: non-tuple target
+add_executable(rustlite_match_tuple_non_tuple_negdriver tools/rustlite_match_tuple_non_tuple_negdriver.cpp)
+  target_link_libraries(rustlite_match_tuple_non_tuple_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_match_tuple_non_tuple_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.match_tuple_non_tuple_neg COMMAND rustlite_match_tuple_non_tuple_negdriver)
+
+# Match tuple pattern negative: over arity (extra tget beyond tuple size)
+add_executable(rustlite_match_tuple_over_arity_negdriver tools/rustlite_match_tuple_over_arity_negdriver.cpp)
+  target_link_libraries(rustlite_match_tuple_over_arity_negdriver PRIVATE rustlite edn)
+  target_compile_features(rustlite_match_tuple_over_arity_negdriver PRIVATE cxx_std_20)
+add_test(NAME rustlite.match_tuple_over_arity_neg COMMAND rustlite_match_tuple_over_arity_negdriver)
+
+# Match tuple pattern gapped (no diagnostics expected)
+add_executable(rustlite_match_tuple_gapped_driver tools/rustlite_match_tuple_gapped_driver.cpp)
+  target_link_libraries(rustlite_match_tuple_gapped_driver PRIVATE rustlite edn)
+  target_compile_features(rustlite_match_tuple_gapped_driver PRIVATE cxx_std_20)
+add_test(NAME rustlite.match_tuple_gapped COMMAND rustlite_match_tuple_gapped_driver)
+
 # if-let / while-let driver
 add_executable(rustlite_if_while_let_driver tools/rustlite_if_while_let_driver.cpp)
 target_link_libraries(rustlite_if_while_let_driver PRIVATE rustlite edn)
@@ -649,6 +707,11 @@ add_test(NAME rustlite.generics.neg.bound COMMAND rustlite_generics_neg_bound_dr
 add_executable(rustlite_generics_specialization_ir_test ../../tests/rustlite_generics_specialization_ir_test.cpp)
 target_link_libraries(rustlite_generics_specialization_ir_test PRIVATE rustlite edn)
 add_test(NAME rustlite.generics.specialization_ir COMMAND rustlite_generics_specialization_ir_test)
+
+# Tuple match literal guard IR test (standalone to avoid duplicate test mains)
+add_executable(rustlite_tuple_match_literal_guard_test ../../tests/rustlite_tuple_match_literal_guard_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_tuple_match_literal_guard_test PRIVATE rustlite edn)
+add_test(NAME rustlite.tuple_match.literal_guard COMMAND rustlite_tuple_match_literal_guard_test)
 
 # rwhile-let parity negative tests
 add_executable(rustlite_rwhile_let_neg_variant_mismatch_driver tools/rustlite_rwhile_let_neg_variant_mismatch_driver.cpp)
