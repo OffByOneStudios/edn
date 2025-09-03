@@ -116,7 +116,7 @@ Then branch into parallelizable P1 items.
 ### Implementation Progress (Rolling)
 | Order | Feature(s) | Status | Notes / Next Steps |
 |-------|------------|--------|--------------------|
-| 1 | Destructuring (2) | Partial (Phase 1 done) | Tuple let tuple-patterns implemented (lowering via `tget` cluster → `member`); match tuple pattern diagnostics (E1454 arity mismatch, E1455 non-tuple) plus over-arity detection (highest index scan) landed with positive + three negative drivers (arity mismatch, non-tuple, over-arity, gapped). Remaining: match arm pattern lowering proper (arm-scoped prologue emission), struct patterns, nested patterns, `_` discard, duplicate-binding diag, ordering/gap robustness tests (non-dense suppression locked in), finalize over-arity vs per-index OOB precedence (current: single E1454). |
+| 1 | Destructuring (2) | Phase 1 complete (let tuples + struct) | Tuple let patterns implemented (cluster → member) with diagnostics (E1454 arity mismatch, E1455 non-tuple) and over-arity aggregation. Struct let patterns implemented: member op emission, placeholder `_` skipping, unknown field (E1456) and duplicate field (E1457) diagnostics, harvested into TypeChecker. Remaining (Phase 2): match arm tuple/struct patterns, nested patterns, aliases, rest (`..`), duplicate binding names, gap robustness tests. |
 | 2 | while/if let (20/21) | Complete | Macros (`rif-let`, `rwhile-let`) implemented; negative tests for missing / type mismatch / variant mismatch (E1421/E1422/E1423/E1405) and undefined :value symbol (E1421) landed. |
 | 3 | loop-with-value (19) | Complete | `rloop-val` macro validated. Test matrix: break with value, plain break (retain zero-init), no break body, multi break (first wins), negative type mismatch (E1107). |
 | 4 | Type alias (7) | Complete | Positive + negatives (E1330–E1333) plus cycle (self-ref) and sum shadow tests landed (E1333/E1401). |
@@ -129,18 +129,16 @@ Then branch into parallelizable P1 items.
 
 Progress summary (current cycle): Completed if/while-let negatives (E1405, E1421–E1423); type alias suite incl. cycle + shadow; began generics/bounds planning. Fixed compound assignment RHS literal trimming regression (shift operators) – numeric literal now preserved (removed spurious zero const). Removed temporary debug logging and legacy unordered_set include from parser. Implemented tuple pattern over-arity detection (meta + backward scan over `tget`/`member`) and added over-arity negative driver; gapped pattern driver asserts no false positives.
 
-### Recent Progress Log (2025-09-01)
-Tuple match literal guard lowering stabilized:
-* Fixed arm body block scanning depth bug preventing multi-arm tuple match lowering emission (previously `ok=0` abort).
-* Added per-arm cluster emission (already present) now verified by new dedicated test `rustlite_tuple_match_literal_guard_test`.
-* Adjusted guard lowering to accept post-expansion nested `(if ...)` chain in addition to planned `(rif ...)` macros; test now tolerant to either form pending future rif canonicalization.
-* Test assertions strengthened: require 3 `(tuple-pattern-meta ...)` entries (one per arm), at least two guard comparisons `(eq ...)`, and conditional chain length >=2 (rif or nested ifs).
-* Removed all temporary debug instrumentation (match arm summaries, IR dumps) after green test run; kept match RHS rescan logic (now without debug print).
-* Remaining cleanup: eliminate minor parser warnings (unused `braceStart`/`sawMatchWord` shadow remnants) in a follow-up patch once match RHS capture refactored into utility.
-Next steps:
-* Integrate type checker awareness for `tget`, `tuple-pattern-meta`, and `tuple-match-arms-count` so test can re-enable full type checking path.
-* Introduce lazy cluster emission optimization (skip extraction for arms made unreachable by earlier literal guards).
-* Extend guard support (variable equality + simple relational ops) and add corresponding positive/negative tests.
+### Recent Progress Log (2025-09-01 - Update)
+Destructuring enhancements:
+* Added struct let pattern lowering with `(member ...)` emission.
+* Implemented placeholder `_` skip logic and `(struct-pattern-meta ...)` summarization.
+* Added duplicate field detection meta → expansion diagnostic E1457.
+* Added unknown field validation against struct declarations → E1456.
+* Harvested E1454–E1457 expansion diagnostics into TypeChecker unified error channel.
+* Added positive + negative struct pattern tests (unknown field, duplicate field, placeholder) and migrated them to rely on TypeChecker errors.
+* Updated `docs/RUSTLITE.md` with struct destructuring section.
+Next (Destructuring Phase 2): match arm tuple/struct patterns, nested patterns, alias/rest syntax, duplicate binding detection, gap ordering robustness tests.
 
 ### Recent Progress Log (2025-08-31)
 Tuple pattern & match infrastructure advances:
@@ -402,31 +400,6 @@ Risk Notes
 - Current nested `(if ...)` structure will change once rif macro canonicalization lands; test tolerant to either form to avoid churn.
 - Parser still emits unused variable warnings in earlier phases (not tuple-related); scheduled cleanup after type checker integration.
 
-### 2025-08-31 (later session) – Tuple Pattern Meta Type Checker Integration (WIP)
-Status: In progress (blocked on structural compile error)
-
-Work Started:
-- Began extending `TypeChecker::check_instruction_list` to recognize tuple pattern support ops emitted by lowering:
-	- `tuple-pattern-meta` (tuple arity + structural validation; ensures target is synthetic `__TupleN`).
-	- `tuple-match-arms-count` (records arm count metadata; presently a no-op validation).
-- Clarified that surface `tget` macro is lowered to existing `(member ...)` ops; no distinct `tget` IR handler required unless raw form leaks pre-expansion (none observed).
-
-Current Blocker:
-- Structural compile failure in `type_check.inl` (compiler reports `check_module` definition nested inside prior scope). Numeric brace counts inside the edited region now balanced; indicates an earlier inadvertent brace misplacement or macro edge causing scope to remain open. Further inspection of earlier (unmodified) portions of the file needed next session.
-
-Planned Next Session Actions:
-1. Resolve brace/scope issue (full-file scan + minimal diff bisect) to restore build.
-2. Add if-chain result assignment unification semantics for lowered nested `if` / future `rif` chains (ensure consistent result type across arms, single destination binding).
-3. Re-run tuple match literal guard test with full type checking enabled (was previously structural-only) to confirm metadata ops are benign (no unexpected diagnostics).
-4. Add a regression test asserting `tuple-pattern-meta` / `tuple-match-arms-count` presence does not emit diagnostics and that over-arity (E1454) still surfaces correctly.
-5. Decide whether provisional struct pattern related codes (E1456–E1459) remain reserved or need renumbering before struct pattern implementation begins.
-
-Notes:
-- No changes yet to test files; integration work paused immediately upon encountering structural compile error to avoid compounding issues.
-- If-chain assignment semantics will leverage existing destination type inference currently used by `rif-let` / `rwhile-let` macros for value arms.
-
--- END UPDATE 2025-08-31
-
 ### 2025-09-01 – Tuple Meta Type Checker Integration Completed + If-Chain Unification
 Status: Complete (Phase slice) / Next: Struct patterns
 
@@ -460,4 +433,25 @@ Notes:
 - No observable impact on existing ematch / rif-let tests (assign mismatch negative still surfaces E1107).
 
 -- END UPDATE 2025-09-01
+
+## 2025-09-02 – Parser Direction & Pattern Roadmap Addendum (Appended)
+
+Added (from gap analysis and current session observations):
+- Parser Direction Checkpoint: Decide PEGTL restoration vs continued handwritten evolution by 2025-09-10; fallback = keep handwritten but modularize (split helpers, add span capture shim). Record decision & rationale.
+- Modularization Goal: Split future PEGTL variant into `grammar.(hpp|cpp)`, `actions.(hpp|cpp)`, `pattern_lowering.(hpp|cpp)` to avoid monolithic churn seen earlier.
+- Pattern Nesting Strategy: Initial implementation will FLATTEN nested tuple/struct patterns (emit only leaf `tget`/`member` ops) + include a metadata note enabling later hierarchical reconstruction. Re-evaluate after diagnostics stable.
+- Exhaustiveness & Duplicate Arm Integration: Ensure emitted pattern metadata (`tuple-pattern-meta`, pending `struct-pattern-meta`) is consumed by future features 35/36 for arm coverage & structural duplicate detection.
+- Error Code Reservation Finalization: Confirm E1456–E145A table (unknown field, duplicate field, bad `..`, non-struct target, duplicate binding) before struct pattern implementation to avoid renumber churn.
+- Dual Parser Parity Risk: Introduce golden IR parity tests comparing handwritten vs PEGTL lowering for a shared corpus (activated once PEGTL restored) to prevent drift.
+- Span / Source Locations: Plan lightweight span attachment to pattern meta (fields start_line, start_col, length) prerequisite for richer diagnostics—target after basic struct pattern diagnostics.
+- Match Arm Extraction Performance: Track metric once multi-arm patterns land; may switch from eager to lazy cluster emission if >25% redundant extraction across representative workloads.
+- Borrow Checker Interaction Note: When references/borrows (feature 12) introduce aliasing, destructuring of references (`let (&x, &mut y) = ..`) will require move vs borrow semantics spelled out—reserve design slot.
+- Rest Pattern (`..`) Semantics: Phase 1 treat as syntactic placeholder (ignored). Future: enforce coverage constraints (struct) and permit suffix capture (tuple) – create follow-up issue if semantics diverge from Rust.
+- Duplicate Binding Detection: Implement single-pass unordered_set check during pattern parse; emit E145A before lowering; avoid generating colliding SSA names.
+- Over-Arity Suppression Rules: Document heuristic: when a recognized tuple pattern exceeds arity, emit only aggregate E1454 and suppress per-index OOB diagnostics.
+- Gapped Index & Placeholder Handling: Negative tests to ensure non-dense user-authored `tget` sequences or placeholders do not spuriously trigger pattern diagnostics.
+- Golden IR Stability Guidelines: Preserve gensym base names (`add`, `arr`, `enum`, etc.) to minimize churn; any systematic rename must update goldens atomically.
+- Diagnostic Consumer Pass (Planned): New pass converts struct/tuple pattern metadata to concrete diagnostics (E1454–E1459, E145A) rather than embedding all logic in parser or type checker—improves separation of concerns.
+
+-- END ADDENDUM 2025-09-02
 
