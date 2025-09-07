@@ -363,7 +363,7 @@ Lowering pipeline:
   - Cover a dense, zero-based index/field sequence `_0 .. _{k-1}` with no gaps
   - Appear contiguously (no unrelated instructions between them)
 
-Diagnostics (emitted as generic module metadata entries):
+Diagnostics (emitted during expansion as generic module metadata; now harvested into the TypeChecker error list):
 
 | Code  | Condition | Message Sketch |
 |-------|-----------|----------------|
@@ -382,7 +382,47 @@ Example end-to-end:
 let (a,b,c) = %t; ; parser -> tget cluster -> expansion -> member cluster
 ```
 
-See `rustlite_tuple_destructure_*_driver.cpp` tool sources for runnable examples (positive, arity mismatch, non-tuple cases).
+See `rustlite_tuple_destructure_*_driver.cpp` tool sources for runnable examples (positive, arity mismatch, non-tuple cases). Tests also assert absence/presence of E1454/E1455 via unified TypeChecker errors.
+
+#### Struct Destructuring (`let Type { field, other } = expr`)
+
+Struct patterns allow binding named fields from a struct value:
+
+```
+let Point { x, y } = p;
+```
+
+Lowering pipeline:
+
+1. Parser recognizes a struct pattern in a `let` binding and emits one `(member %dst Type %src fieldName)` instruction per bound (non-placeholder) field plus a summary meta form:
+  ```
+  (struct-pattern-meta %p Point <N> x y ...)
+  ```
+  Duplicate field names produce a `(struct-pattern-duplicate-fields %p Point [ dup1 dup2 ... ])` meta.
+2. Expansion validates the pattern against the known struct declaration (both simplified and keyword forms) and emits diagnostics as generic metadata symbols on the module head:
+  - E1456: unknown struct field in pattern
+  - E1457: duplicate struct field in pattern (converted from duplicate-fields meta)
+3. TypeChecker harvests these module-level generic errors so tests can rely on the unified error channel.
+
+Placeholders `_` are skipped: no `(member %_ ...)` is emitted and they are omitted from the captured field list inside `(struct-pattern-meta ...)` (the count reflects only bound fields).
+
+Example IR (abridged) for `let Point { x, _, y } = p;`:
+```
+(member %x Point %p x)
+(member %y Point %p y)
+(struct-pattern-meta %p Point 2 x y)
+```
+
+Diagnostics Table (struct patterns):
+
+| Code  | Condition                      | Message Sketch                         |
+|-------|--------------------------------|----------------------------------------|
+| E1456 | Unknown field referenced       | "unknown field <name> in pattern"      |
+| E1457 | Duplicate field listed         | "duplicate field <name> in struct pattern" |
+
+Positive / negative tests: see `rustlite_struct_let_pattern_positive_test.cpp`, `rustlite_struct_let_pattern_unknown_field_neg_test.cpp`, `rustlite_struct_let_pattern_duplicate_field_neg_test.cpp`, and placeholder coverage in `rustlite_struct_let_pattern_placeholder_test.cpp`.
+
+Planned extensions (not yet implemented): field alias syntax (`field: localName`), rest pattern (`..`) capturing remaining unbound fields (currently ignored / diagnostic TBD), nested patterns, match arm struct patterns.
 
 ### Arrays (`arr`, legacy `rarray` numeric size)
 

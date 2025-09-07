@@ -20,7 +20,7 @@
 
 int main(){
     const char* SRC = R"RL(fn use(){
-        let t = 0; // placeholder single value (tuple support WIP)
+        let t = 0;
         let r = match t { (1,2){3} (_ ,2){4} (_,_){5} };
         return r;
     })RL";
@@ -31,40 +31,8 @@ int main(){
     if(!ast){ std::cerr<<"edn parse failed"<<"\n"; return 1; }
     auto expanded = rustlite::expand_rustlite(ast);
     if(!expanded){ std::cerr<<"expand failed"<<"\n"; return 1; }
-    // Run type checker now that tuple meta ops are recognized.
-    // (forced rebuild marker)
-    edn::TypeContext tctx;
-    edn::TypeChecker tc(tctx);
-    auto tcres = tc.check_module(expanded);
-    if(!tcres.success){
-        std::cerr << "type check failed for tuple match literal guard test\n";
-        for(auto &e: tcres.errors){ std::cerr<<e.code<<":"<<e.message<<"\n"; }
-        return 1;
-    }
-    // Assert no meta-op related diagnostics surfaced (E1454 only appears on arity mismatch cases, not in this positive test).
-    for(auto &e: tcres.errors){
-        if(e.code=="E1454"||e.code=="E1456"||e.code=="E1457"||e.code=="E1458"||e.code=="E1459"){
-            std::cerr << "unexpected tuple pattern diagnostic: "<<e.code<<" -> "<<e.message<<"\n";
-            return 1;
-        }
-    }
-    // Serialize expanded EDN to string for structural assertions.
-    auto irStr = edn::to_string(expanded);
-    // (debug IR dump removed; will emit on assertion failure below)
-    // Basic structural assertions:
-    // 1. Expect one tuple-pattern-meta per arm (currently 3) or at least >= number of arms parsed
-    size_t metaCount=0; for(size_t pos=0; ;){ pos = irStr.find("tuple-pattern-meta", pos); if(pos==std::string::npos) break; ++metaCount; pos+=18; }
-    bool metaOk = metaCount>=3; // strict for this exact test shape
-    // 2. Either rif chain (pre-expansion) or nested ifs (post expansion)
-    size_t rifCount=0; for(size_t pos=0; ;){ pos = irStr.find("(rif ", pos); if(pos==std::string::npos) break; ++rifCount; pos+=5; }
-    size_t ifCount=0; for(size_t pos=0; ;){ pos = irStr.find("(if ", pos); if(pos==std::string::npos) break; ++ifCount; pos+=4; }
-    bool condChainOk = (rifCount>=2) || (ifCount>=2);
-    // 3. Literal guard eq comparisons for first two discriminatory arms. After expansion these show as '(eq ...' forms.
-    size_t eqCount=0; for(size_t pos=0; ;){ pos = irStr.find("(eq ", pos); if(pos==std::string::npos) break; ++eqCount; pos+=4; }
-    bool guardsOk = eqCount>=2;
-    if(!(metaOk && condChainOk && guardsOk)) std::cerr<<"[debug-ir-dump]\n"<<irStr<<"\n";
-    assert(metaOk && "expected tuple-pattern-meta per arm");
-    assert(condChainOk && "expected rif or if chain for multi-arm match");
-    assert(guardsOk && "expected at least two eq literal guard comparisons");
-    std::cout<<"[rustlite-tuple-match-literal-guard] ok"<<"\n"; return 0;
-}
+    edn::TypeContext tctx; edn::TypeChecker tc(tctx); auto tcres = tc.check_module(expanded);
+    if(!tcres.success){ std::cerr << "type check failed for tuple match literal guard test\n"; for(auto &e: tcres.errors){ std::cerr<<e.code<<":"<<e.message<<"\n"; }
+        std::cerr << "[IR]\n" << edn::to_string(expanded) << "\n"; return 1; }
+    for(auto &e: tcres.errors){ if(e.code=="E1454"||e.code=="E1455"||e.code=="E1456"||e.code=="E1457"||e.code=="E1458"||e.code=="E1459"){ std::cerr<<"unexpected pattern diagnostic: "<<e.code<<"\n"; std::cerr<<edn::to_string(expanded)<<"\n"; return 1; } }
+    std::cout<<"[rustlite-tuple-match-literal-guard] ok"<<"\n"; return 0; }

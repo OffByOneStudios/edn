@@ -150,6 +150,33 @@ inline void TypeChecker::append_suggestions(TypeError& err, const std::vector<st
     err.notes.push_back(TypeNote{msg,err.line,err.col});
 }
 inline void TypeChecker::collect_globals(TypeCheckResult& r, const std::vector<node_ptr>& elems){
+    // Harvest generic-error diagnostics (emitted during expansion) from module head metadata
+    // so downstream tooling/tests can rely on TypeChecker unified error channel instead of
+    // spelunking metadata. We preserve metadata (non-destructive) but duplicate into r.errors.
+    if(!elems.empty() && elems[0] && std::holds_alternative<symbol>(elems[0]->data)){
+        auto &head = elems[0];
+        for(auto &kv : head->metadata){
+            if(kv.first.rfind("generic-error-",0)==0 && kv.second && std::holds_alternative<symbol>(kv.second->data)){
+                std::string payload = std::get<symbol>(kv.second->data).name; // CODE:message
+                auto pos = payload.find(':');
+                std::string code = pos==std::string::npos?payload:payload.substr(0,pos);
+                std::string msg = pos==std::string::npos?std::string("generic diagnostic"):payload.substr(pos+1);
+                // Avoid duplicating if already harvested (should not normally happen, but guard)
+                bool already=false; for(auto &e : r.errors){ if(e.code==code && e.message==msg){ already=true; break; } }
+                if(already) continue;
+                // Provide code-specific hints (fallback generic)
+                std::string hint;
+                if(code=="E1454") hint="ensure tuple pattern arity matches value";
+                else if(code=="E1455") hint="ensure value used in tuple pattern is a tuple";
+                else if(code=="E1456") hint="remove or correct unknown struct field in pattern";
+                else if(code=="E1457") hint="remove duplicate struct field from pattern";
+                else if(code.rfind("E17",0)==0) hint="generic instantiation error";
+                else hint="expansion diagnostic";
+                r.errors.push_back(TypeError{code,msg,hint,line(*head),col(*head),{}});
+                r.success = false; // presence of expansion diagnostic marks module unsuccessful
+            }
+        }
+    }
     for(size_t i=1;i<elems.size(); ++i){
         auto &n = elems[i];
         if(!n||!std::holds_alternative<list>(n->data)) continue;
@@ -157,18 +184,6 @@ inline void TypeChecker::collect_globals(TypeCheckResult& r, const std::vector<n
         if(l.empty()||!std::holds_alternative<symbol>(l[0]->data)) continue;
         if(std::get<symbol>(l[0]->data).name!="global") continue;
         std::string name; TypeId ty=0; bool isConst=false; node_ptr init; 
-        // Early generic error metadata harvesting from module head
-        if(i==0 && n && std::holds_alternative<symbol>(n->data)){
-            for(auto &kv : n->metadata){
-                if(kv.first.rfind("generic-error-",0)==0 && kv.second && std::holds_alternative<symbol>(kv.second->data)){
-                    std::string payload = std::get<symbol>(kv.second->data).name; // CODE:msg
-                    auto pos = payload.find(':');
-                    std::string code = pos==std::string::npos?payload:payload.substr(0,pos);
-                    std::string msg = pos==std::string::npos?"generic diagnostic":payload.substr(pos+1);
-                    if(code.rfind("E17",0)==0){ error_code(r,*n,code,msg,"generic instantiation error"); r.success=false; }
-                }
-            }
-        }
         for(size_t j=1;j<l.size(); ++j){
             if(l[j]&&std::holds_alternative<keyword>(l[j]->data)){
                 std::string kw=std::get<keyword>(l[j]->data).name; if(++j>=l.size()) break; auto val=l[j];
@@ -424,6 +439,21 @@ inline void TypeChecker::check_instruction_list(TypeCheckResult& r, const std::v
     if(op=="tuple-match-arms-count"){ // (tuple-match-arms-count <int>) metadata only
         if(il.size()!=2 || !std::holds_alternative<int64_t>(il[1]->data)) { error_code(r,*n,"E1459","tuple-match-arms-count arity","expected (tuple-match-arms-count <int>)"); r.success=false; }
         continue; }
+    if(op=="struct-pattern-duplicate-fields"){ // (struct-pattern-duplicate-fields %src [ d1 d2 ... ])
+        if(il.size()<3){ error_code(r,*n,"E1457","duplicate fields meta arity","expected (struct-pattern-duplicate-fields %src [dup1 dup2 ...])"); r.success=false; continue; }
+        std::string src = sym(1);
+        if(src.empty() || src[0] != '%'){
+            error_code(r,*n,"E1457","duplicate fields meta source must be %var","prefix with %"); r.success=false; }
+        if(!std::holds_alternative<vector_t>(il[2]->data)){
+            error_code(r,*n,"E1457","duplicate fields meta requires vector of field names","supply [ dup1 dup2 ... ]"); r.success=false; continue; }
+        auto &vec = std::get<vector_t>(il[2]->data).elems;
+        if(vec.empty()) continue; // nothing to report (should not normally happen)
+        // Aggregate all duplicate field names into one diagnostic message.
+        std::ostringstream msg;
+        msg << "duplicate field" << (vec.size()>1?"s":"") << " in struct pattern: ";
+        bool first=true; for(auto &fldNode : vec){ if(!fldNode) continue; if(!std::holds_alternative<symbol>(fldNode->data)) continue; auto name = std::get<symbol>(fldNode->data).name; if(!first) msg << ", "; first=false; msg << name; }
+        error_code(r,*n,"E1457",msg.str(),"remove duplicate struct field from pattern");
+        r.success=false; continue; }
     // Note: (tget ...) lowers to (member ...) during macro expansion; no direct checker support required.
     // If unexpanded (should not normally happen), fall through to unknown instruction to surface issue.
     if(op=="assign"){ // (assign %dst %src)

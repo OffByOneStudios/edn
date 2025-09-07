@@ -727,3 +727,33 @@ add_executable(rustlite_tuple_match_variable_pattern_test ../../tests/rustlite_t
 target_link_libraries(rustlite_tuple_match_variable_pattern_test PRIVATE rustlite edn)
 add_test(NAME rustlite.tuple_match.variable_pattern COMMAND rustlite_tuple_match_variable_pattern_test)
 
+# Register struct let pattern test target
+add_executable(rustlite_struct_let_pattern_test ../../tests/rustlite_struct_let_pattern_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_let_pattern_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.let_pattern COMMAND rustlite_struct_let_pattern_test)
+add_executable(rustlite_struct_let_pattern_duplicate_field_neg_test ../../tests/rustlite_struct_let_pattern_duplicate_field_neg_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_let_pattern_duplicate_field_neg_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.let_pattern.dup_field_neg COMMAND rustlite_struct_let_pattern_duplicate_field_neg_test)
+add_executable(rustlite_struct_let_pattern_placeholder_test ../../tests/rustlite_struct_let_pattern_placeholder_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_let_pattern_placeholder_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.let_pattern.placeholder COMMAND rustlite_struct_let_pattern_placeholder_test)
+add_executable(rustlite_struct_let_pattern_unknown_field_neg_test ../../tests/rustlite_struct_let_pattern_unknown_field_neg_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_let_pattern_unknown_field_neg_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.let_pattern.unknown_field_neg COMMAND rustlite_struct_let_pattern_unknown_field_neg_test)
+
+# Positive struct let pattern test (no diagnostics expected)
+add_executable(rustlite_struct_let_pattern_positive_test ../../tests/rustlite_struct_let_pattern_positive_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_let_pattern_positive_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.let_pattern.positive COMMAND rustlite_struct_let_pattern_positive_test)
+
+# Struct match arm pattern tests (Phase 2)
+add_executable(rustlite_struct_match_positive_test ../../tests/rustlite_struct_match_positive_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_match_positive_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.match.positive COMMAND rustlite_struct_match_positive_test)
+add_executable(rustlite_struct_match_unknown_field_neg_test ../../tests/rustlite_struct_match_unknown_field_neg_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_match_unknown_field_neg_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.match.unknown_field_neg COMMAND rustlite_struct_match_unknown_field_neg_test)
+add_executable(rustlite_struct_match_duplicate_field_neg_test ../../tests/rustlite_struct_match_duplicate_field_neg_test.cpp $<TARGET_OBJECTS:rustlite_parser>)
+target_link_libraries(rustlite_struct_match_duplicate_field_neg_test PRIVATE rustlite edn)
+add_test(NAME rustlite.struct.match.duplicate_field_neg COMMAND rustlite_struct_match_duplicate_field_neg_test)
+
